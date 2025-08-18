@@ -1,0 +1,5 @@
+__pycache__/
+debug_pages/
+car_data_1.csv
+*.md
+test.py

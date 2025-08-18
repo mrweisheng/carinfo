@@ -1,0 +1,70 @@
+{
+  "proxies": [
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@23.95.150.145:6114",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@23.95.150.145:6114",
+      "name": "proxy1",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@198.23.239.134:6540",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@198.23.239.134:6540",
+      "name": "proxy2",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@45.38.107.97:6014",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@45.38.107.97:6014",
+      "name": "proxy3",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@207.244.217.165:6712",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@207.244.217.165:6712",
+      "name": "proxy4",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@107.172.163.27:6543",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@107.172.163.27:6543",
+      "name": "proxy5",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@104.222.161.211:6343",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@104.222.161.211:6343",
+      "name": "proxy6",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@64.137.96.74:6641",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@64.137.96.74:6641",
+      "name": "proxy7",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@216.10.27.159:6837",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@216.10.27.159:6837",
+      "name": "proxy8",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@136.0.207.84:6661",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@136.0.207.84:6661",
+      "name": "proxy9",
+      "enabled": true
+    },
+    {
+      "http": "socks5://hdqxklfp:kdg9sm4zl7nw@142.147.128.93:6593",
+      "https": "socks5://hdqxklfp:kdg9sm4zl7nw@142.147.128.93:6593",
+      "name": "proxy10",
+      "enabled": true
+    }
+  ],
+  "retry_settings": {
+    "max_retries": 3,
+    "retry_delay": 5,
+    "timeout": 30
+  },
+  "fallback_to_direct": true
+}
