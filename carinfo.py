@@ -895,16 +895,34 @@ def main():
         except ValueError:
             print("请输入有效数字")
     
-    # 获取爬取页数
+    # 获取爬取页数范围
     while True:
         try:
-            GLOBE_PAGE = int(input("请输入要爬取的页数: "))
-            if GLOBE_PAGE > 0:
-                break
+            page_input = input("请输入要爬取的页数（单个数字如'3'表示1-3页，范围如'3,10'表示3-10页）: ").strip()
+            if ',' in page_input:
+                # 范围输入，如"3,10"
+                start_page, end_page = map(int, page_input.split(','))
+                if start_page > 0 and end_page >= start_page:
+                    START_PAGE = start_page
+                    END_PAGE = end_page
+                    GLOBE_PAGE = end_page - start_page + 1
+                    print(f"将爬取第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
+                    break
+                else:
+                    print("起始页必须大于0，结束页必须大于等于起始页")
             else:
-                print("页数必须大于0")
+                # 单个数字输入，如"3"
+                end_page = int(page_input)
+                if end_page > 0:
+                    START_PAGE = 1
+                    END_PAGE = end_page
+                    GLOBE_PAGE = end_page
+                    print(f"将爬取第1页到第{END_PAGE}页，共{GLOBE_PAGE}页")
+                    break
+                else:
+                    print("页数必须大于0")
         except ValueError:
-            print("请输入有效数字")
+            print("请输入有效格式，如'3'或'3,10'")
     
     # 获取车辆类型名称
     vehicle_types = {
@@ -933,8 +951,7 @@ def main():
             
             # 逐页处理
             total_vehicles = 0
-            for page_num in range(GLOBE_PAGE):
-                page = page_num + 1
+            for page in range(START_PAGE, END_PAGE + 1):
                 print(f'\n=== 正在处理第 {page} 页 ===')
                 
                 # 创建实例（每页重新创建，避免数据累积）
@@ -981,7 +998,7 @@ def main():
                         print(f'第 {page} 页CSV文件生成失败')
                 
                 # 每页之间添加随机间隔，模拟真实用户行为
-                if page < GLOBE_PAGE:
+                if page < END_PAGE:
                     delay = random.uniform(3.0, 6.0)
                     print(f'休息 {delay:.1f} 秒，准备处理下一页...')
                     time.sleep(delay)
@@ -1015,8 +1032,7 @@ def main():
         
         # 逐页处理
         total_vehicles = 0
-        for page_num in range(GLOBE_PAGE):
-            page = page_num + 1
+        for page in range(START_PAGE, END_PAGE + 1):
             print(f'\n=== 正在处理第 {page} 页 ===')
             
             # 创建实例（每页重新创建，避免数据累积）
@@ -1063,14 +1079,14 @@ def main():
                     print(f'第 {page} 页CSV文件生成失败')
             
             # 每页之间添加随机间隔，模拟真实用户行为
-            if page < GLOBE_PAGE:
+            if page < END_PAGE:
                 delay = random.uniform(3.0, 6.0)
                 print(f'休息 {delay:.1f} 秒，准备处理下一页...')
                 time.sleep(delay)
         
         print(f'\n=== 爬取完成！ ===')
         print(f"车辆类型: {vehicle_name}")
-        print(f"爬取页数: {GLOBE_PAGE}")
+        print(f"爬取页数范围: 第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
         print(f"总共获取车辆数: {total_vehicles}")
         print(f"CSV文件: {csv_filename}")
         print(f"CSV文件可直接用于数据库导入！")
