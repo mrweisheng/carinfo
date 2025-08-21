@@ -2,4 +2,6 @@ __pycache__/
 debug_pages/
 car_data_1.csv
 *.md
+.env
 test.py
+log/
