@@ -59,6 +59,66 @@
       "https": "socks5://hdqxklfp:kdg9sm4zl7nw@142.147.128.93:6593",
       "name": "proxy10",
       "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@23.95.150.145:6114",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@23.95.150.145:6114",
+      "name": "proxy11",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@198.23.239.134:6540",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@198.23.239.134:6540",
+      "name": "proxy12",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@45.38.107.97:6014",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@45.38.107.97:6014",
+      "name": "proxy13",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@107.172.163.27:6543",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@107.172.163.27:6543",
+      "name": "proxy14",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@64.137.96.74:6641",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@64.137.96.74:6641",
+      "name": "proxy15",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@45.43.186.39:6257",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@45.43.186.39:6257",
+      "name": "proxy16",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@154.203.43.247:5536",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@154.203.43.247:5536",
+      "name": "proxy17",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@216.10.27.159:6837",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@216.10.27.159:6837",
+      "name": "proxy18",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@136.0.207.84:6661",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@136.0.207.84:6661",
+      "name": "proxy19",
+      "enabled": true
+    },
+    {
+      "http": "socks5://gvrtjhdg:lda33wsfiuwk@142.147.128.93:6593",
+      "https": "socks5://gvrtjhdg:lda33wsfiuwk@142.147.128.93:6593",
+      "name": "proxy20",
+      "enabled": true
     }
   ],
   "retry_settings": {

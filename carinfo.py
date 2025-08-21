@@ -20,6 +20,8 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urljoin
+import subprocess
+import sys
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -536,7 +538,7 @@ class CarScraper:
                     delay = random.uniform(30, 60)  # 30-60秒
                     logger.info(f"反爬虫模式：延迟 {delay:.1f} 秒...")
                 else:
-                    delay = random.uniform(3, 6)  # 5-10秒
+                    delay = random.uniform(3, 5)  # 5-10秒
                     logger.info(f"正常模式：延迟 {delay:.1f} 秒...")
                 
                 time.sleep(delay)
@@ -604,6 +606,12 @@ class CarScraper:
         # 写入CSV文件
         if csv_data:
             df = pd.DataFrame(csv_data)
+            
+            # 确保特定字段保持字符串格式，避免pandas自动转换
+            string_columns = ['year', 'phone_number', 'seats', 'engine_volume']
+            for col in string_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(str).str.replace('.0', '', regex=False)
             
             if append_mode and os.path.exists(csv_path):
                 # 追加模式：读取现有文件并追加新数据
@@ -872,6 +880,39 @@ class CarScraper:
         return True
 
 
+def auto_import_to_database():
+    """自动执行数据库导入"""
+    try:
+        print("正在启动数据库导入脚本...")
+        
+        # 检查是否存在CSV文件
+        import glob
+        csv_files = glob.glob("car_data_*.csv")
+        if not csv_files:
+            print("[ERROR] 没有找到CSV文件，跳过数据库导入")
+            return False
+        
+        print(f"找到 {len(csv_files)} 个CSV文件，开始导入...")
+        
+        # 调用导入脚本
+        result = subprocess.run([sys.executable, "import_to_mysql.py"], 
+                              capture_output=True, text=True, encoding='gbk', errors='ignore')
+        
+        if result.returncode == 0:
+            print("[OK] 数据库导入成功完成！")
+            print("导入结果:")
+            print(result.stdout)
+            return True
+        else:
+            print("[ERROR] 数据库导入失败")
+            print("错误信息:")
+            print(result.stderr)
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] 执行数据库导入时发生错误: {e}")
+        return False
+
 def main():
     """主函数"""
     print("=== 28car.com 车辆信息爬取工具 ===")
@@ -1016,6 +1057,10 @@ def main():
                 print(f"  - {csv_filename}")
         print(f"所有CSV文件可直接用于数据库导入！")
         
+        # 自动执行数据库导入
+        print(f"\n=== 开始自动导入数据库 ===")
+        auto_import_to_database()
+        
     else:
         # 爬取单个类型
         vehicle_name = vehicle_types.get(vehicle_type, '未知类型')
@@ -1090,6 +1135,10 @@ def main():
         print(f"总共获取车辆数: {total_vehicles}")
         print(f"CSV文件: {csv_filename}")
         print(f"CSV文件可直接用于数据库导入！")
+        
+        # 自动执行数据库导入
+        print(f"\n=== 开始自动导入数据库 ===")
+        auto_import_to_database()
 
 
 if __name__ == "__main__":
