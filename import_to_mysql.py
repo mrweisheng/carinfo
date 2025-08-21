@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class SmartMySQLImporter:
-    def __init__(self, host='127.0.0.1', user='root', password='1qaz!QAZ2wsx@WSX', database='car_info_db', port=3306):
+    def __init__(self, host='103.117.122.192', user='root', password='1qaz!QAZ2wsx@WSX', database='car_info_db', port=3306):
         """初始化MySQL连接"""
         self.host = host
         self.user = user
@@ -179,8 +179,15 @@ class SmartMySQLImporter:
             
             for row in data:
                 try:
-                    # 处理扩展字段（JSON格式）
-                    extra_fields = self._process_extra_fields(row, vehicle_type)
+                    # 使用CSV中已有的扩展字段（JSON格式）
+                    extra_fields_str = row.get('extra_fields', '')
+                    extra_fields = None
+                    if extra_fields_str:
+                        try:
+                            extra_fields = json.loads(extra_fields_str)
+                        except json.JSONDecodeError:
+                            logger.warning(f"车辆 {row.get('vehicle_id', 'unknown')} 的extra_fields JSON解析失败，使用空值")
+                            extra_fields = None
                     
                     # 解析价格字段
                     price_str = row.get('price', '')
@@ -227,23 +234,23 @@ class SmartMySQLImporter:
                         updated_vehicles += 1
                     else:
                         imported_vehicles += 1
-                    
-                    # 2. Process image information (只插入新图片，不更新已存在的)
-                    image_urls = row.get('image_urls', '').split('\n') if row.get('image_urls') else []
-                    
-                    # Filter empty strings and de-duplicate within the current row's image list
-                    valid_image_urls = []
-                    for url in image_urls:
-                        url = url.strip()
-                        if url and url not in valid_image_urls:
-                            valid_image_urls.append(url)
-                    
-                    # Insert image records (使用INSERT IGNORE避免重复)
-                    for i, image_url in enumerate(valid_image_urls):
-                        image_data = (row.get('vehicle_id', ''), image_url, i)
-                        self.cursor.execute(insert_image_sql, image_data)
-                        if self.cursor.rowcount > 0:  # 只有新插入的才计数
-                            imported_images += 1
+                        
+                        # 2. Process image information (只有新增车辆才插入图片)
+                        image_urls = row.get('image_urls', '').split('\n') if row.get('image_urls') else []
+                        
+                        # Filter empty strings and de-duplicate within the current row's image list
+                        valid_image_urls = []
+                        for url in image_urls:
+                            url = url.strip()
+                            if url and url not in valid_image_urls:
+                                valid_image_urls.append(url)
+                        
+                        # Insert image records (只有新增车辆才插入图片)
+                        for i, image_url in enumerate(valid_image_urls):
+                            image_data = (row.get('vehicle_id', ''), image_url, i)
+                            self.cursor.execute(insert_image_sql, image_data)
+                            if self.cursor.rowcount > 0:  # 只有新插入的才计数
+                                imported_images += 1
                     
                     # Commit every 50 records
                     if (imported_vehicles + updated_vehicles) % 50 == 0:
@@ -268,97 +275,6 @@ class SmartMySQLImporter:
             logger.error(f"导入数据失败: {e}")
             self.connection.rollback()
             return False
-    
-    def _process_extra_fields(self, row, vehicle_type):
-        """处理扩展字段，根据车辆类型提取特殊属性"""
-        extra_fields = {}
-        
-        # 解析价格字段
-        price_str = row.get('price', '')
-        if price_str:
-            current_price, original_price = self._parse_price(price_str)
-            if current_price is not None:
-                extra_fields['current_price'] = current_price
-            if original_price is not None:
-                extra_fields['original_price'] = original_price
-        
-        if vehicle_type in [2, 3]:  # 客货车和货车
-            # 从描述中提取客货车和货车特有信息
-            description = row.get('description', '')
-            
-            # 提取载重量
-            cargo_match = re.search(r'(\d+\.?\d*)\s*[吨|T]', description)
-            if cargo_match:
-                extra_fields['cargo_capacity'] = f"{cargo_match.group(1)}吨"
-            
-            # 提取车厢长度
-            length_match = re.search(r'(\d+\.?\d*)\s*[米|m]', description)
-            if length_match:
-                extra_fields['body_length'] = f"{length_match.group(1)}米"
-            
-            # 提取车高
-            height_match = re.search(r'(\d+\.?\d*)\s*米.*高', description)
-            if height_match:
-                extra_fields['body_height'] = f"{height_match.group(1)}米"
-            
-            # 提取油耗
-            fuel_match = re.search(r'(\d+\.?\d*)L/100km', description)
-            if fuel_match:
-                extra_fields['fuel_consumption'] = f"{fuel_match.group(1)}L/100km"
-            
-            # 提取特殊功能
-            features = []
-            if '升降尾板' in description or '尾板' in description:
-                features.append('升降尾板')
-            if '原廠斗' in description:
-                features.append('原廠斗')
-            if '活動網' in description:
-                features.append('活動網')
-            if 'HIAB' in description or '吊机' in description:
-                features.append('HIAB吊机')
-            if '凍機' in description or '冻机' in description:
-                features.append('冷冻设备')
-            if '纖維斗' in description or '纤维斗' in description:
-                features.append('纤维斗')
-            if '孖屋' in description:
-                features.append('孖屋')
-            if features:
-                extra_fields['features'] = ', '.join(features)
-            
-            # 货车特有属性
-            if vehicle_type == 3:  # 货车
-                # 提取发动机型号
-                engine_match = re.search(r'(\d+)\s*節機', description)
-                if engine_match:
-                    extra_fields['engine_sections'] = f"{engine_match.group(1)}节机"
-                
-                # 提取车厢类型
-                if '夾車' in description:
-                    extra_fields['body_type'] = '夹车'
-                elif '冷凍車' in description or '冻车' in description:
-                    extra_fields['body_type'] = '冷冻车'
-                elif '貨車' in description:
-                    extra_fields['body_type'] = '货车'
-                
-                # 提取载重吨位
-                ton_match = re.search(r'(\d+\.?\d*)TON', description, re.IGNORECASE)
-                if ton_match:
-                    extra_fields['tonnage'] = f"{ton_match.group(1)}TON"
-        
-        elif vehicle_type == 1:  # 私家车
-            description = row.get('description', '')
-            
-            # 提取里程
-            mileage_match = re.search(r'(\d+[,，]?\d*)\s*[km|公里]', description)
-            if mileage_match:
-                extra_fields['mileage'] = f"{mileage_match.group(1)}km"
-            
-            # 提取颜色
-            color_match = re.search(r'([黑白红蓝银灰金棕绿紫])[色|色系]', description)
-            if color_match:
-                extra_fields['color'] = f"{color_match.group(1)}色"
-        
-        return extra_fields if extra_fields else None
     
     def _parse_price(self, price_str):
         """

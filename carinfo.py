@@ -75,7 +75,7 @@ class CarScraper:
         if random.random() < 0.7:
             delay = random.uniform(0.8, 2.5)
         else:
-            delay = random.uniform(3.0, 8.0)
+            delay = random.uniform(2.0, 5.0)
         
         time.sleep(delay)
         return delay
@@ -299,12 +299,30 @@ class CarScraper:
         """提取车辆销售状态"""
         record_html = str(record)
         
-        # 检查是否包含已售标识（图标或文字）
-        if ('sold.gif' in record_html or 
-            '由於已售，聯絡人資料亦被保護中' in record_html):
+        # 检查是否包含已售标识（更精确的检查）
+        sold_indicators = [
+            'sold.gif',
+            'sold.png', 
+            'sold.jpg',
+            '已售',
+            '已賣',
+            'SOLD',
+            '由於已售，聯絡人資料亦被保護中',
+            '由于已售，联络人资料亦被保护中',
+            'class="sold"'
+        ]
+        
+        # 特殊检查：灰色文字且包含已售相关内容
+        if 'style="color:#999999"' in record_html and ('已售' in record_html or '已賣' in record_html or 'sold' in record_html.lower()):
             return "已售"
-        else:
-            return "未售"
+        
+        for indicator in sold_indicators:
+            if indicator in record_html:
+                return "已售"
+        
+        return "未售"
+
+
 
     def get_html_1(self, page):
         '''获取请求概览页返回的数据，page表示第几页'''
@@ -345,7 +363,7 @@ class CarScraper:
         logger.info(f"请求详情页面URL: {url}")
         return self._make_request_with_retry(url, headers, 'detail')
 
-    def extract_car_info(self, html_content, h_vid):
+    def extract_car_info(self, html_content, h_vid, initial_sale_status=None):
         """从详细表格中中提取车辆信息"""
         if html_content is None:
             logger.warning(f"车辆 {h_vid} 的HTML内容为空，跳过")
@@ -353,6 +371,11 @@ class CarScraper:
             
         soup = BeautifulSoup(html_content, 'html.parser')
         car_data = {}  # 放车辆信息
+        
+        # 直接使用列表页的销售状态，不再从详情页判断
+        car_data['sale_status'] = initial_sale_status
+        
+        logger.info(f"车辆 {h_vid} 销售状态：{initial_sale_status}（来自列表页）")
         
         # 定位目标表格
         target_table = soup.find('table', {'width': '100%', 'style': 'height:100%'})
@@ -475,35 +498,9 @@ class CarScraper:
             logger.info(f"正在处理第 {i}/{len(h_vid_list)} 个车辆，h_vid: {h_vid}, 状态: {sale_status}")
             
             try:
-                if sale_status == "已售":
-                    # 已售车辆只记录基本信息，不爬取详情
-                    car_info = {
-                        'h_vid': h_vid,
-                        'sale_status': sale_status,
-                        '編號': f"s{h_vid}",  # 生成编号
-                        '網址': f"https://www.28car.com/sell_dsp.php?h_vid={h_vid}&h_vw=y",
-                        '車類': self.vehicle_types[self.vehicle_type]['name'],
-                        '車廠': '',
-                        '型號': '',
-                        '燃炓': '',
-                        '座位': '',
-                        '容積': '',
-                        '傳動': '',
-                        '年份': '',
-                        '簡評': '已售车辆',
-                        '售價': '',
-                        '聯絡人資料': '由于已售，联络人资料亦被保护中',
-                        'contact_name': '',
-                        'phone_number': '',
-                        '更新日期': '',
-                        '图片URLs': [],
-                        '本地图片路径': []
-                    }
-                    self.car_data.append(car_info)
-                    logger.info(f"已售车辆 {h_vid} 基本信息已记录")
-                    continue
+                # 无论已售未售都要爬取详情页面获取完整信息
+                logger.info(f"正在爬取车辆 {h_vid} 的详细信息（状态：{sale_status}）")
                 
-                # 未售车辆爬取详情
                 # 获取车辆详细页面内容
                 html_content = self.get_detail_content(h_vid)
                 
@@ -518,8 +515,8 @@ class CarScraper:
                     logger.warning("建议增加请求间隔时间或减少并发请求")
                     continue
                 
-                # 提取车辆信息
-                car_info = self.extract_car_info(html_content, h_vid)
+                # 提取车辆信息（传递初始销售状态进行验证）
+                car_info = self.extract_car_info(html_content, h_vid, sale_status)
                 logger.info(f"车辆 {h_vid} 信息提取结果: {type(car_info)}")
                 
                 # 随机跳过某些车辆，模拟用户选择行为
@@ -528,10 +525,9 @@ class CarScraper:
                     continue
                 
                 if car_info is not None:
-                    # 添加销售状态
-                    car_info['sale_status'] = sale_status
                     self.car_data.append(car_info)
-                    logger.info(f"成功提取车辆信息: {car_info.get('車廠', '')} {car_info.get('型號', '')}")
+                    final_status = car_info.get('sale_status', '未知')
+                    logger.info(f"成功提取车辆信息: {car_info.get('車廠', '')} {car_info.get('型號', '')} (状态: {final_status})")
                 else:
                     logger.warning(f"车辆 {h_vid} 提取失败，跳过")
                     
@@ -540,7 +536,7 @@ class CarScraper:
                     delay = random.uniform(30, 60)  # 30-60秒
                     logger.info(f"反爬虫模式：延迟 {delay:.1f} 秒...")
                 else:
-                    delay = random.uniform(5, 10)  # 5-10秒
+                    delay = random.uniform(3, 6)  # 5-10秒
                     logger.info(f"正常模式：延迟 {delay:.1f} 秒...")
                 
                 time.sleep(delay)
