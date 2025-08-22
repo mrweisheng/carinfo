@@ -935,6 +935,7 @@ def auto_import_to_database():
             print(result.stdout)
             
             # 导入成功后自动清理文件
+            cleaned_count = 0
             try:
                 from cleanup_utils import FileCleanup
                 cleanup = FileCleanup()
@@ -947,11 +948,48 @@ def auto_import_to_database():
             except Exception as e:
                 print(f"[WARNING] 清理文件时出错: {e}")
             
+            # 发送webhook通知 - 任务成功完成
+            try:
+                from webhook_notifier import WebhookNotifier
+                notifier = WebhookNotifier()
+                print("\n=== 发送完成通知 ===")
+                
+                # 获取车辆统计信息
+                vehicle_counts = {}
+                import glob
+                for csv_file in glob.glob("car_data_*.csv"):
+                    try:
+                        # 从文件名提取车辆类型
+                        type_id = csv_file.split('_')[2].split('.')[0]
+                        # 简单统计行数（减1去掉标题行）
+                        with open(csv_file, 'r', encoding='utf-8-sig') as f:
+                            line_count = sum(1 for line in f) - 1
+                        vehicle_counts[type_id] = max(0, line_count)
+                    except:
+                        pass
+                
+                # 发送通知
+                success = notifier.notify_scraping_completed(
+                    vehicle_counts=vehicle_counts,
+                    import_success=True,
+                    cleaned_files=cleaned_count,
+                    log_file=None  # 可以后续添加日志文件路径
+                )
+                
+                if success:
+                    print("[OK] 下游业务方通知发送成功")
+                else:
+                    print("[WARNING] 下游业务方通知发送失败")
+                    
+            except Exception as e:
+                print(f"[WARNING] 发送webhook通知时出错: {e}")
+            
             return True
         else:
             print("[ERROR] 数据库导入失败")
             print("错误信息:")
             print(result.stderr)
+            print("[INFO] 任务失败，不发送下游通知（无数据可处理）")
             return False
             
     except Exception as e:
