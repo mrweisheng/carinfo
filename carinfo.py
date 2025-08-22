@@ -927,7 +927,7 @@ def auto_import_to_database():
         
         # 调用导入脚本
         result = subprocess.run([sys.executable, "import_to_mysql.py"], 
-                              capture_output=True, text=True, encoding='gbk', errors='ignore')
+                              capture_output=True, text=True, encoding='utf-8', errors='ignore')
         
         if result.returncode == 0:
             print("[OK] 数据库导入成功完成！")
