@@ -9,7 +9,7 @@
     "vehicle_types": {
       "1": {
         "name": "私家车",
-        "pages": 1,
+        "pages": 20,
         "enabled": true
       },
       "2": {
@@ -19,7 +19,7 @@
       },
       "3": {
         "name": "货车",
-        "pages": 0,
+        "pages": 20,
         "enabled": true
       },
       "4": {

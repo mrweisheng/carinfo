@@ -11,7 +11,7 @@
  Target Server Version : 80042 (8.0.42-0ubuntu0.20.04.1)
  File Encoding         : 65001
 
- Date: 18/08/2025 22:16:11
+ Date: 22/08/2025 17:08:53
 */
 
 SET NAMES utf8mb4;
@@ -45,7 +45,7 @@ CREATE TABLE `daily_visitors`  (
   INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
   INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
   INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引'
-) ENGINE = InnoDB AUTO_INCREMENT = 147 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '每日访客统计表' ROW_FORMAT = DYNAMIC;
+) ENGINE = InnoDB AUTO_INCREMENT = 1026 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '每日访客统计表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for ip_location_cache
@@ -69,7 +69,7 @@ CREATE TABLE `ip_location_cache`  (
   INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
   INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引',
   INDEX `idx_updated_at`(`updated_at` ASC) USING BTREE COMMENT '更新时间索引'
-) ENGINE = InnoDB AUTO_INCREMENT = 1 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = 'IP地理位置缓存表' ROW_FORMAT = DYNAMIC;
+) ENGINE = InnoDB AUTO_INCREMENT = 114 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = 'IP地理位置缓存表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for user_browsing_history
@@ -239,7 +239,7 @@ CREATE TABLE `vehicle_images`  (
   INDEX `idx_vehicle_id`(`vehicle_id` ASC) USING BTREE,
   INDEX `idx_image_order`(`image_order` ASC) USING BTREE,
   CONSTRAINT `vehicle_images_ibfk_1` FOREIGN KEY (`vehicle_id`) REFERENCES `vehicles` (`vehicle_id`) ON DELETE CASCADE ON UPDATE RESTRICT
-) ENGINE = InnoDB AUTO_INCREMENT = 95358 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆图片表' ROW_FORMAT = DYNAMIC;
+) ENGINE = InnoDB AUTO_INCREMENT = 100641 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆图片表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for vehicles
@@ -273,6 +273,7 @@ CREATE TABLE `vehicles`  (
   `contact_name` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '联系人姓名',
   `phone_number` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '联系电话',
   `is_special_offer` tinyint NOT NULL DEFAULT 0 COMMENT '是否特价车辆：1=是, 0=否',
+  `transport_purpose` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '运输用途（如：冷链、普货、危化品、建材、快递等）',
   PRIMARY KEY (`id`) USING BTREE,
   UNIQUE INDEX `uk_vehicle_id`(`vehicle_id` ASC) USING BTREE,
   INDEX `idx_vehicle_id`(`vehicle_id` ASC) USING BTREE,
@@ -284,8 +285,11 @@ CREATE TABLE `vehicles`  (
   INDEX `idx_original_price`(`original_price` ASC) USING BTREE,
   INDEX `idx_contact_name`(`contact_name` ASC) USING BTREE,
   INDEX `idx_phone_number`(`phone_number` ASC) USING BTREE,
-  INDEX `idx_is_special_offer`(`is_special_offer` ASC) USING BTREE
-) ENGINE = InnoDB AUTO_INCREMENT = 20748 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆基础信息表' ROW_FORMAT = DYNAMIC;
+  INDEX `idx_is_special_offer`(`is_special_offer` ASC) USING BTREE,
+  INDEX `idx_seats`(`seats` ASC) USING BTREE COMMENT '座位数量索引',
+  INDEX `idx_seats_price`(`seats` ASC, `current_price` ASC) USING BTREE COMMENT '座位+价格复合索引',
+  INDEX `idx_seats_brand`(`seats` ASC, `car_brand` ASC) USING BTREE COMMENT '座位+品牌复合索引'
+) ENGINE = InnoDB AUTO_INCREMENT = 24183 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆基础信息表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- View structure for daily_visitor_summary
