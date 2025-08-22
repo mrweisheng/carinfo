@@ -8,3 +8,5 @@ mysql-connector-python==8.2.0
 python-dotenv==1.0.1
 Flask==2.3.3
 schedule==1.2.0
+brotli==1.1.0
+pysocks==1.7.1
