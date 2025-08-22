@@ -1,0 +1,41 @@
+{
+  "schedule": {
+    "interval_hours": 4,
+    "timezone": "Asia/Shanghai"
+  },
+  "scraping": {
+    "vehicle_types": {
+      "1": {
+        "name": "私家车",
+        "pages": 200,
+        "enabled": true
+      },
+      "2": {
+        "name": "客货车",
+        "pages": 0,
+        "enabled": true
+      },
+      "3": {
+        "name": "货车",
+        "pages": 0,
+        "enabled": true
+      },
+      "4": {
+        "name": "电单车",
+        "pages": 0,
+        "enabled": true
+      },
+      "5": {
+        "name": "经典车",
+        "pages": 0,
+        "enabled": true
+      }
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "scheduler.log",
+    "max_size_mb": 10,
+    "backup_count": 5
+  }
+}

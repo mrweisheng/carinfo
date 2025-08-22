@@ -33,8 +33,8 @@ class FastCSVImporter:
                 autocommit=False,
                 buffered=True,
                 connect_timeout=30,
-                read_timeout=60,
-                write_timeout=60
+                use_unicode=True,
+                sql_mode=''
             )
             self.cursor = self.connection.cursor(buffered=True)
             
@@ -82,16 +82,42 @@ class FastCSVImporter:
             return None, None
             
         try:
-            # 移除非数字字符，保留数字和小数点
-            import re
-            numbers = re.findall(r'\d+(?:\.\d+)?', str(price_str))
-            if numbers:
-                current_price = float(numbers[0])
-                original_price = float(numbers[1]) if len(numbers) > 1 else current_price
-                return current_price, original_price
+            # 移除HKD$前缀
+            price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
+            
+            current_price = None
+            original_price = None
+            
+            # 处理 "54,000[原價$57,000]" 格式
+            if '[' in price_str and '原價' in price_str:
+                # 提取现价部分（方括号前）
+                current_part = price_str.split('[')[0].strip()
+                current_price = self._extract_price_number(current_part)
+                
+                # 提取原价部分（方括号内）
+                original_part = price_str.split('原價')[1].split(']')[0].strip()
+                original_price = self._extract_price_number(original_part)
+            
+            # 处理只有现价的格式 "60,000"
+            else:
+                current_price = self._extract_price_number(price_str)
+            
+            return current_price, original_price
         except:
             pass
         return None, None
+    
+    def _extract_price_number(self, price_str):
+        """从价格字符串中提取数字"""
+        if not price_str:
+            return None
+        
+        # 移除逗号、$符号并转换为数字
+        clean_str = price_str.replace(',', '').replace('$', '').strip()
+        try:
+            return float(clean_str)
+        except:
+            return None
     
     def clean_data(self, value):
         """清理数据"""

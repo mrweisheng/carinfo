@@ -28,6 +28,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def load_config_from_file(config_file='config.json'):
+    """从配置文件加载爬取配置"""
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 提取车辆类型配置
+        vehicle_types = config.get('scraping', {}).get('vehicle_types', {})
+        enabled_types = {}
+        
+        for type_id, type_config in vehicle_types.items():
+            if type_config.get('enabled', True) and type_config.get('pages', 0) > 0:
+                enabled_types[int(type_id)] = {
+                    'name': type_config.get('name', f'类型{type_id}'),
+                    'pages': type_config.get('pages', 0)
+                }
+        
+        logger.info(f"从配置文件 {config_file} 加载了 {len(enabled_types)} 个启用的车辆类型")
+        return enabled_types
+        
+    except FileNotFoundError:
+        logger.error(f"配置文件 {config_file} 不存在")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"配置文件 {config_file} 格式错误: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"加载配置文件失败: {e}")
+        return {}
+
+
 class CarScraper:
     def __init__(self, PAGE, vehicle_type=1):
         self.PAGE = PAGE
@@ -538,7 +569,7 @@ class CarScraper:
                     delay = random.uniform(30, 60)  # 30-60秒
                     logger.info(f"反爬虫模式：延迟 {delay:.1f} 秒...")
                 else:
-                    delay = random.uniform(3, 5)  # 5-10秒
+                    delay = random.uniform(1, 2)  # 5-10秒
                     logger.info(f"正常模式：延迟 {delay:.1f} 秒...")
                 
                 time.sleep(delay)
@@ -915,55 +946,17 @@ def auto_import_to_database():
 
 def main():
     """主函数"""
-    print("=== 28car.com 车辆信息爬取工具 ===")
-    print("支持5种车辆类型：")
-    print("1. 私家车")
-    print("2. 客货车") 
-    print("3. 货车")
-    print("4. 电单车")
-    print("5. 经典车")
-    print("6. 依次爬取所有类型")
-    print()
+    import argparse
     
-    # 用户选择车辆类型
-    while True:
-        try:
-            vehicle_type = int(input("请选择车辆类型 (1-6): "))
-            if 1 <= vehicle_type <= 6:
-                break
-            else:
-                print("请输入1-6之间的数字")
-        except ValueError:
-            print("请输入有效数字")
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='28car.com 车辆信息爬取工具')
+    parser.add_argument('--auto', action='store_true', help='自动模式（非交互式）')
+    parser.add_argument('--config', action='store_true', help='从配置文件读取并执行所有启用的类型')
+    parser.add_argument('--type', type=int, choices=[1,2,3,4,5,6], help='车辆类型 (1-6)')
+    parser.add_argument('--pages', type=str, help='爬取页数，如"3"或"3,10"')
+    parser.add_argument('--config-file', default='config.json', help='配置文件路径')
     
-    # 获取爬取页数范围
-    while True:
-        try:
-            page_input = input("请输入要爬取的页数（单个数字如'3'表示1-3页，范围如'3,10'表示3-10页）: ").strip()
-            if ',' in page_input:
-                # 范围输入，如"3,10"
-                start_page, end_page = map(int, page_input.split(','))
-                if start_page > 0 and end_page >= start_page:
-                    START_PAGE = start_page
-                    END_PAGE = end_page
-                    GLOBE_PAGE = end_page - start_page + 1
-                    print(f"将爬取第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
-                    break
-                else:
-                    print("起始页必须大于0，结束页必须大于等于起始页")
-            else:
-                # 单个数字输入，如"3"
-                end_page = int(page_input)
-                if end_page > 0:
-                    START_PAGE = 1
-                    END_PAGE = end_page
-                    GLOBE_PAGE = end_page
-                    print(f"将爬取第1页到第{END_PAGE}页，共{GLOBE_PAGE}页")
-                    break
-                else:
-                    print("页数必须大于0")
-        except ValueError:
-            print("请输入有效格式，如'3'或'3,10'")
+    args = parser.parse_args()
     
     # 获取车辆类型名称
     vehicle_types = {
@@ -973,6 +966,186 @@ def main():
         4: '电单车',
         5: '经典车'
     }
+    
+    # 如果没有指定任何参数，默认使用配置文件模式
+    if not any([args.auto, args.config, args.type, args.pages]):
+        print("未指定参数，默认使用配置文件模式")
+        args.config = True
+    
+    if args.config:
+        # 配置文件模式（从配置文件读取所有启用的类型）
+        print(f"=== 配置文件模式启动 ===")
+        print(f"配置文件: {args.config_file}")
+        
+        # 加载配置文件
+        enabled_types = load_config_from_file(args.config_file)
+        
+        if not enabled_types:
+            print("[ERROR] 配置文件中没有启用的车辆类型或配置文件加载失败")
+            sys.exit(1)
+        
+        print(f"将爬取 {len(enabled_types)} 种车辆类型:")
+        for type_id, type_config in enabled_types.items():
+            print(f"  - {type_config['name']} (类型{type_id}): {type_config['pages']}页")
+        
+        # 执行配置文件中的所有类型
+        total_vehicles = 0
+        for type_id, type_config in enabled_types.items():
+            type_name = type_config['name']
+            pages = type_config['pages']
+            
+            print(f"\n=== 开始爬取 {type_name} (类型{type_id}) ===")
+            
+            # 自动检测文件模式
+            csv_filename = f"car_data_{type_id}.csv"
+            append_mode = os.path.exists(csv_filename)
+            if append_mode:
+                print(f"发现现有文件，将追加数据到: {csv_filename}")
+            else:
+                print(f"将创建新文件: {csv_filename}")
+            
+            # 逐页处理
+            for page in range(1, pages + 1):
+                print(f'\n=== 正在处理第 {page} 页 ===')
+                
+                # 创建实例（每页重新创建，避免数据累积）
+                scraper = CarScraper(pages, type_id)
+                
+                # 获取当前页的车辆列表
+                print(f'正在获取第 {page} 页车辆列表...')
+                decoded_html = scraper.get_html_1(page)
+                
+                # 检查是否因反爬虫终止
+                if decoded_html is None:
+                    print(f'第 {page} 页因反爬虫终止，停止爬取')
+                    break
+                
+                dateCode_i = scraper.get_date_code(decoded_html)
+                
+                if not dateCode_i:
+                    print(f'第 {page} 页没有找到车辆数据')
+                    continue
+                    
+                print(f'第 {page} 页找到 {len(dateCode_i)} 个车辆')
+                
+                # 获取当前页的销售状态列表
+                sale_status_list = [it['sale_status'] for it in dateCode_i]
+                
+                # 立即爬取当前页的车辆详情
+                vehicle_ids = [int(it['code']) for it in dateCode_i]
+                scraper.scrape_cars(vehicle_ids, sale_status_list)
+                
+                # 检查是否因反爬虫终止
+                if len(scraper.car_data) == 0 and any(status == "未售" for status in sale_status_list):
+                    print(f'第 {page} 页详情爬取因反爬虫终止，停止爬取')
+                    break
+                
+                # 立即保存当前页的数据到CSV
+                if scraper.car_data:
+                    csv_path = scraper.create_csv_file(csv_filename, append_mode)
+                    if csv_path:
+                        print(f'第 {page} 页数据已保存，获取 {len(scraper.car_data)} 个车辆')
+                        total_vehicles += len(scraper.car_data)
+                        # 后续页面使用追加模式
+                        append_mode = True
+                    else:
+                        print(f'第 {page} 页CSV文件生成失败')
+                
+                # 每页之间添加随机间隔，模拟真实用户行为
+                if page < pages:
+                    delay = random.uniform(3.0, 6.0)
+                    print(f'休息 {delay:.1f} 秒，准备处理下一页...')
+                    time.sleep(delay)
+            
+            print(f'\n{type_name} 爬取完成！')
+            print(f"CSV文件: {csv_filename}")
+        
+        print(f"\n=== 所有类型爬取完成！ ===")
+        print(f"总共获取车辆数: {total_vehicles}")
+        print(f"生成的CSV文件:")
+        for type_id in enabled_types.keys():
+            csv_filename = f"car_data_{type_id}.csv"
+            if os.path.exists(csv_filename):
+                print(f"  - {csv_filename}")
+        print(f"所有CSV文件可直接用于数据库导入！")
+        
+        # 自动执行数据库导入
+        print(f"\n=== 开始自动导入数据库 ===")
+        auto_import_to_database()
+        
+        return
+
+    elif args.auto:
+        # 自动模式（非交互式）
+        if not args.type or not args.pages:
+            print("[ERROR] 自动模式需要指定 --type 和 --pages 参数")
+            sys.exit(1)
+        
+        vehicle_type = args.type
+        page_input = args.pages
+        
+        print(f"=== 自动模式启动 ===")
+        print(f"车辆类型: {vehicle_type}")
+        print(f"页数配置: {page_input}")
+        
+    else:
+        # 交互模式
+        print("=== 28car.com 车辆信息爬取工具 ===")
+        print("支持5种车辆类型：")
+        print("1. 私家车")
+        print("2. 客货车") 
+        print("3. 货车")
+        print("4. 电单车")
+        print("5. 经典车")
+        print("6. 依次爬取所有类型")
+        print()
+        
+        # 用户选择车辆类型
+        while True:
+            try:
+                vehicle_type = int(input("请选择车辆类型 (1-6): "))
+                if 1 <= vehicle_type <= 6:
+                    break
+                else:
+                    print("请输入1-6之间的数字")
+            except ValueError:
+                print("请输入有效数字")
+        
+        # 获取爬取页数范围
+        while True:
+            try:
+                page_input = input("请输入要爬取的页数（单个数字如'3'表示1-3页，范围如'3,10'表示3-10页）: ").strip()
+                break
+            except ValueError:
+                print("请输入有效格式，如'3'或'3,10'")
+    
+    # 解析页数配置
+    try:
+        if ',' in page_input:
+            # 范围输入，如"3,10"
+            start_page, end_page = map(int, page_input.split(','))
+            if start_page > 0 and end_page >= start_page:
+                START_PAGE = start_page
+                END_PAGE = end_page
+                GLOBE_PAGE = end_page - start_page + 1
+                print(f"将爬取第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
+            else:
+                print("起始页必须大于0，结束页必须大于等于起始页")
+                sys.exit(1)
+        else:
+            # 单个数字输入，如"3"
+            end_page = int(page_input)
+            if end_page > 0:
+                START_PAGE = 1
+                END_PAGE = end_page
+                GLOBE_PAGE = end_page
+                print(f"将爬取第1页到第{END_PAGE}页，共{GLOBE_PAGE}页")
+            else:
+                print("页数必须大于0")
+                sys.exit(1)
+    except ValueError:
+        print("页数格式错误")
+        sys.exit(1)
     
     if vehicle_type == 6:
         # 依次爬取所有类型
@@ -1057,9 +1230,11 @@ def main():
                 print(f"  - {csv_filename}")
         print(f"所有CSV文件可直接用于数据库导入！")
         
-        # 自动执行数据库导入
-        print(f"\n=== 开始自动导入数据库 ===")
-        auto_import_to_database()
+        # 在自动模式下跳过数据库导入，由调度器统一处理
+        if not args.auto:
+            # 自动执行数据库导入
+            print(f"\n=== 开始自动导入数据库 ===")
+            auto_import_to_database()
         
     else:
         # 爬取单个类型
@@ -1136,9 +1311,11 @@ def main():
         print(f"CSV文件: {csv_filename}")
         print(f"CSV文件可直接用于数据库导入！")
         
-        # 自动执行数据库导入
-        print(f"\n=== 开始自动导入数据库 ===")
-        auto_import_to_database()
+        # 在自动模式下跳过数据库导入，由调度器统一处理
+        if not args.auto:
+            # 自动执行数据库导入
+            print(f"\n=== 开始自动导入数据库 ===")
+            auto_import_to_database()
 
 
 if __name__ == "__main__":
