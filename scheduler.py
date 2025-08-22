@@ -17,26 +17,49 @@ from pathlib import Path
 
 class CarScheduler:
     def __init__(self):
-        # 从配置文件读取间隔时间，默认4小时
-        self.interval_hours = self._load_interval_config()
+        # 从配置文件读取调度配置
+        schedule_config = self._load_schedule_config()
+        self.schedule_mode = schedule_config.get('mode', 'interval')  # interval 或 times
+        self.interval_hours = schedule_config.get('interval_hours', 4)
+        self.schedule_times = schedule_config.get('times', ['08:00', '12:00', '16:00', '20:00'])
+        
         self.log_file = "scheduler.log"
         self.pid_file = "scheduler.pid"
         self.running = True
         self.task_running = False
+        self.last_run_date = None  # 记录最后运行日期，避免重复执行
         
         # 设置信号处理（优雅停止）
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
-    def _load_interval_config(self):
-        """从配置文件读取执行间隔"""
+    def _load_schedule_config(self):
+        """从配置文件读取调度配置"""
         try:
             with open('config.json', 'r', encoding='utf-8') as f:
                 config = json.load(f)
-            interval = config.get('schedule', {}).get('interval_hours', 4)
-            return max(1, interval)  # 最少1小时
+            schedule_config = config.get('schedule', {})
+            
+            # 默认配置
+            default_config = {
+                'mode': 'times',  # 默认使用时间点模式
+                'interval_hours': 4,
+                'times': ['08:00', '12:00', '16:00', '20:00']
+            }
+            
+            # 合并配置
+            for key, default_value in default_config.items():
+                if key not in schedule_config:
+                    schedule_config[key] = default_value
+            
+            return schedule_config
         except:
-            return 4  # 默认4小时
+            # 如果配置文件读取失败，返回默认配置
+            return {
+                'mode': 'times',
+                'interval_hours': 4,
+                'times': ['08:00', '12:00', '16:00', '20:00']
+            }
     
     def _signal_handler(self, signum, frame):
         """处理停止信号"""
@@ -194,10 +217,60 @@ class CarScheduler:
         finally:
             self.task_running = False
     
+    def should_run_now(self):
+        """检查当前时间是否应该执行任务"""
+        now = datetime.now()
+        current_time = now.strftime('%H:%M')
+        current_date = now.strftime('%Y-%m-%d')
+        
+        if self.schedule_mode == 'times':
+            # 时间点模式
+            for schedule_time in self.schedule_times:
+                schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
+                schedule_datetime = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+                
+                # 计算时间差
+                time_diff = (now - schedule_datetime).total_seconds()
+                
+                # 如果在执行时间点后的5分钟内（允许执行窗口）
+                if 0 <= time_diff <= 300:  # 0-5分钟内
+                    task_key = f"{current_date}_{schedule_time}"
+                    
+                    # 检查这个时间点是否已经执行过
+                    if self.last_run_date != task_key:
+                        # 检查当前是否有任务在运行
+                        if not self.task_running:
+                            self.last_run_date = task_key
+                            return True, f"定时执行 {schedule_time}"
+                        else:
+                            # 有任务在运行，跳过这个时间点
+                            self.log(f"跳过 {schedule_time} 时间点：上一次任务仍在执行中", "WARNING")
+                            self.last_run_date = task_key  # 标记为已处理，避免重复提示
+                            return False, f"跳过 {schedule_time}（任务进行中）"
+                
+                # 如果超过执行窗口（5分钟后），标记该时间点为已跳过
+                elif time_diff > 300:
+                    task_key = f"{current_date}_{schedule_time}"
+                    if self.last_run_date != task_key:
+                        self.log(f"跳过 {schedule_time} 时间点：错过执行窗口", "INFO")
+                        self.last_run_date = task_key  # 标记为已跳过
+            
+            return False, "未到执行时间"
+        else:
+            # 间隔模式（原有逻辑）
+            return True, "间隔模式执行"
+    
     def start(self):
         """启动调度器"""
         self.log("汽车信息爬取调度器启动")
-        self.log(f"执行间隔: {self.interval_hours}小时")
+        
+        if self.schedule_mode == 'times':
+            self.log(f"执行模式: 定时执行")
+            self.log(f"执行时间: {', '.join(self.schedule_times)}")
+        else:
+            self.log(f"执行模式: 间隔执行")
+            self.log(f"执行间隔: {self.interval_hours}小时")
+            
         self.log(f"工作目录: {os.getcwd()}")
         self.log(f"PID: {os.getpid()}")
         
@@ -220,48 +293,38 @@ class CarScheduler:
         try:
             # 启动时立即执行一次
             self.log("启动时立即执行一次任务...")
-            success = self.run_task()
-            
-            if not success:
-                consecutive_failures += 1
-                self.log(f"首次执行失败 ({consecutive_failures}/{max_failures})", "WARNING")
+            startup_success = self.run_task()
+            if startup_success:
+                self.log("启动任务执行成功")
             else:
-                consecutive_failures = 0
+                self.log("启动任务执行失败", "WARNING")
+                consecutive_failures += 1
             
-            # 主循环
+            self.log("调度器开始监控...")
+            
             while self.running:
                 try:
-                    # 计算下次执行时间
-                    next_time = datetime.now() + timedelta(hours=self.interval_hours)
-                    self.log(f"下次执行时间: {next_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    # 检查是否应该执行
+                    should_run, reason = self.should_run_now()
                     
-                    # 分段休眠，便于响应停止信号
-                    total_sleep = self.interval_hours * 3600
-                    sleep_interval = 60  # 每分钟检查一次
-                    
-                    while total_sleep > 0 and self.running:
-                        sleep_time = min(sleep_interval, total_sleep)
-                        time.sleep(sleep_time)
-                        total_sleep -= sleep_time
-                    
-                    # 检查是否需要退出
-                    if not self.running:
-                        break
-                    
-                    # 执行任务
-                    success = self.run_task()
-                    
-                    if success:
-                        consecutive_failures = 0
-                    else:
-                        consecutive_failures += 1
-                        self.log(f"连续失败次数: {consecutive_failures}/{max_failures}", "WARNING")
+                    if should_run and not self.task_running:
+                        self.log(f"触发任务执行: {reason}")
+                        success = self.run_task()
                         
-                        # 连续失败太多次，增加等待时间
-                        if consecutive_failures >= max_failures:
-                            self.log("连续失败次数过多，等待30分钟后重试", "ERROR")
-                            time.sleep(1800)  # 等待30分钟
-                            consecutive_failures = 0  # 重置计数
+                        if success:
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            self.log(f"连续失败次数: {consecutive_failures}/{max_failures}", "WARNING")
+                            
+                            # 连续失败太多次，增加等待时间
+                            if consecutive_failures >= max_failures:
+                                self.log("连续失败次数过多，等待30分钟后重试", "ERROR")
+                                time.sleep(1800)  # 等待30分钟
+                                consecutive_failures = 0  # 重置计数
+                    
+                    # 检查间隔（每分钟检查一次）
+                    time.sleep(60)
                     
                 except Exception as e:
                     self.log(f"主循环异常: {e}", "ERROR")

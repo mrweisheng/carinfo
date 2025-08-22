@@ -1,6 +1,8 @@
 {
   "schedule": {
+    "mode": "times",
     "interval_hours": 4,
+    "times": ["08:00", "12:00", "16:00", "20:00"],
     "timezone": "Asia/Shanghai"
   },
   "scraping": {
