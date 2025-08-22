@@ -496,6 +496,14 @@ class FastCSVImporter:
 
 def main():
     """主函数"""
+    # 确保输出编码正确
+    import sys
+    import io
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+    
     print("=== 高性能CSV导入工具（优化版） ===")
     print("优化特性:")
     print("- 增加批量操作大小")

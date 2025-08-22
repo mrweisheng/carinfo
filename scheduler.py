@@ -160,6 +160,20 @@ class CarScheduler:
             if result.returncode == 0:
                 self.log(f"✓ 爬取任务完成，耗时 {duration/60:.1f} 分钟")
                 self.consecutive_failures = 0  # 重置失败计数
+                
+                # 成功后自动清理文件
+                try:
+                    from cleanup_utils import FileCleanup
+                    cleanup = FileCleanup()
+                    self.log("开始清理临时文件...")
+                    cleaned_count = cleanup.cleanup_after_success()
+                    if cleaned_count > 0:
+                        self.log(f"清理完成：删除了 {cleaned_count} 个临时文件")
+                    else:
+                        self.log("无需清理文件")
+                except Exception as e:
+                    self.log(f"清理文件时出错: {e}", "WARNING")
+                
                 self.task_running = False
                 return True
             else:

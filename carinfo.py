@@ -933,6 +933,20 @@ def auto_import_to_database():
             print("[OK] 数据库导入成功完成！")
             print("导入结果:")
             print(result.stdout)
+            
+            # 导入成功后自动清理文件
+            try:
+                from cleanup_utils import FileCleanup
+                cleanup = FileCleanup()
+                print("\n=== 开始清理临时文件 ===")
+                cleaned_count = cleanup.cleanup_after_success()
+                if cleaned_count > 0:
+                    print(f"[OK] 清理完成：删除了 {cleaned_count} 个临时文件")
+                else:
+                    print("[INFO] 无需清理文件")
+            except Exception as e:
+                print(f"[WARNING] 清理文件时出错: {e}")
+            
             return True
         else:
             print("[ERROR] 数据库导入失败")

@@ -7,6 +7,8 @@ WORKDIR /app
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 ENV TZ=Asia/Hong_Kong
 
 # 安装系统依赖
@@ -17,7 +19,13 @@ RUN apt-get update && apt-get install -y \
     curl \
     vim \
     tzdata \
+    locales \
     && rm -rf /var/lib/apt/lists/*
+
+# 生成UTF-8 locale
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \
+    sed -i '/zh_CN.UTF-8/s/^# //g' /etc/locale.gen && \
+    locale-gen
 
 # 设置时区
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
