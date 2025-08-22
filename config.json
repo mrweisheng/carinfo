@@ -7,7 +7,7 @@
     "vehicle_types": {
       "1": {
         "name": "私家车",
-        "pages": 200,
+        "pages": 1,
         "enabled": true
       },
       "2": {

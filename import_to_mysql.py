@@ -13,6 +13,13 @@ from datetime import datetime
 import time
 import requests
 
+# 尝试导入Docker配置模块
+try:
+    from docker_config import get_database_config, is_docker_environment
+    DOCKER_ENV = is_docker_environment()
+except ImportError:
+    DOCKER_ENV = False
+
 class FastCSVImporter:
     def __init__(self):
         """初始化数据库连接"""
@@ -23,12 +30,27 @@ class FastCSVImporter:
         """连接数据库"""
         print("正在连接数据库...")
         try:
+            # 根据运行环境选择配置
+            if DOCKER_ENV:
+                db_config = get_database_config()
+                print(f"Docker环境: 连接到 {db_config['host']}:{db_config['port']}")
+            else:
+                # 本地环境使用原有配置
+                db_config = {
+                    'host': '103.117.122.192',
+                    'user': 'root', 
+                    'password': '1qaz!QAZ2wsx@WSX',
+                    'database': 'car_info_db',
+                    'port': 3306
+                }
+                print(f"本地环境: 连接到 {db_config['host']}:{db_config['port']}")
+            
             self.connection = mysql.connector.connect(
-                host='103.117.122.192',
-                user='root',
-                password='1qaz!QAZ2wsx@WSX',
-                database='car_info_db',
-                port=3306,
+                host=db_config['host'],
+                user=db_config['user'],
+                password=db_config['password'],
+                database=db_config['database'],
+                port=db_config['port'],
                 charset='utf8mb4',
                 autocommit=False,
                 buffered=True,
