@@ -135,7 +135,7 @@ def classify_transport_purpose_with_gemini_rest(api_key: str, image_urls: List[s
         "contents": contents,
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 10,
+            "maxOutputTokens": 1000,
             "topP": 0.8,
             "topK": 10
         }
