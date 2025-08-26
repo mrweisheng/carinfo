@@ -128,6 +128,12 @@ def classify_transport_purpose_with_gemini_rest(api_key: str, image_urls: List[s
         logger.warning("所有图片获取失败，返回默认分类")
         return TransportPurpose.QITA.value
     
+    # 图像数量日志与提示
+    num_images = len(contents[0]["parts"]) - 1
+    logger.info(f"准备调用 Gemini REST API，图片数: {num_images}")
+    if num_images > 4:
+        logger.warning("图片数量较多，可能导致请求体过大而被 API 拒绝(400)。可在 .env 中将 MAX_IMAGES 调小（如 3 或 2）以规避。")
+    
     # 调用 Gemini REST API
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
@@ -147,7 +153,16 @@ def classify_transport_purpose_with_gemini_rest(api_key: str, image_urls: List[s
     
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
+        # 如果返回非 2xx，详细记录响应体以便排查
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, 'response', None) or response
+            try:
+                logger.error(f"API 错误，状态码={resp.status_code}，响应体={resp.text}")
+            except Exception:
+                logger.error(f"API 错误: {e}")
+            return TransportPurpose.QITA.value
         
         result_data = response.json()
         logger.debug(f"API 响应: {result_data}")
