@@ -5,3 +5,12 @@ car_data_1.csv
 .env
 test.py
 log/
+
+# 敏感配置文件
+proxy_config.json
+config.json
+
+# IDE和工具目录
+.codebuddy/
+.vscode/
+.idea/
