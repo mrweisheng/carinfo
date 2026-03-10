@@ -3,6 +3,7 @@
 """
 生产级定时任务脚本
 稳定可靠的汽车信息爬取调度器，适用于服务器部署
+包含任务历史记录、状态报告等功能
 """
 
 import time
@@ -14,6 +15,30 @@ import signal
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+
+try:
+    from task_history import TaskHistory, SchedulerStatus
+except ImportError:
+    # 如果模块不存在，使用简单实现
+    class TaskHistory:
+        def __init__(self, *args, **kwargs):
+            self.history = []
+        def add_task(self, *args, **kwargs):
+            pass
+        def get_stats(self, *args, **kwargs):
+            return {}
+    
+    class SchedulerStatus:
+        def __init__(self, *args, **kwargs):
+            self.status = {}
+        def start(self, *args, **kwargs):
+            pass
+        def stop(self, *args, **kwargs):
+            pass
+        def task_started(self, *args, **kwargs):
+            pass
+        def task_completed(self, *args, **kwargs):
+            pass
 
 class CarScheduler:
     def __init__(self):
@@ -27,7 +52,12 @@ class CarScheduler:
         self.pid_file = "scheduler.pid"
         self.running = True
         self.task_running = False
-        self.last_run_date = None  # 记录最后运行日期，避免重复执行
+        self.last_run_date = None
+        self.consecutive_failures = 0
+        
+        # 初始化历史记录和状态管理
+        self.task_history = TaskHistory()
+        self.scheduler_status = SchedulerStatus()
         
         # 设置信号处理（优雅停止）
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -159,13 +189,16 @@ class CarScheduler:
             return False
         
         self.task_running = True
+        task_start_time = datetime.now()
+        self.scheduler_status.task_started()
+        
         self.log("=== 开始执行爬取任务 ===")
         start_time = time.time()
         
         try:
             self.log("正在执行爬取任务，实时进度如下:")
             self.log("─" * 50)
-            
+
             # 调用carinfo.py - 不捕获输出，直接显示
             result = subprocess.run(
                 [sys.executable, 'carinfo.py'],
@@ -175,44 +208,40 @@ class CarScheduler:
                 timeout=7200,  # 2小时超时
                 cwd=os.getcwd()
             )
-            
+
             duration = time.time() - start_time
-            
+
             self.log("─" * 50)
-            
+
             if result.returncode == 0:
                 self.log(f"✓ 爬取任务完成，耗时 {duration/60:.1f} 分钟")
-                self.consecutive_failures = 0  # 重置失败计数
-                
-                # 成功后自动清理文件
-                try:
-                    from cleanup_utils import FileCleanup
-                    cleanup = FileCleanup()
-                    self.log("开始清理临时文件...")
-                    cleaned_count = cleanup.cleanup_after_success()
-                    if cleaned_count > 0:
-                        self.log(f"清理完成：删除了 {cleaned_count} 个临时文件")
-                    else:
-                        self.log("无需清理文件")
-                except Exception as e:
-                    self.log(f"清理文件时出错: {e}", "WARNING")
-                
+                self.consecutive_failures = 0
+                self.task_history.add_task(task_start_time, datetime.now(), True, 0)
+                self.scheduler_status.task_completed(True, 0)
                 self.task_running = False
                 return True
             else:
                 self.log(f"✗ 爬取任务失败，返回码: {result.returncode}，耗时 {duration/60:.1f} 分钟", "ERROR")
                 self.consecutive_failures += 1
+                self.task_history.add_task(task_start_time, datetime.now(), False, 0, f"返回码: {result.returncode}")
+                self.scheduler_status.task_completed(False, 0)
                 self.task_running = False
                 return False
             
         except subprocess.TimeoutExpired:
             self.log("✗ 爬取任务超时（超过2小时）", "ERROR")
+            self.task_history.add_task(task_start_time, datetime.now(), False, 0, "任务超时")
+            self.scheduler_status.task_completed(False, 0)
             return False
         except FileNotFoundError:
             self.log("✗ 找不到carinfo.py文件", "ERROR")
+            self.task_history.add_task(task_start_time, datetime.now(), False, 0, "文件不存在")
+            self.scheduler_status.task_completed(False, 0)
             return False
         except Exception as e:
             self.log(f"✗ 爬取任务异常: {e}", "ERROR")
+            self.task_history.add_task(task_start_time, datetime.now(), False, 0, str(e))
+            self.scheduler_status.task_completed(False, 0)
             return False
         finally:
             self.task_running = False
@@ -263,6 +292,14 @@ class CarScheduler:
     def start(self):
         """启动调度器"""
         self.log("汽车信息爬取调度器启动")
+        
+        # 记录启动状态
+        self.scheduler_status.start(os.getpid())
+        
+        # 显示最近任务统计
+        stats = self.task_history.get_stats(7)
+        if stats.get('total_tasks', 0) > 0:
+            self.log(f"过去{stats['period_days']}天: 执行{stats['total_tasks']}次, 成功{stats['success_count']}次, 成功率{stats['success_rate']:.1f}%")
         
         if self.schedule_mode == 'times':
             self.log(f"执行模式: 定时执行")
@@ -334,6 +371,7 @@ class CarScheduler:
         
         finally:
             self.remove_pid_file()
+            self.scheduler_status.stop()
             self.log("调度器已停止")
         
         return True

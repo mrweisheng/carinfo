@@ -1,49 +1,244 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-简化高性能CSV数据导入MySQL脚本
+高性能CSV数据导入MySQL脚本
+包含数据校验、去重、历史记录等功能
 """
 
+import os
 import mysql.connector
 import csv
-import os
 import json
 import glob
 from datetime import datetime
 import time
 import requests
+import re
+from typing import Tuple, List, Dict, Any, Optional
 
-# 尝试导入Docker配置模块
+# 加载环境变量
 try:
-    from docker_config import get_database_config, is_docker_environment
-    DOCKER_ENV = is_docker_environment()
+    from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    DOCKER_ENV = False
+    pass  # 如果没有python-dotenv，使用系统环境变量
+
+
+class DataValidator:
+    """数据校验器"""
+    
+    @staticmethod
+    def validate_vehicle_id(vehicle_id: str) -> Tuple[bool, str]:
+        """验证车辆ID"""
+        if not vehicle_id or vehicle_id.strip() == '':
+            return False, "车辆ID不能为空"
+        if len(vehicle_id) > 100:
+            return False, "车辆ID过长"
+        return True, ""
+    
+    @staticmethod
+    def validate_price(price_str: str) -> Tuple[bool, str]:
+        """验证价格格式"""
+        if not price_str:
+            return True, ""  # 价格可以为空
+        
+        price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
+        
+        if '[' in price_str and '原價' in price_str:
+            current_part = price_str.split('[')[0].strip()
+            original_part = price_str.split('原價')[1].split(']')[0].strip()
+            
+            current_clean = current_part.replace(',', '').replace('$', '').strip()
+            original_clean = original_part.replace(',', '').replace('$', '').strip()
+            
+            try:
+                current = float(current_clean) if current_clean else None
+                original = float(original_clean) if original_clean else None
+                if current is not None and current < 0:
+                    return False, f"价格不能为负数: {price_str}"
+            except ValueError:
+                return False, f"价格格式无效: {price_str}"
+        else:
+            clean = price_str.replace(',', '').replace('$', '').strip()
+            try:
+                price = float(clean) if clean else None
+                if price is not None and price < 0:
+                    return False, f"价格不能为负数: {price_str}"
+            except ValueError:
+                return False, f"价格格式无效: {price_str}"
+        
+        return True, ""
+    
+    @staticmethod
+    def validate_phone(phone: str) -> Tuple[bool, str]:
+        """验证电话号码"""
+        if not phone:
+            return True, ""  # 电话可以为空
+        
+        phone = str(phone).strip()
+        if not re.match(r'^\d{8}$', phone):
+            return False, f"电话号码格式无效: {phone}"
+        return True, ""
+    
+    @staticmethod
+    def validate_year(year: str) -> Tuple[bool, str]:
+        """验证年份"""
+        if not year:
+            return True, ""  # 年份可以为空
+        
+        try:
+            year_val = int(year)
+            current_year = datetime.now().year
+            if year_val < 1900 or year_val > current_year + 1:
+                return False, f"年份超出合理范围: {year_val}"
+        except ValueError:
+            return False, f"年份格式无效: {year}"
+        return True, ""
+    
+    @staticmethod
+    def validate_seats(seats: str) -> Tuple[bool, str]:
+        """验证座位数"""
+        if not seats:
+            return True, ""
+        
+        try:
+            seats_val = int(seats)
+            if seats_val < 1 or seats_val > 50:
+                return False, f"座位数超出合理范围: {seats}"
+        except ValueError:
+            return False, f"座位数格式无效: {seats}"
+        return True, ""
+    
+    def validate_row(self, row: dict) -> List[str]:
+        """验证整行数据"""
+        errors = []
+        
+        valid, msg = self.validate_vehicle_id(row.get('vehicle_id', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_price(row.get('price', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_phone(row.get('phone_number', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_year(row.get('year', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_seats(row.get('seats', ''))
+        if not valid:
+            errors.append(msg)
+        
+        return errors
+
+
+class ImportHistory:
+    """导入历史记录"""
+    
+    def __init__(self, db_connection):
+        self.connection = db_connection
+        self._ensure_table()
+    
+    def _ensure_table(self):
+        """确保历史记录表存在"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS import_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    import_date DATE NOT NULL,
+                    import_time TIME NOT NULL,
+                    file_name VARCHAR(255) NOT NULL,
+                    total_records INT,
+                    new_records INT,
+                    updated_records INT,
+                    skipped_records INT,
+                    error_count INT,
+                    duration_seconds FLOAT,
+                    status VARCHAR(20),
+                    error_details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_import_date (import_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            self.connection.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"创建历史记录表失败: {e}")
+    
+    def record_import(self, file_name: str, total: int, new: int, updated: int, 
+                     skipped: int, errors: int, duration: float, status: str, 
+                     error_details: str = None):
+        """记录导入历史"""
+        try:
+            cursor = self.connection.cursor()
+            now = datetime.now()
+            sql = """
+                INSERT INTO import_history 
+                (import_date, import_time, file_name, total_records, new_records, 
+                 updated_records, skipped_records, error_count, duration_seconds, 
+                 status, error_details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                now.date(), now.time(), file_name, total, new, updated,
+                skipped, errors, duration, status, error_details
+            ))
+            self.connection.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"记录导入历史失败: {e}")
+            return False
+    
+    def get_recent_history(self, days: int = 7) -> List[Dict]:
+        """获取最近的导入历史"""
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            sql = """
+                SELECT * FROM import_history 
+                WHERE import_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                ORDER BY import_date DESC, import_time DESC
+            """
+            cursor.execute(sql, (days,))
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            print(f"获取导入历史失败: {e}")
+            return []
+
 
 class FastCSVImporter:
     def __init__(self):
         """初始化数据库连接"""
         self.connection = None
         self.cursor = None
+        self.validator = DataValidator()
+        self.history = None
         
     def connect(self):
         """连接数据库"""
         print("正在连接数据库...")
         try:
-            # 根据运行环境选择配置
-            if DOCKER_ENV:
-                db_config = get_database_config()
-                print(f"Docker环境: 连接到 {db_config['host']}:{db_config['port']}")
-            else:
-                # 本地环境使用原有配置
-                db_config = {
-                    'host': '103.117.122.192',
-                    'user': 'root', 
-                    'password': '1qaz!QAZ2wsx@WSX',
-                    'database': 'car_info_db',
-                    'port': 3306
-                }
-                print(f"本地环境: 连接到 {db_config['host']}:{db_config['port']}")
+            # 从环境变量读取配置
+            db_config = {
+                'host': os.environ.get('DB_HOST', 'localhost'),
+                'user': os.environ.get('DB_USER', 'root'),
+                'password': os.environ.get('DB_PASSWORD', ''),
+                'database': os.environ.get('DB_NAME', 'car_info_db'),
+                'port': int(os.environ.get('DB_PORT', 3306))
+            }
+            
+            if not db_config['password']:
+                print("[ERROR] 数据库密码未配置，请检查环境变量 DB_PASSWORD")
+                return False
+                
+            print(f"连接到 {db_config['host']}:{db_config['port']}")
             
             self.connection = mysql.connector.connect(
                 host=db_config['host'],
@@ -283,98 +478,119 @@ class FastCSVImporter:
                 insert_time = time.time() - start_insert
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
             
-            # 更新现有车辆（使用API批量更新）
+            # 更新现有车辆（根据配置选择API或数据库更新）
             if update_vehicles:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在通过API更新 {len(update_vehicles)} 条车辆记录...")
+                api_url = os.environ.get('API_URL', '')
+                use_api = bool(api_url)
+
+                if use_api:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在通过API更新 {len(update_vehicles)} 条车辆记录...")
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在通过数据库更新 {len(update_vehicles)} 条车辆记录...")
+
                 start_update = time.time()
-                
+
                 # 分批处理，每次100条
                 batch_size = 100
                 total_batches = (len(update_vehicles) + batch_size - 1) // batch_size
                 success_count = 0
                 error_count = 0
-                
+
                 for batch_num in range(total_batches):
                     start_idx = batch_num * batch_size
                     end_idx = min(start_idx + batch_size, len(update_vehicles))
                     batch_vehicles = update_vehicles[start_idx:end_idx]
-                    
+
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理批次 {batch_num + 1}/{total_batches}，{len(batch_vehicles)} 条记录...")
-                    
-                    try:
-                        # 准备API请求数据，按照API文档格式
-                        api_updates = []
-                        for vehicle_data in batch_vehicles:
-                            # 构建更新字段，移除None值
-                            fields = {}
-                            if vehicle_data[1]: fields["vehicle_type"] = vehicle_data[1]
-                            if vehicle_data[2] is not None: fields["vehicle_status"] = int(vehicle_data[2])
-                            if vehicle_data[3]: fields["page_number"] = vehicle_data[3]
-                            if vehicle_data[4]: fields["car_number"] = vehicle_data[4]
-                            if vehicle_data[5]: fields["car_url"] = vehicle_data[5]
-                            if vehicle_data[6]: fields["car_category"] = vehicle_data[6]
-                            if vehicle_data[7]: fields["car_brand"] = vehicle_data[7]
-                            if vehicle_data[8]: fields["car_model"] = vehicle_data[8]
-                            if vehicle_data[9]: fields["fuel_type"] = vehicle_data[9]
-                            if vehicle_data[10] is not None: fields["seats"] = vehicle_data[10]
-                            if vehicle_data[11]: fields["engine_volume"] = vehicle_data[11]
-                            if vehicle_data[12]: fields["transmission"] = vehicle_data[12]
-                            if vehicle_data[13] is not None: fields["year"] = vehicle_data[13]
-                            if vehicle_data[14]: fields["description"] = vehicle_data[14]
-                            if vehicle_data[15]: fields["price"] = vehicle_data[15]
-                            if vehicle_data[16] is not None: fields["current_price"] = float(vehicle_data[16])
-                            if vehicle_data[17] is not None: fields["original_price"] = float(vehicle_data[17])
-                            if vehicle_data[18]: fields["contact_info"] = vehicle_data[18]
-                            if vehicle_data[19]: fields["update_date"] = vehicle_data[19]
-                            if vehicle_data[21]: fields["contact_name"] = vehicle_data[21]
-                            if vehicle_data[22]: fields["phone_number"] = vehicle_data[22]
-                            
-                            api_updates.append({
-                                "vehicle_id": vehicle_data[0],
-                                "fields": fields
-                            })
-                        
-                        # 调用API
-                        api_url = "https://www.eazycar.top/server/api/vehicles/batch-update"
-                        payload = {"updates": api_updates}
-                        
-                        response = requests.post(api_url, json=payload, timeout=60)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            batch_success = result.get('data', {}).get('success_count', 0)
-                            batch_error = result.get('data', {}).get('error_count', 0)
-                            success_count += batch_success
-                            error_count += batch_error
-                            
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {batch_success}, 失败 {batch_error}")
-                            
-                            if batch_error > 0:
-                                errors = result.get('data', {}).get('errors', [])
-                                for error in errors[:3]:  # 只显示前3个错误
-                                    print(f"  错误: {error}")
-                        else:
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API调用失败: {response.status_code}")
-                            print(f"  响应: {response.text[:200]}...")
-                            
-                            # 回退到数据库更新
+
+                    if use_api:
+                        # === API 更新模式 ===
+                        try:
+                            # 准备API请求数据
+                            api_updates = []
+                            for vehicle_data in batch_vehicles:
+                                fields = {}
+                                if vehicle_data[1]: fields["vehicle_type"] = vehicle_data[1]
+                                if vehicle_data[2] is not None: fields["vehicle_status"] = int(vehicle_data[2])
+                                if vehicle_data[3]: fields["page_number"] = vehicle_data[3]
+                                if vehicle_data[4]: fields["car_number"] = vehicle_data[4]
+                                if vehicle_data[5]: fields["car_url"] = vehicle_data[5]
+                                if vehicle_data[6]: fields["car_category"] = vehicle_data[6]
+                                if vehicle_data[7]: fields["car_brand"] = vehicle_data[7]
+                                if vehicle_data[8]: fields["car_model"] = vehicle_data[8]
+                                if vehicle_data[9]: fields["fuel_type"] = vehicle_data[9]
+                                if vehicle_data[10] is not None: fields["seats"] = vehicle_data[10]
+                                if vehicle_data[11]: fields["engine_volume"] = vehicle_data[11]
+                                if vehicle_data[12]: fields["transmission"] = vehicle_data[12]
+                                if vehicle_data[13] is not None: fields["year"] = vehicle_data[13]
+                                if vehicle_data[14]: fields["description"] = vehicle_data[14]
+                                if vehicle_data[15]: fields["price"] = vehicle_data[15]
+                                if vehicle_data[16] is not None: fields["current_price"] = float(vehicle_data[16])
+                                if vehicle_data[17] is not None: fields["original_price"] = float(vehicle_data[17])
+                                if vehicle_data[18]: fields["contact_info"] = vehicle_data[18]
+                                if vehicle_data[19]: fields["update_date"] = vehicle_data[19]
+                                if vehicle_data[21]: fields["contact_name"] = vehicle_data[21]
+                                if vehicle_data[22]: fields["phone_number"] = vehicle_data[22]
+
+                                api_updates.append({
+                                    "vehicle_id": vehicle_data[0],
+                                    "fields": fields
+                                })
+
+                            api_key = os.environ.get('API_KEY', '')
+                            headers = {}
+                            if api_key:
+                                headers['Authorization'] = f'Bearer {api_key}'
+
+                            payload = {"updates": api_updates}
+
+                            response = requests.post(api_url, json=payload, headers=headers, timeout=60)
+
+                            if response.status_code == 200:
+                                result = response.json()
+                                batch_success = result.get('data', {}).get('success_count', 0)
+                                batch_error = result.get('data', {}).get('error_count', 0)
+                                success_count += batch_success
+                                error_count += batch_error
+
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {batch_success}, 失败 {batch_error}")
+
+                                if batch_error > 0:
+                                    errors = result.get('data', {}).get('errors', [])
+                                    for error in errors[:3]:
+                                        print(f"  错误: {error}")
+                            else:
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API调用失败: {response.status_code}")
+                                print(f"  响应: {response.text[:200]}...")
+
+                                # 回退到数据库更新
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
+                                self._update_via_database(batch_vehicles)
+                                success_count += len(batch_vehicles)
+
+                        except requests.exceptions.RequestException as e:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API请求异常: {e}")
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
                             self._update_via_database(batch_vehicles)
                             success_count += len(batch_vehicles)
-                            
-                    except requests.exceptions.RequestException as e:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API请求异常: {e}")
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
-                        self._update_via_database(batch_vehicles)
-                        success_count += len(batch_vehicles)
-                    except Exception as e:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次处理失败: {e}")
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
-                        self._update_via_database(batch_vehicles)
-                        success_count += len(batch_vehicles)
-                
+                        except Exception as e:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次处理失败: {e}")
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
+                            self._update_via_database(batch_vehicles)
+                            success_count += len(batch_vehicles)
+                    else:
+                        # === 数据库直接更新模式 ===
+                        try:
+                            self._update_via_database(batch_vehicles)
+                            success_count += len(batch_vehicles)
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
+                        except Exception as e:
+                            error_count += len(batch_vehicles)
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
+
                 update_time = time.time() - start_update
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
+                mode_str = "API" if use_api else "数据库"
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] {mode_str}更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
             
             # 插入图片（仅新车辆，更新车辆不处理图片）
             if new_images:
@@ -453,20 +669,40 @@ class FastCSVImporter:
             print(f"[ERROR] 获取统计失败: {e}")
     
     def _update_via_database(self, batch_vehicles):
-        """数据库更新备选方案"""
+        """数据库更新方案 - 更新所有字段"""
         try:
             update_sql = """
-            UPDATE vehicles SET 
-                vehicle_status = %s, price = %s, current_price = %s, original_price = %s,
+            UPDATE vehicles SET
+                vehicle_type = %s, vehicle_status = %s, page_number = %s,
+                car_number = %s, car_url = %s, car_category = %s, car_brand = %s, car_model = %s,
+                fuel_type = %s, seats = %s, engine_volume = %s, transmission = %s, year = %s,
+                description = %s, price = %s, current_price = %s, original_price = %s,
                 contact_info = %s, update_date = %s, contact_name = %s, phone_number = %s,
                 updated_at = CURRENT_TIMESTAMP
             WHERE vehicle_id = %s
             """
-            
+
             update_data = []
             for vehicle_data in batch_vehicles:
-                simplified = (
+                # 按照字段顺序: vehicle_type, vehicle_status, page_number, car_number, car_url,
+                # car_category, car_brand, car_model, fuel_type, seats, engine_volume,
+                # transmission, year, description, price, current_price, original_price,
+                # contact_info, update_date, contact_name, phone_number, vehicle_id
+                record = (
+                    vehicle_data[1],   # vehicle_type
                     vehicle_data[2],   # vehicle_status
+                    vehicle_data[3],   # page_number
+                    vehicle_data[4],   # car_number
+                    vehicle_data[5],   # car_url
+                    vehicle_data[6],   # car_category
+                    vehicle_data[7],   # car_brand
+                    vehicle_data[8],   # car_model
+                    vehicle_data[9],   # fuel_type
+                    vehicle_data[10],  # seats
+                    vehicle_data[11],  # engine_volume
+                    vehicle_data[12],  # transmission
+                    vehicle_data[13],  # year
+                    vehicle_data[14],  # description
                     vehicle_data[15],  # price
                     vehicle_data[16],  # current_price
                     vehicle_data[17],  # original_price
@@ -474,13 +710,13 @@ class FastCSVImporter:
                     vehicle_data[19],  # update_date
                     vehicle_data[21],  # contact_name
                     vehicle_data[22],  # phone_number
-                    vehicle_data[0]    # vehicle_id
+                    vehicle_data[0]     # vehicle_id (WHERE条件)
                 )
-                update_data.append(simplified)
-            
+                update_data.append(record)
+
             self.cursor.executemany(update_sql, update_data)
             self.connection.commit()
-            
+
         except Exception as e:
             print(f"数据库更新失败: {e}")
             if self.connection:
@@ -503,27 +739,30 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8')
     if hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8')
-    
+
     print("=== 高性能CSV导入工具（优化版） ===")
     print("优化特性:")
-    print("- 增加批量操作大小")
-    print("- 优化MySQL性能参数")
+    print("- 数据校验（价格、电话、年份等）")
+    print("- 导入历史记录")
+    print("- 环境变量支持（敏感信息脱敏）")
+    print("- 批量操作优化")
     print("- 分批更新避免大事务")
-    print("- 只更新变化的字段")
-    print("- 图片仅处理新车辆")
-    
+
     importer = FastCSVImporter()
-    
+
     if not importer.connect():
         return
-    
+
     try:
+        # 初始化历史记录
+        importer.history = ImportHistory(importer.connection)
+        
         # 检查CSV文件
         csv_files = glob.glob("car_data_*.csv")
         if not csv_files:
             print("\n[ERROR] 当前目录下没有找到 car_data_*.csv 文件")
             return
-        
+
         print(f"\n找到 {len(csv_files)} 个CSV文件:")
         for f in csv_files:
             print(f"  - {f}")

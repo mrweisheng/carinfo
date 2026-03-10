@@ -6,6 +6,10 @@
     "timezone": "Asia/Shanghai"
   },
   "scraping": {
+    "concurrency": 5,
+    "request_timeout": 90,
+    "max_retries": 3,
+    "retry_delay": 5,
     "vehicle_types": {
       "1": {
         "name": "私家车",
