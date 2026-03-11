@@ -9,7 +9,10 @@ import os
 import logging
 import time
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# 北京时间时区
+BEIJING_TZ = timezone(timedelta(hours=8))
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -124,7 +127,7 @@ class LoggerManager:
         self.stats['errors'].append({
             'type': error_type,
             'message': message,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(BEIJING_TZ).isoformat()
         })
         if len(self.stats['errors']) > 100:
             self.stats['errors'] = self.stats['errors'][-100:]
@@ -205,7 +208,7 @@ class ScrapingStats:
     def add_error(self, error: str):
         """添加错误"""
         self.errors.append({
-            'time': datetime.now().strftime('%H:%M:%S'),
+            'time': datetime.now(BEIJING_TZ).strftime('%H:%M:%S'),
             'error': error
         })
         if len(self.errors) > 50:

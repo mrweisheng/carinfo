@@ -18,12 +18,25 @@ import pandas as pd
 import requests
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from proxy_manager import get_proxy_manager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 设置日志时区为北京时间
+class BeijingTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        # 获取本地时间（自动跟随系统时区）
+        dt = datetime.fromtimestamp(record.created)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+handler = logging.StreamHandler()
+handler.setFormatter(BeijingTimeFormatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(handler)
 logger = logging.getLogger(__name__)
 
 # 并发配置

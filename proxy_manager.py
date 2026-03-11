@@ -10,7 +10,10 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 北京时间时区
+BEIJING_TZ = timezone(timedelta(hours=8))
 from dotenv import load_dotenv
 import mysql.connector
 
@@ -87,7 +90,7 @@ class ProxyManager:
                 ]
 
                 self.failed_proxies.clear()
-                self.last_load_time = datetime.now()
+                self.last_load_time = datetime.now(BEIJING_TZ)
                 self.load_count += 1
 
                 cursor.close()

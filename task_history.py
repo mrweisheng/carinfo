@@ -8,7 +8,10 @@
 import os
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 北京时间时区
+BEIJING_TZ = timezone(timedelta(hours=8))
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -66,7 +69,7 @@ class TaskHistory:
     
     def get_stats(self, days: int = 7) -> Dict[str, Any]:
         """获取统计信息"""
-        since = datetime.now() - timedelta(days=days)
+        since = datetime.now(BEIJING_TZ) - timedelta(days=days)
         recent_tasks = [
             t for t in self.history 
             if datetime.fromisoformat(t['start_time']) >= since
@@ -100,7 +103,7 @@ class TaskHistory:
     
     def clear_old_records(self, days: int = 30):
         """清除旧的记录"""
-        since = datetime.now() - timedelta(days=days)
+        since = datetime.now(BEIJING_TZ) - timedelta(days=days)
         self.history = [
             t for t in self.history 
             if datetime.fromisoformat(t['start_time']) >= since
@@ -151,7 +154,7 @@ class SchedulerStatus:
         """记录调度器启动"""
         self.status['running'] = True
         self.status['pid'] = pid
-        self.status['start_time'] = datetime.now().isoformat()
+        self.status['start_time'] = datetime.now(BEIJING_TZ).isoformat()
         self._save_status()
     
     def stop(self):
@@ -162,12 +165,12 @@ class SchedulerStatus:
     
     def task_started(self):
         """记录任务开始"""
-        self.status['current_task_start'] = datetime.now().isoformat()
+        self.status['current_task_start'] = datetime.now(BEIJING_TZ).isoformat()
         self._save_status()
     
     def task_completed(self, success: bool, vehicle_count: int = 0):
         """记录任务完成"""
-        now = datetime.now()
+        now = datetime.now(BEIJING_TZ)
         self.status['last_task_time'] = now.isoformat()
         self.status['last_task_result'] = 'success' if success else 'failure'
         self.status['last_vehicle_count'] = vehicle_count
@@ -198,4 +201,4 @@ class SchedulerStatus:
             return None
         
         start = datetime.fromisoformat(self.status['start_time'])
-        return (datetime.now() - start).total_seconds()
+        return (datetime.now(BEIJING_TZ) - start).total_seconds()

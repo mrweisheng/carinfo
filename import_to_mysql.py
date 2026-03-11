@@ -10,7 +10,15 @@ import mysql.connector
 import csv
 import json
 import glob
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# 北京时间时区
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def now_beijing():
+    """获取当前北京时间"""
+    return datetime.now(BEIJING_TZ)
 import time
 import re
 from typing import Tuple, List, Dict, Any, Optional
@@ -87,7 +95,7 @@ class DataValidator:
         
         try:
             year_val = int(year)
-            current_year = datetime.now().year
+            current_year = now_beijing().year
             if year_val < 1900 or year_val > current_year + 1:
                 return False, f"年份超出合理范围: {year_val}"
         except ValueError:
@@ -175,7 +183,7 @@ class ImportHistory:
         """记录导入历史"""
         try:
             cursor = self.connection.cursor()
-            now = datetime.now()
+            now = now_beijing()
             sql = """
                 INSERT INTO import_history 
                 (import_date, import_time, file_name, total_records, new_records, 
@@ -260,7 +268,7 @@ class CrawlLogManager:
         """记录爬取日志"""
         try:
             cursor = self.connection.cursor()
-            now = datetime.now()
+            now = now_beijing()
             sql = """
                 INSERT INTO crawl_logs (
                     crawl_date, crawl_time, vehicle_type, pages_scraped,
@@ -451,15 +459,15 @@ class FastCSVImporter:
                     pass
             
             # 获取已存在的ID
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始查询已存在的车辆ID...")
+            print(f"[{now_beijing().strftime('%H:%M:%S')}] 开始查询已存在的车辆ID...")
             start_query = time.time()
             vehicle_ids = [row.get('vehicle_id', '') for row in data]
             existing_ids = self.get_existing_ids(vehicle_ids)
             query_time = time.time() - start_query
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 查询完成，发现 {len(existing_ids)} 个已存在的记录，耗时 {query_time:.2f} 秒")
+            print(f"[{now_beijing().strftime('%H:%M:%S')}] 查询完成，发现 {len(existing_ids)} 个已存在的记录，耗时 {query_time:.2f} 秒")
             
             # 准备数据
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始准备数据...")
+            print(f"[{now_beijing().strftime('%H:%M:%S')}] 开始准备数据...")
             start_prepare = time.time()
             new_vehicles = []
             update_vehicles = []
@@ -521,15 +529,15 @@ class FastCSVImporter:
                             new_images.append((vehicle_id, url, i))
             
             prepare_time = time.time() - start_prepare
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据准备完成，新增: {len(new_vehicles)} 条，更新: {len(update_vehicles)} 条，图片: {len(new_images)} 条，耗时 {prepare_time:.2f} 秒")
+            print(f"[{now_beijing().strftime('%H:%M:%S')}] 数据准备完成，新增: {len(new_vehicles)} 条，更新: {len(update_vehicles)} 条，图片: {len(new_images)} 条，耗时 {prepare_time:.2f} 秒")
             
             # 执行批量操作
-            start_time = datetime.now()
+            start_time = now_beijing()
             print(f"[{start_time.strftime('%H:%M:%S')}] 开始执行数据库操作...")
             
             # 插入新车辆
             if new_vehicles:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在插入 {len(new_vehicles)} 条新车辆记录...")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在插入 {len(new_vehicles)} 条新车辆记录...")
                 start_insert = time.time()
                 insert_sql = """
                 INSERT IGNORE INTO vehicles (
@@ -548,11 +556,11 @@ class FastCSVImporter:
                 self.cursor.executemany(insert_sql, new_vehicles)
                 self.connection.commit()
                 insert_time = time.time() - start_insert
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
             
             # 更新现有车辆（直接操作数据库）
             if update_vehicles:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在更新 {len(update_vehicles)} 条车辆记录...")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在更新 {len(update_vehicles)} 条车辆记录...")
 
                 start_update = time.time()
 
@@ -567,33 +575,33 @@ class FastCSVImporter:
                     end_idx = min(start_idx + batch_size, len(update_vehicles))
                     batch_vehicles = update_vehicles[start_idx:end_idx]
 
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理批次 {batch_num + 1}/{total_batches}，{len(batch_vehicles)} 条记录...")
+                    print(f"[{now_beijing().strftime('%H:%M:%S')}] 处理批次 {batch_num + 1}/{total_batches}，{len(batch_vehicles)} 条记录...")
 
                     try:
                         self._update_via_database(batch_vehicles)
                         success_count += len(batch_vehicles)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
+                        print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
                     except Exception as e:
                         error_count += len(batch_vehicles)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
+                        print(f"[{now_beijing().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
 
                 update_time = time.time() - start_update
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
             
             # 插入图片（仅新车辆，更新车辆不处理图片）
             if new_images:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在插入 {len(new_images)} 条图片记录（仅新车辆）...")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在插入 {len(new_images)} 条图片记录（仅新车辆）...")
                 start_images = time.time()
                 image_sql = "INSERT IGNORE INTO vehicle_images (vehicle_id, image_url, image_order) VALUES (%s, %s, %s)"
                 self.cursor.executemany(image_sql, new_images)
                 self.connection.commit()
                 images_time = time.time() - start_images
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_images)} 条图片记录，耗时 {images_time:.2f} 秒")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {len(new_images)} 条图片记录，耗时 {images_time:.2f} 秒")
             else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 无需处理图片（无新车辆）")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] 无需处理图片（无新车辆）")
             
             # 计算耗时
-            end_time = datetime.now()
+            end_time = now_beijing()
             duration = (end_time - start_time).total_seconds()
             print(f"[OK] 导入完成！总计处理 {len(data)} 条记录，耗时 {duration:.1f} 秒")
             return True
@@ -616,13 +624,13 @@ class FastCSVImporter:
             print(f"- {csv_file}")
         
         success_count = 0
-        start_time = datetime.now()
+        start_time = now_beijing()
         
         for csv_file in csv_files:
             if self.import_csv(csv_file):
                 success_count += 1
         
-        end_time = datetime.now()
+        end_time = now_beijing()
         duration = (end_time - start_time).total_seconds()
         
         print(f"\n=== 导入完成 ===")
@@ -755,7 +763,7 @@ def main():
     if not importer.connect():
         return
 
-    import_start_time = datetime.now()
+    import_start_time = now_beijing()
 
     try:
         # 初始化历史记录
@@ -789,7 +797,7 @@ def main():
         importer.show_stats()
 
         # 计算导入耗时
-        import_duration = (datetime.now() - import_start_time).total_seconds()
+        import_duration = (now_beijing() - import_start_time).total_seconds()
 
         # 尝试从导入历史中获取新增/更新统计
         if importer.history:

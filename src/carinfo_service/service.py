@@ -5,8 +5,16 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+
+# 北京时间时区
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def now_beijing():
+    """获取当前北京时间"""
+    return datetime.now(BEIJING_TZ)
 
 
 @dataclass(frozen=True)
@@ -46,7 +54,7 @@ class FileLock:
             created = datetime.fromisoformat(ts)
         except Exception:
             return True
-        return datetime.now() - created > self.stale_after
+        return now_beijing() - created > self.stale_after
 
     def acquire(self) -> bool:
         if self._held:
@@ -64,7 +72,7 @@ class FileLock:
             fd = os.open(self.path, flags)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"pid": os.getpid(), "created_at": datetime.now().isoformat(timespec="seconds")},
+                    {"pid": os.getpid(), "created_at": now_beijing().isoformat(timespec="seconds")},
                     f,
                     ensure_ascii=False,
                 )
@@ -144,7 +152,7 @@ class CarinfoService:
         self._running = False
 
     def _log(self, msg: str, level: str = "INFO"):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{ts}] [{level}] {msg}", flush=True)
 
     def _load_state(self) -> dict:
@@ -197,7 +205,7 @@ class CarinfoService:
     def _ensure_next_time(self) -> datetime:
         """确保下次执行时间（确保同一天不重复执行）"""
         state = self._load_state()
-        now = datetime.now()
+        now = now_beijing()
         today_str = now.strftime("%Y-%m-%d")
 
         def parse_dt(v: str) -> Optional[datetime]:
@@ -225,7 +233,7 @@ class CarinfoService:
         return next_run
 
     def _reschedule_after_skip(self) -> None:
-        now = datetime.now()
+        now = now_beijing()
         state = self._load_state()
         # 跳过时也检查是否今天已执行
         today_str = now.strftime("%Y-%m-%d")
@@ -275,7 +283,7 @@ class CarinfoService:
 
             # 记录本次执行日期，防止同一天重复执行
             state = self._load_state()
-            state["last_run_date"] = datetime.now().strftime("%Y-%m-%d")
+            state["last_run_date"] = now_beijing().strftime("%Y-%m-%d")
             self._save_state(state)
 
         except Exception as e:
@@ -297,7 +305,7 @@ class CarinfoService:
 
         while self._running:
             next_run = self._ensure_next_time()
-            now = datetime.now()
+            now = now_beijing()
 
             wait_s = max(1, int((next_run - now).total_seconds()))
             self._log(
