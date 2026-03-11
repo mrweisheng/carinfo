@@ -48,22 +48,21 @@ class ConfigManager:
     def _load_config(self):
         """加载配置文件"""
         if not os.path.exists(self.config_file):
-            logger.warning(f"配置文件 {self.config_file} 不存在，使用默认配置")
-            self.config = self.DEFAULT_CONFIG.copy()
-            return
-        
+            logger.error(f"配置文件 {self.config_file} 不存在，程序中断")
+            raise FileNotFoundError(f"配置文件 {self.config_file} 不存在，请创建配置文件后重试")
+
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 self.config = json.load(f)
-            
+
             self._apply_env_overrides()
             logger.info(f"成功加载配置文件: {self.config_file}")
         except json.JSONDecodeError as e:
-            logger.error(f"配置文件格式错误: {e}，使用默认配置")
-            self.config = self.DEFAULT_CONFIG.copy()
+            logger.error(f"配置文件格式错误: {e}，程序中断")
+            raise ValueError(f"配置文件 {self.config_file} 格式错误，请检查JSON格式")
         except Exception as e:
-            logger.error(f"加载配置文件失败: {e}，使用默认配置")
-            self.config = self.DEFAULT_CONFIG.copy()
+            logger.error(f"加载配置文件失败: {e}，程序中断")
+            raise RuntimeError(f"加载配置文件 {self.config_file} 失败: {e}")
     
     def _apply_env_overrides(self):
         """应用环境变量覆盖"""
@@ -119,17 +118,25 @@ class ConfigManager:
         return section_data.get(key, default)
     
     def get_enabled_vehicle_types(self) -> Dict[int, Dict[str, Any]]:
-        """获取启用的车辆类型配置"""
+        """获取需要爬取的车辆类型配置（pages > 0）"""
         vehicle_types = self.config.get('scraping', {}).get('vehicle_types', {})
+        if not vehicle_types:
+            logger.error("配置文件中缺少 vehicle_types 配置，程序中断")
+            raise ValueError("配置文件中缺少 vehicle_types 配置")
+
         enabled_types = {}
-        
+
         for type_id, type_config in vehicle_types.items():
-            if type_config.get('enabled', True) and type_config.get('pages', 0) > 0:
+            pages = type_config.get('pages', 0)
+            if pages > 0:
                 enabled_types[int(type_id)] = {
                     'name': type_config.get('name', f'类型{type_id}'),
-                    'pages': type_config.get('pages', 0)
+                    'pages': pages
                 }
-        
+
+        if not enabled_types:
+            logger.warning("配置文件中没有需要爬取的车辆类型（所有类型的 pages 都为 0）")
+
         return enabled_types
     
     def get_schedule_config(self) -> Dict[str, Any]:
