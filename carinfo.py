@@ -63,32 +63,41 @@ def get_random_user_agent():
 
 def load_config_from_file(config_file='config.json'):
     """从配置文件加载爬取配置"""
+    if not os.path.exists(config_file):
+        logger.error(f"配置文件 {config_file} 不存在，程序中断")
+        raise FileNotFoundError(f"配置文件 {config_file} 不存在，请创建配置文件后重试")
+
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
         vehicle_types = config.get('scraping', {}).get('vehicle_types', {})
+        if not vehicle_types:
+            logger.error(f"配置文件 {config_file} 中缺少 vehicle_types 配置，程序中断")
+            raise ValueError(f"配置文件 {config_file} 中缺少 vehicle_types 配置")
+
         enabled_types = {}
 
         for type_id, type_config in vehicle_types.items():
-            if type_config.get('enabled', True) and type_config.get('pages', 0) > 0:
+            pages = type_config.get('pages', 0)
+            if pages > 0:
                 enabled_types[int(type_id)] = {
                     'name': type_config.get('name', f'类型{type_id}'),
-                    'pages': type_config.get('pages', 0)
+                    'pages': pages
                 }
 
-        logger.info(f"从配置文件 {config_file} 加载了 {len(enabled_types)} 个启用的车辆类型")
+        if not enabled_types:
+            logger.warning(f"配置文件 {config_file} 中没有需要爬取的车辆类型（所有类型的 pages 都为 0）")
+
+        logger.info(f"从配置文件 {config_file} 加载了 {len(enabled_types)} 个需要爬取的车辆类型")
         return enabled_types
 
-    except FileNotFoundError:
-        logger.error(f"配置文件 {config_file} 不存在")
-        return {}
     except json.JSONDecodeError as e:
-        logger.error(f"配置文件 {config_file} 格式错误: {e}")
-        return {}
+        logger.error(f"配置文件 {config_file} 格式错误: {e}，程序中断")
+        raise ValueError(f"配置文件 {config_file} 格式错误，请检查JSON格式")
     except Exception as e:
-        logger.error(f"加载配置文件失败: {e}")
-        return {}
+        logger.error(f"加载配置文件失败: {e}，程序中断")
+        raise RuntimeError(f"加载配置文件 {config_file} 失败: {e}")
 
 
 class CarScraper:
@@ -957,17 +966,11 @@ def main():
 
     parser = argparse.ArgumentParser(description='28car.com 车辆信息爬取工具')
     parser.add_argument('--config', action='store_true', help='从配置文件读取并执行所有启用的类型')
-    parser.add_argument('--type', type=int, choices=[1,2,3,4,5], help='车辆类型 (1-5)')
-    parser.add_argument('--pages', type=str, help='爬取页数，如"3"或"3,10"')
     parser.add_argument('--config-file', default='config.json', help='配置文件路径')
 
     args = parser.parse_args()
 
-    vehicle_types = {
-        1: '私家车', 2: '客货车', 3: '货车', 4: '电单车', 5: '经典车'
-    }
-
-    if not any([args.config, args.type, args.pages]):
+    if not args.config:
         print("未指定参数，默认使用配置文件模式")
         args.config = True
 
@@ -978,7 +981,7 @@ def main():
         enabled_types = load_config_from_file(args.config_file)
 
         if not enabled_types:
-            print("[ERROR] 配置文件中没有启用的车辆类型或配置文件加载失败")
+            print("[ERROR] 配置文件中没有需要爬取的车辆类型（所有类型的 pages 都为 0）")
             sys.exit(1)
 
         print(f"将爬取 {len(enabled_types)} 种车辆类型:")
@@ -1001,52 +1004,6 @@ def main():
             if os.path.exists(csv_filename):
                 print(f"  - {csv_filename}")
         print(f"所有CSV文件可直接用于数据库导入！")
-
-        print(f"\n=== 开始自动导入数据库 ===")
-        auto_import_to_database()
-        return
-
-    if args.type and args.pages:
-        vehicle_type = args.type
-        page_input = args.pages
-
-        print(f"=== 命令行模式启动 ===")
-        print(f"车辆类型: {vehicle_type} ({vehicle_types.get(vehicle_type, '未知')})")
-        print(f"页数配置: {page_input}")
-
-        try:
-            if ',' in page_input:
-                start_page, end_page = map(int, page_input.split(','))
-                if start_page > 0 and end_page >= start_page:
-                    START_PAGE = start_page
-                    END_PAGE = end_page
-                    GLOBE_PAGE = end_page - start_page + 1
-                    print(f"将爬取第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
-                else:
-                    print("起始页必须大于0，结束页必须大于等于起始页")
-                    sys.exit(1)
-            else:
-                end_page = int(page_input)
-                if end_page > 0:
-                    START_PAGE = 1
-                    END_PAGE = end_page
-                    GLOBE_PAGE = end_page
-                    print(f"将爬取第1页到第{END_PAGE}页，共{GLOBE_PAGE}页")
-                else:
-                    print("页数必须大于0")
-                    sys.exit(1)
-        except ValueError:
-            print("页数格式错误")
-            sys.exit(1)
-
-        csv_filename = f"car_data_{vehicle_type}.csv"
-        total_vehicles = scrape_vehicle_type(vehicle_type, GLOBE_PAGE, csv_filename)
-
-        print(f'\n=== 爬取完成！ ===')
-        print(f"车辆类型: {vehicle_types.get(vehicle_type, '未知')}")
-        print(f"爬取页数范围: 第{START_PAGE}页到第{END_PAGE}页，共{GLOBE_PAGE}页")
-        print(f"总共获取车辆数: {total_vehicles}")
-        print(f"CSV文件: {csv_filename}")
 
         print(f"\n=== 开始自动导入数据库 ===")
         auto_import_to_database()

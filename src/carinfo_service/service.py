@@ -89,14 +89,55 @@ class CarinfoService:
         self.state_file = state_file
         self._running = True
 
-        self.window_morning = TimeWindow((9, 0), (11, 0))
-        self.window_afternoon = TimeWindow((16, 0), (20, 0))
-
-        # 每次执行的页数配置
-        self.pages_by_type = {1: 40, 2: 20, 3: 20, 4: 20, 5: 20}
+        # 从配置文件加载时间和页数配置
+        self._load_config()
 
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
+
+    def _load_config(self):
+        """从配置文件加载配置"""
+        config_file = 'config.json'
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(f"配置文件 {config_file} 不存在，请创建配置文件后重试")
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"配置文件 {config_file} 格式错误: {e}")
+
+        # 加载爬取页数配置
+        vehicle_types = config.get('scraping', {}).get('vehicle_types', {})
+        if not vehicle_types:
+            raise ValueError("配置文件中缺少 vehicle_types 配置")
+
+        self.pages_by_type = {}
+        for type_id, type_config in vehicle_types.items():
+            pages = type_config.get('pages', 0)
+            self.pages_by_type[int(type_id)] = pages
+
+        # 加载定时任务配置（从 schedule 配置中读取）
+        # 默认使用早上8点到下午6点之间
+        schedule = config.get('schedule', {})
+        times = schedule.get('times', ['08:00', '18:00'])
+
+        if len(times) >= 2:
+            start_time = self._parse_time(times[0])
+            end_time = self._parse_time(times[1])
+        else:
+            start_time = (8, 0)
+            end_time = (18, 0)
+
+        self.window = TimeWindow(start_time, end_time)
+
+    def _parse_time(self, time_str: str) -> Tuple[int, int]:
+        """解析时间字符串为 (hour, minute)"""
+        try:
+            parts = time_str.split(':')
+            return int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            return 8, 0  # 默认早上8点
 
     def _handle_signal(self, *_):
         self._log("收到停止信号，准备退出（若正在执行任务，将在本轮结束后退出）", level="WARNING")
@@ -153,9 +194,11 @@ class CarinfoService:
 
         return start + timedelta(seconds=random.randint(0, seconds))
 
-    def _ensure_next_times(self) -> Tuple[datetime, datetime]:
+    def _ensure_next_time(self) -> datetime:
+        """确保下次执行时间（确保同一天不重复执行）"""
         state = self._load_state()
         now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
 
         def parse_dt(v: str) -> Optional[datetime]:
             try:
@@ -163,27 +206,37 @@ class CarinfoService:
             except Exception:
                 return None
 
-        next_m = parse_dt(state.get("next_morning", ""))
-        next_a = parse_dt(state.get("next_afternoon", ""))
+        # 检查今天是否已经执行过
+        last_run_date = state.get("last_run_date", "")
+        if last_run_date == today_str:
+            # 今天已执行，安排明天的随机时间
+            tomorrow = now + timedelta(days=1)
+            next_run = self._pick_random_time(tomorrow, self.window)
+            self._log(f"今天({today_str})已执行过任务，安排明天执行", level="INFO")
+        else:
+            # 今天还未执行，检查当前是否有待执行的时间
+            next_run = parse_dt(state.get("next_run", ""))
+            if not next_run or next_run <= now:
+                next_run = self._pick_random_time(now, self.window)
 
-        if not next_m or next_m <= now:
-            next_m = self._pick_random_time(now, self.window_morning)
-        if not next_a or next_a <= now:
-            next_a = self._pick_random_time(now, self.window_afternoon)
-
-        state["next_morning"] = next_m.isoformat(timespec="seconds")
-        state["next_afternoon"] = next_a.isoformat(timespec="seconds")
+        state["next_run"] = next_run.isoformat(timespec="seconds")
         self._save_state(state)
 
-        return next_m, next_a
+        return next_run
 
-    def _reschedule_after_skip(self, which: str) -> None:
+    def _reschedule_after_skip(self) -> None:
         now = datetime.now()
         state = self._load_state()
-        if which == "morning":
-            state["next_morning"] = self._pick_random_time(now, self.window_morning).isoformat(timespec="seconds")
+        # 跳过时也检查是否今天已执行
+        today_str = now.strftime("%Y-%m-%d")
+        last_run_date = state.get("last_run_date", "")
+        if last_run_date == today_str:
+            # 今天已执行，安排明天
+            tomorrow = now + timedelta(days=1)
+            next_run = self._pick_random_time(tomorrow, self.window)
         else:
-            state["next_afternoon"] = self._pick_random_time(now, self.window_afternoon).isoformat(timespec="seconds")
+            next_run = self._pick_random_time(now, self.window)
+        state["next_run"] = next_run.isoformat(timespec="seconds")
         self._save_state(state)
 
     def _run_one_job(self) -> None:
@@ -192,7 +245,7 @@ class CarinfoService:
             return
 
         start = time.time()
-        self._log("=== 开始执行任务（按固定页数爬取并入库）===", level="INFO")
+        self._log("=== 开始执行任务（从配置文件读取爬取配置）===", level="INFO")
 
         try:
             if os.getcwd() not in sys.path:
@@ -202,16 +255,28 @@ class CarinfoService:
 
             total = 0
             for t in (1, 2, 3, 4, 5):
-                pages = self.pages_by_type[t]
+                pages = self.pages_by_type.get(t, 0)
+                if pages <= 0:
+                    self._log(f"跳过类型{t}（pages=0）", level="INFO")
+                    continue
+
                 csv = f"car_data_{t}.csv"
                 self._log(f"开始类型{t}，页数={pages}", level="INFO")
                 total += carinfo.scrape_vehicle_type(t, pages, csv, start_page=1)
+
+            if total == 0:
+                self._log("没有需要爬取的车辆类型（所有类型pages都为0）", level="WARNING")
 
             self._log(f"爬取结束，累计抓取 {total} 条，准备入库...", level="INFO")
             carinfo.auto_import_to_database()
 
             cost = time.time() - start
             self._log(f"=== 任务完成，耗时 {cost/60:.1f} 分钟 ===", level="INFO")
+
+            # 记录本次执行日期，防止同一天重复执行
+            state = self._load_state()
+            state["last_run_date"] = datetime.now().strftime("%Y-%m-%d")
+            self._save_state(state)
 
         except Exception as e:
             self._log(f"任务执行异常: {e}", level="ERROR")
@@ -226,18 +291,17 @@ class CarinfoService:
         self._log("服务启动：立即执行一次任务（如果当前无任务运行）", level="INFO")
         self._run_one_job()
 
-        self._log("进入调度循环：每天 09:00-11:00 / 16:00-20:00 各随机执行一次", level="INFO")
+        start_h, start_m = self.window.start_hm
+        end_h, end_m = self.window.end_hm
+        self._log(f"进入调度循环：每天 {start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d} 之间随机执行一次", level="INFO")
 
         while self._running:
-            next_m, next_a = self._ensure_next_times()
+            next_run = self._ensure_next_time()
             now = datetime.now()
-
-            next_run = min(next_m, next_a)
-            which = "morning" if next_run == next_m else "afternoon"
 
             wait_s = max(1, int((next_run - now).total_seconds()))
             self._log(
-                f"下一次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({which})，等待 {wait_s} 秒",
+                f"下一次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_s} 秒",
                 level="INFO",
             )
 
@@ -252,19 +316,9 @@ class CarinfoService:
 
             if os.path.exists(self.lock.path) and not self.lock._is_stale():
                 self._log("到达触发时间，但上一次任务仍在运行，跳过并顺延重排", level="WARNING")
-                self._reschedule_after_skip(which)
+                self._reschedule_after_skip()
                 continue
 
             self._run_one_job()
-
-            state = self._load_state()
-            now2 = datetime.now()
-            if which == "morning":
-                state["next_morning"] = self._pick_random_time(now2, self.window_morning).isoformat(timespec="seconds")
-            else:
-                state["next_afternoon"] = self._pick_random_time(now2, self.window_afternoon).isoformat(
-                    timespec="seconds"
-                )
-            self._save_state(state)
 
         self._log("服务已退出", level="INFO")
