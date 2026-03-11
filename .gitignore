@@ -1,7 +1,6 @@
 __pycache__/
 debug_pages/
 car_data_1.csv
-*.md
 .env
 test.py
 log/
@@ -14,3 +13,10 @@ config.json
 .codebuddy/
 .vscode/
 .idea/
+
+# 数据文件/运行产物
+car_data_*.csv
+*.log
+*.pid
+*.lock
+.carinfo_service_state.json
