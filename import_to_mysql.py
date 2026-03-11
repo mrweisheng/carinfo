@@ -12,7 +12,6 @@ import json
 import glob
 from datetime import datetime
 import time
-import requests
 import re
 from typing import Tuple, List, Dict, Any, Optional
 
@@ -200,7 +199,7 @@ class ImportHistory:
         try:
             cursor = self.connection.cursor(dictionary=True)
             sql = """
-                SELECT * FROM import_history 
+                SELECT * FROM import_history
                 WHERE import_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
                 ORDER BY import_date DESC, import_time DESC
             """
@@ -211,6 +210,79 @@ class ImportHistory:
         except Exception as e:
             print(f"获取导入历史失败: {e}")
             return []
+
+
+class CrawlLogManager:
+    """爬取日志管理器"""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def _ensure_table(self):
+        """确保爬取日志表存在"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS crawl_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    crawl_date DATE NOT NULL,
+                    crawl_time TIME NOT NULL,
+                    vehicle_type VARCHAR(50),
+                    pages_scraped INT DEFAULT 0,
+                    total_vehicles INT DEFAULT 0,
+                    new_vehicles INT DEFAULT 0,
+                    updated_vehicles INT DEFAULT 0,
+                    skipped_vehicles INT DEFAULT 0,
+                    proxy_used_count INT DEFAULT 0,
+                    proxy_fail_count INT DEFAULT 0,
+                    anti_crawler_triggered INT DEFAULT 0,
+                    error_count INT DEFAULT 0,
+                    crawl_duration_seconds FLOAT DEFAULT 0,
+                    import_duration_seconds FLOAT DEFAULT 0,
+                    total_duration_seconds FLOAT DEFAULT 0,
+                    status VARCHAR(20) DEFAULT 'success',
+                    error_details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_crawl_date (crawl_date),
+                    INDEX idx_vehicle_type (vehicle_type)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            self.connection.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"创建爬取日志表失败: {e}")
+
+    def record_crawl(self, vehicle_type: str, pages_scraped: int, total_vehicles: int,
+                    new_vehicles: int, updated_vehicles: int, skipped_vehicles: int,
+                    proxy_used_count: int, proxy_fail_count: int, anti_crawler_triggered: int,
+                    error_count: int, crawl_duration: float, import_duration: float,
+                    status: str, error_details: str = None):
+        """记录爬取日志"""
+        try:
+            cursor = self.connection.cursor()
+            now = datetime.now()
+            sql = """
+                INSERT INTO crawl_logs (
+                    crawl_date, crawl_time, vehicle_type, pages_scraped,
+                    total_vehicles, new_vehicles, updated_vehicles, skipped_vehicles,
+                    proxy_used_count, proxy_fail_count, anti_crawler_triggered,
+                    error_count, crawl_duration_seconds, import_duration_seconds,
+                    total_duration_seconds, status, error_details
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                now.date(), now.time(), vehicle_type, pages_scraped,
+                total_vehicles, new_vehicles, updated_vehicles, skipped_vehicles,
+                proxy_used_count, proxy_fail_count, anti_crawler_triggered,
+                error_count, crawl_duration, import_duration,
+                crawl_duration + import_duration, status, error_details
+            ))
+            self.connection.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"记录爬取日志失败: {e}")
+            return False
 
 
 class FastCSVImporter:
@@ -478,15 +550,9 @@ class FastCSVImporter:
                 insert_time = time.time() - start_insert
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
             
-            # 更新现有车辆（根据配置选择API或数据库更新）
+            # 更新现有车辆（直接操作数据库）
             if update_vehicles:
-                api_url = os.environ.get('API_URL', '')
-                use_api = bool(api_url)
-
-                if use_api:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在通过API更新 {len(update_vehicles)} 条车辆记录...")
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在通过数据库更新 {len(update_vehicles)} 条车辆记录...")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在更新 {len(update_vehicles)} 条车辆记录...")
 
                 start_update = time.time()
 
@@ -503,94 +569,16 @@ class FastCSVImporter:
 
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理批次 {batch_num + 1}/{total_batches}，{len(batch_vehicles)} 条记录...")
 
-                    if use_api:
-                        # === API 更新模式 ===
-                        try:
-                            # 准备API请求数据
-                            api_updates = []
-                            for vehicle_data in batch_vehicles:
-                                fields = {}
-                                if vehicle_data[1]: fields["vehicle_type"] = vehicle_data[1]
-                                if vehicle_data[2] is not None: fields["vehicle_status"] = int(vehicle_data[2])
-                                if vehicle_data[3]: fields["page_number"] = vehicle_data[3]
-                                if vehicle_data[4]: fields["car_number"] = vehicle_data[4]
-                                if vehicle_data[5]: fields["car_url"] = vehicle_data[5]
-                                if vehicle_data[6]: fields["car_category"] = vehicle_data[6]
-                                if vehicle_data[7]: fields["car_brand"] = vehicle_data[7]
-                                if vehicle_data[8]: fields["car_model"] = vehicle_data[8]
-                                if vehicle_data[9]: fields["fuel_type"] = vehicle_data[9]
-                                if vehicle_data[10] is not None: fields["seats"] = vehicle_data[10]
-                                if vehicle_data[11]: fields["engine_volume"] = vehicle_data[11]
-                                if vehicle_data[12]: fields["transmission"] = vehicle_data[12]
-                                if vehicle_data[13] is not None: fields["year"] = vehicle_data[13]
-                                if vehicle_data[14]: fields["description"] = vehicle_data[14]
-                                if vehicle_data[15]: fields["price"] = vehicle_data[15]
-                                if vehicle_data[16] is not None: fields["current_price"] = float(vehicle_data[16])
-                                if vehicle_data[17] is not None: fields["original_price"] = float(vehicle_data[17])
-                                if vehicle_data[18]: fields["contact_info"] = vehicle_data[18]
-                                if vehicle_data[19]: fields["update_date"] = vehicle_data[19]
-                                if vehicle_data[21]: fields["contact_name"] = vehicle_data[21]
-                                if vehicle_data[22]: fields["phone_number"] = vehicle_data[22]
-
-                                api_updates.append({
-                                    "vehicle_id": vehicle_data[0],
-                                    "fields": fields
-                                })
-
-                            api_key = os.environ.get('API_KEY', '')
-                            headers = {}
-                            if api_key:
-                                headers['Authorization'] = f'Bearer {api_key}'
-
-                            payload = {"updates": api_updates}
-
-                            response = requests.post(api_url, json=payload, headers=headers, timeout=60)
-
-                            if response.status_code == 200:
-                                result = response.json()
-                                batch_success = result.get('data', {}).get('success_count', 0)
-                                batch_error = result.get('data', {}).get('error_count', 0)
-                                success_count += batch_success
-                                error_count += batch_error
-
-                                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {batch_success}, 失败 {batch_error}")
-
-                                if batch_error > 0:
-                                    errors = result.get('data', {}).get('errors', [])
-                                    for error in errors[:3]:
-                                        print(f"  错误: {error}")
-                            else:
-                                print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API调用失败: {response.status_code}")
-                                print(f"  响应: {response.text[:200]}...")
-
-                                # 回退到数据库更新
-                                print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
-                                self._update_via_database(batch_vehicles)
-                                success_count += len(batch_vehicles)
-
-                        except requests.exceptions.RequestException as e:
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] API请求异常: {e}")
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
-                            self._update_via_database(batch_vehicles)
-                            success_count += len(batch_vehicles)
-                        except Exception as e:
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次处理失败: {e}")
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 回退到数据库更新...")
-                            self._update_via_database(batch_vehicles)
-                            success_count += len(batch_vehicles)
-                    else:
-                        # === 数据库直接更新模式 ===
-                        try:
-                            self._update_via_database(batch_vehicles)
-                            success_count += len(batch_vehicles)
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
-                        except Exception as e:
-                            error_count += len(batch_vehicles)
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
+                    try:
+                        self._update_via_database(batch_vehicles)
+                        success_count += len(batch_vehicles)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
+                    except Exception as e:
+                        error_count += len(batch_vehicles)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
 
                 update_time = time.time() - start_update
-                mode_str = "API" if use_api else "数据库"
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] {mode_str}更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
             
             # 插入图片（仅新车辆，更新车辆不处理图片）
             if new_images:
@@ -744,19 +732,39 @@ def main():
     print("优化特性:")
     print("- 数据校验（价格、电话、年份等）")
     print("- 导入历史记录")
+    print("- 爬取日志记录")
     print("- 环境变量支持（敏感信息脱敏）")
     print("- 批量操作优化")
     print("- 分批更新避免大事务")
+
+    # 从环境变量读取爬取统计
+    crawl_stats = {
+        'vehicle_type': os.environ.get('CRAWL_VEHICLE_TYPE', ''),
+        'pages_scraped': int(os.environ.get('CRAWL_PAGES_SCRAPED', '0')),
+        'total_vehicles': int(os.environ.get('CRAWL_TOTAL_VEHICLES', '0')),
+        'proxy_used_count': int(os.environ.get('CRAWL_PROXY_USED', '0')),
+        'proxy_fail_count': int(os.environ.get('CRAWL_PROXY_FAIL', '0')),
+        'anti_crawler_triggered': int(os.environ.get('CRAWL_ANTI_CRAWLER', '0')),
+        'crawl_duration': float(os.environ.get('CRAWL_DURATION', '0')),
+        'error_count': int(os.environ.get('CRAWL_ERROR_COUNT', '0')),
+    }
+    has_crawl_stats = any(v != 0 and v != '' for v in crawl_stats.values() if isinstance(v, (int, float))) or crawl_stats['vehicle_type']
 
     importer = FastCSVImporter()
 
     if not importer.connect():
         return
 
+    import_start_time = datetime.now()
+
     try:
         # 初始化历史记录
         importer.history = ImportHistory(importer.connection)
-        
+
+        # 初始化爬取日志（如果表不存在会自动创建）
+        crawl_log_manager = CrawlLogManager(importer.connection)
+        crawl_log_manager._ensure_table()
+
         # 检查CSV文件
         csv_files = glob.glob("car_data_*.csv")
         if not csv_files:
@@ -766,14 +774,52 @@ def main():
         print(f"\n找到 {len(csv_files)} 个CSV文件:")
         for f in csv_files:
             print(f"  - {f}")
-        
+
+        # 记录每个文件的导入结果
+        total_new = 0
+        total_updated = 0
+        total_skipped = 0
+        total_errors = 0
+
         # 直接开始导入
         print("\n开始自动导入...")
         importer.import_all_csv()
-        
+
         # 显示统计
         importer.show_stats()
-        
+
+        # 计算导入耗时
+        import_duration = (datetime.now() - import_start_time).total_seconds()
+
+        # 尝试从导入历史中获取新增/更新统计
+        if importer.history:
+            recent = importer.history.get_recent_history(days=1)
+            for record in recent:
+                total_new += record.get('new_records', 0)
+                total_updated += record.get('updated_records', 0)
+                total_skipped += record.get('skipped_records', 0)
+                total_errors += record.get('error_count', 0)
+
+        # 记录爬取日志（如果有爬取统计）
+        if has_crawl_stats:
+            crawl_log_manager.record_crawl(
+                vehicle_type=crawl_stats['vehicle_type'],
+                pages_scraped=crawl_stats['pages_scraped'],
+                total_vehicles=crawl_stats['total_vehicles'],
+                new_vehicles=total_new,
+                updated_vehicles=total_updated,
+                skipped_vehicles=total_skipped,
+                proxy_used_count=crawl_stats['proxy_used_count'],
+                proxy_fail_count=crawl_stats['proxy_fail_count'],
+                anti_crawler_triggered=crawl_stats['anti_crawler_triggered'],
+                error_count=total_errors + crawl_stats['error_count'],
+                crawl_duration=crawl_stats['crawl_duration'],
+                import_duration=import_duration,
+                status='success',
+                error_details=None
+            )
+            print("\n[OK] 爬取日志已记录到数据库")
+
     finally:
         importer.close()
 

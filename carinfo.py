@@ -830,6 +830,13 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
     """
     print(f"\n=== 开始爬取 (类型{vehicle_type}) ===")
 
+    # 爬取统计
+    crawl_start_time = time.time()
+    anti_crawler_triggered = 0
+    proxy_fail_count = 0
+    pages_scraped = 0
+    error_count = 0
+
     # 每次定时任务启动时，刷新代理池（重新随机抽取2000个）
     proxy_manager = get_proxy_manager(pool_size=2000)
     print("正在刷新代理池（从数据库随机抽取2000个代理）...")
@@ -846,6 +853,8 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
         print(f"将创建新文件: {csv_filename}")
 
     total_vehicles = 0
+    vehicle_type_names = {1: '私家车', 2: '客货车', 3: '货车', 4: '电单车', 5: '经典车'}
+    vehicle_type_name = vehicle_type_names.get(vehicle_type, f'类型{vehicle_type}')
 
     for page in range(start_page, pages + 1):
         print(f'\n=== 正在处理第 {page} 页 ===')
@@ -857,6 +866,7 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
 
         if decoded_html is None:
             print(f'第 {page} 页因反爬虫终止，停止爬取')
+            anti_crawler_triggered += 1
             break
 
         dateCode_i = scraper.get_date_code(decoded_html)
@@ -873,6 +883,7 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
 
         if len(scraper.car_data) == 0 and any(status == "未售" for status in sale_status_list):
             print(f'第 {page} 页详情爬取因反爬虫终止，停止爬取')
+            anti_crawler_triggered += 1
             break
 
         if scraper.car_data:
@@ -884,12 +895,26 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
             else:
                 print(f'第 {page} 页CSV文件生成失败')
 
+        pages_scraped += 1
+
         if page < pages:
             delay = random.uniform(3.0, 6.0)
             print(f'休息 {delay:.1f} 秒，准备处理下一页...')
             time.sleep(delay)
 
-    print(f'\n爬取完成！车辆数: {total_vehicles}')
+    crawl_duration = time.time() - crawl_start_time
+    print(f'\n爬取完成！车辆数: {total_vehicles}, 爬取页数: {pages_scraped}, 反爬触发: {anti_crawler_triggered}')
+
+    # 设置环境变量供导入脚本使用
+    os.environ['CRAWL_VEHICLE_TYPE'] = vehicle_type_name
+    os.environ['CRAWL_PAGES_SCRAPED'] = str(pages_scraped)
+    os.environ['CRAWL_TOTAL_VEHICLES'] = str(total_vehicles)
+    os.environ['CRAWL_PROXY_USED'] = str(stats.get('pool_size', 0))
+    os.environ['CRAWL_PROXY_FAIL'] = str(proxy_fail_count)
+    os.environ['CRAWL_ANTI_CRAWLER'] = str(anti_crawler_triggered)
+    os.environ['CRAWL_DURATION'] = str(round(crawl_duration, 2))
+    os.environ['CRAWL_ERROR_COUNT'] = str(error_count)
+
     return total_vehicles
 
 
