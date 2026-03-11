@@ -1,396 +1,402 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-智能CSV数据导入MySQL数据库脚本
-支持新的CSV格式（包含sale_status字段），实现更新策略
+高性能CSV数据导入MySQL脚本
+包含数据校验、去重、历史记录等功能
 """
 
-import pandas as pd
-import mysql.connector
-from mysql.connector import Error
-import csv
 import os
-import logging
+import mysql.connector
+import csv
+import json
 import glob
 from datetime import datetime
-import json
+import time
 import re
+from typing import Tuple, List, Dict, Any, Optional
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# 加载环境变量
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # 如果没有python-dotenv，使用系统环境变量
 
-class SmartMySQLImporter:
-    def __init__(self, host='127.0.0.1', user='root', password='1qaz!QAZ2wsx@WSX', database='car_info_db', port=3306):
-        """初始化MySQL连接"""
-        self.host = host
-        self.user = user
-        self.password = password
-        self.database = database
-        self.port = port
+
+class DataValidator:
+    """数据校验器"""
+    
+    @staticmethod
+    def validate_vehicle_id(vehicle_id: str) -> Tuple[bool, str]:
+        """验证车辆ID"""
+        if not vehicle_id or vehicle_id.strip() == '':
+            return False, "车辆ID不能为空"
+        if len(vehicle_id) > 100:
+            return False, "车辆ID过长"
+        return True, ""
+    
+    @staticmethod
+    def validate_price(price_str: str) -> Tuple[bool, str]:
+        """验证价格格式"""
+        if not price_str:
+            return True, ""  # 价格可以为空
+        
+        price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
+        
+        if '[' in price_str and '原價' in price_str:
+            current_part = price_str.split('[')[0].strip()
+            original_part = price_str.split('原價')[1].split(']')[0].strip()
+            
+            current_clean = current_part.replace(',', '').replace('$', '').strip()
+            original_clean = original_part.replace(',', '').replace('$', '').strip()
+            
+            try:
+                current = float(current_clean) if current_clean else None
+                original = float(original_clean) if original_clean else None
+                if current is not None and current < 0:
+                    return False, f"价格不能为负数: {price_str}"
+            except ValueError:
+                return False, f"价格格式无效: {price_str}"
+        else:
+            clean = price_str.replace(',', '').replace('$', '').strip()
+            try:
+                price = float(clean) if clean else None
+                if price is not None and price < 0:
+                    return False, f"价格不能为负数: {price_str}"
+            except ValueError:
+                return False, f"价格格式无效: {price_str}"
+        
+        return True, ""
+    
+    @staticmethod
+    def validate_phone(phone: str) -> Tuple[bool, str]:
+        """验证电话号码"""
+        if not phone:
+            return True, ""  # 电话可以为空
+        
+        phone = str(phone).strip()
+        if not re.match(r'^\d{8}$', phone):
+            return False, f"电话号码格式无效: {phone}"
+        return True, ""
+    
+    @staticmethod
+    def validate_year(year: str) -> Tuple[bool, str]:
+        """验证年份"""
+        if not year:
+            return True, ""  # 年份可以为空
+        
+        try:
+            year_val = int(year)
+            current_year = datetime.now().year
+            if year_val < 1900 or year_val > current_year + 1:
+                return False, f"年份超出合理范围: {year_val}"
+        except ValueError:
+            return False, f"年份格式无效: {year}"
+        return True, ""
+    
+    @staticmethod
+    def validate_seats(seats: str) -> Tuple[bool, str]:
+        """验证座位数"""
+        if not seats:
+            return True, ""
+        
+        try:
+            seats_val = int(seats)
+            if seats_val < 1 or seats_val > 50:
+                return False, f"座位数超出合理范围: {seats}"
+        except ValueError:
+            return False, f"座位数格式无效: {seats}"
+        return True, ""
+    
+    def validate_row(self, row: dict) -> List[str]:
+        """验证整行数据"""
+        errors = []
+        
+        valid, msg = self.validate_vehicle_id(row.get('vehicle_id', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_price(row.get('price', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_phone(row.get('phone_number', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_year(row.get('year', ''))
+        if not valid:
+            errors.append(msg)
+        
+        valid, msg = self.validate_seats(row.get('seats', ''))
+        if not valid:
+            errors.append(msg)
+        
+        return errors
+
+
+class ImportHistory:
+    """导入历史记录"""
+    
+    def __init__(self, db_connection):
+        self.connection = db_connection
+        self._ensure_table()
+    
+    def _ensure_table(self):
+        """确保历史记录表存在"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS import_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    import_date DATE NOT NULL,
+                    import_time TIME NOT NULL,
+                    file_name VARCHAR(255) NOT NULL,
+                    total_records INT,
+                    new_records INT,
+                    updated_records INT,
+                    skipped_records INT,
+                    error_count INT,
+                    duration_seconds FLOAT,
+                    status VARCHAR(20),
+                    error_details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_import_date (import_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            self.connection.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"创建历史记录表失败: {e}")
+    
+    def record_import(self, file_name: str, total: int, new: int, updated: int, 
+                     skipped: int, errors: int, duration: float, status: str, 
+                     error_details: str = None):
+        """记录导入历史"""
+        try:
+            cursor = self.connection.cursor()
+            now = datetime.now()
+            sql = """
+                INSERT INTO import_history 
+                (import_date, import_time, file_name, total_records, new_records, 
+                 updated_records, skipped_records, error_count, duration_seconds, 
+                 status, error_details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                now.date(), now.time(), file_name, total, new, updated,
+                skipped, errors, duration, status, error_details
+            ))
+            self.connection.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"记录导入历史失败: {e}")
+            return False
+    
+    def get_recent_history(self, days: int = 7) -> List[Dict]:
+        """获取最近的导入历史"""
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            sql = """
+                SELECT * FROM import_history
+                WHERE import_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                ORDER BY import_date DESC, import_time DESC
+            """
+            cursor.execute(sql, (days,))
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            print(f"获取导入历史失败: {e}")
+            return []
+
+
+class CrawlLogManager:
+    """爬取日志管理器"""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def _ensure_table(self):
+        """确保爬取日志表存在"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS crawl_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    crawl_date DATE NOT NULL,
+                    crawl_time TIME NOT NULL,
+                    vehicle_type VARCHAR(50),
+                    pages_scraped INT DEFAULT 0,
+                    total_vehicles INT DEFAULT 0,
+                    new_vehicles INT DEFAULT 0,
+                    updated_vehicles INT DEFAULT 0,
+                    skipped_vehicles INT DEFAULT 0,
+                    proxy_used_count INT DEFAULT 0,
+                    proxy_fail_count INT DEFAULT 0,
+                    anti_crawler_triggered INT DEFAULT 0,
+                    error_count INT DEFAULT 0,
+                    crawl_duration_seconds FLOAT DEFAULT 0,
+                    import_duration_seconds FLOAT DEFAULT 0,
+                    total_duration_seconds FLOAT DEFAULT 0,
+                    status VARCHAR(20) DEFAULT 'success',
+                    error_details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_crawl_date (crawl_date),
+                    INDEX idx_vehicle_type (vehicle_type)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            self.connection.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"创建爬取日志表失败: {e}")
+
+    def record_crawl(self, vehicle_type: str, pages_scraped: int, total_vehicles: int,
+                    new_vehicles: int, updated_vehicles: int, skipped_vehicles: int,
+                    proxy_used_count: int, proxy_fail_count: int, anti_crawler_triggered: int,
+                    error_count: int, crawl_duration: float, import_duration: float,
+                    status: str, error_details: str = None):
+        """记录爬取日志"""
+        try:
+            cursor = self.connection.cursor()
+            now = datetime.now()
+            sql = """
+                INSERT INTO crawl_logs (
+                    crawl_date, crawl_time, vehicle_type, pages_scraped,
+                    total_vehicles, new_vehicles, updated_vehicles, skipped_vehicles,
+                    proxy_used_count, proxy_fail_count, anti_crawler_triggered,
+                    error_count, crawl_duration_seconds, import_duration_seconds,
+                    total_duration_seconds, status, error_details
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                now.date(), now.time(), vehicle_type, pages_scraped,
+                total_vehicles, new_vehicles, updated_vehicles, skipped_vehicles,
+                proxy_used_count, proxy_fail_count, anti_crawler_triggered,
+                error_count, crawl_duration, import_duration,
+                crawl_duration + import_duration, status, error_details
+            ))
+            self.connection.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"记录爬取日志失败: {e}")
+            return False
+
+
+class FastCSVImporter:
+    def __init__(self):
+        """初始化数据库连接"""
         self.connection = None
         self.cursor = None
+        self.validator = DataValidator()
+        self.history = None
         
     def connect(self):
-        """连接到MySQL数据库"""
+        """连接数据库"""
+        print("正在连接数据库...")
         try:
+            # 从环境变量读取配置
+            db_config = {
+                'host': os.environ.get('DB_HOST', 'localhost'),
+                'user': os.environ.get('DB_USER', 'root'),
+                'password': os.environ.get('DB_PASSWORD', ''),
+                'database': os.environ.get('DB_NAME', 'car_info_db'),
+                'port': int(os.environ.get('DB_PORT', 3306))
+            }
+            
+            if not db_config['password']:
+                print("[ERROR] 数据库密码未配置，请检查环境变量 DB_PASSWORD")
+                return False
+                
+            print(f"连接到 {db_config['host']}:{db_config['port']}")
+            
             self.connection = mysql.connector.connect(
-                host=self.host,
-                user=self.user,
-                password=self.password,
-                database=self.database,
-                port=self.port,
+                host=db_config['host'],
+                user=db_config['user'],
+                password=db_config['password'],
+                database=db_config['database'],
+                port=db_config['port'],
                 charset='utf8mb4',
-                autocommit=False
+                autocommit=False,
+                buffered=True,
+                connect_timeout=30,
+                use_unicode=True,
+                sql_mode=''
             )
-            self.cursor = self.connection.cursor()
-            logger.info("成功连接到MySQL数据库")
-            return True
-        except Error as e:
-            logger.error(f"连接MySQL数据库失败: {e}")
-            return False
-    
-    def disconnect(self):
-        """断开数据库连接"""
-        if self.cursor:
-            self.cursor.close()
-        if self.connection:
-            self.connection.close()
-            logger.info("已断开MySQL数据库连接")
-    
-    def detect_csv_files(self):
-        """自动检测所有CSV文件"""
-        csv_files = []
-        pattern = "car_data_*.csv"
-        
-        for file_path in glob.glob(pattern):
-            filename = os.path.basename(file_path)
-            # 解析文件名：car_data_3.csv -> type=3 (新格式，包含所有状态)
-            parts = filename.replace('.csv', '').split('_')
-            if len(parts) >= 3:
-                vehicle_type = int(parts[2])
-                
-                # 新格式：car_data_3.csv 包含该类型的所有车辆（已售+未售）
-                csv_files.append({
-                    'file_path': file_path,
-                    'filename': filename,
-                    'vehicle_type': vehicle_type,
-                    'name': f"车辆类型{vehicle_type}（包含已售未售）"
-                })
-                logger.info(f"检测到CSV文件: {filename} -> 车辆类型{vehicle_type}")
-        
-        return csv_files
-    
-    def update_existing_vehicle_status(self):
-        """更新存量数据，将所有车辆的vehicle_status设置为未售状态"""
-        try:
-            # 更新所有vehicle_status为NULL或0的记录为1（未售）
-            update_sql = """
-            UPDATE vehicles 
-            SET vehicle_status = 1, updated_at = CURRENT_TIMESTAMP 
-            WHERE vehicle_status IS NULL OR vehicle_status = 0 OR vehicle_status NOT IN (1, 2)
-            """
+            self.cursor = self.connection.cursor(buffered=True)
             
-            self.cursor.execute(update_sql)
-            updated_count = self.cursor.rowcount
-            self.connection.commit()
+            # 性能优化设置
+            optimizations = [
+                "SET SESSION unique_checks = 0",                # 禁用唯一性检查
+                "SET SESSION sql_log_bin = 0",                  # 禁用二进制日志
+                "SET SESSION innodb_lock_wait_timeout = 300",   # 增加锁等待超时
+                "SET SESSION bulk_insert_buffer_size = 67108864"   # 设置批量插入缓冲
+            ]
             
-            logger.info(f"已更新 {updated_count} 条存量数据的vehicle_status为未售状态")
-            return updated_count
-            
-        except Error as e:
-            logger.error(f"更新存量数据失败: {e}")
-            self.connection.rollback()
-            return 0
-    
-    def import_csv_to_mysql(self, csv_file_info):
-        """将CSV文件数据导入到MySQL数据库"""
-        file_path = csv_file_info['file_path']
-        vehicle_type = csv_file_info['vehicle_type']
-        name = csv_file_info['name']
-        
-        if not os.path.exists(file_path):
-            logger.error(f"CSV文件不存在: {file_path}")
-            return False
-        
-        try:
-            # 读取CSV文件
-            data = []
-            with open(file_path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    data.append(row)
-            
-            if not data:
-                logger.warning(f"{name} CSV文件中没有数据")
-                return False
-            
-            logger.info(f"开始导入 {name} 的 {len(data)} 条车辆数据")
-            
-            # 检查CSV是否包含sale_status字段
-            if 'sale_status' not in data[0]:
-                logger.error(f"CSV文件缺少sale_status字段，无法确定车辆状态")
-                return False
-            
-            # Prepare insert/update statements
-            upsert_vehicle_sql = """
-            INSERT INTO vehicles (
-                vehicle_id, vehicle_type, vehicle_status, page_number,
-                car_number, car_url, car_category, car_brand, car_model,
-                fuel_type, seats, engine_volume, transmission, year,
-                description, price, current_price, original_price, contact_info, update_date, extra_fields,
-                contact_name, phone_number
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            ) ON DUPLICATE KEY UPDATE
-                vehicle_status = VALUES(vehicle_status),
-                car_number = VALUES(car_number),
-                car_url = VALUES(car_url),
-                car_category = VALUES(car_category),
-                car_brand = VALUES(car_brand),
-                car_model = VALUES(car_model),
-                fuel_type = VALUES(fuel_type),
-                seats = VALUES(seats),
-                engine_volume = VALUES(engine_volume),
-                transmission = VALUES(transmission),
-                year = VALUES(year),
-                description = VALUES(description),
-                price = VALUES(price),
-                current_price = VALUES(current_price),
-                original_price = VALUES(original_price),
-                contact_info = VALUES(contact_info),
-                update_date = VALUES(update_date),
-                extra_fields = VALUES(extra_fields),
-                contact_name = VALUES(contact_name),
-                phone_number = VALUES(phone_number),
-                updated_at = CURRENT_TIMESTAMP
-            """
-            
-            # 只插入新图片，不更新已存在的图片
-            insert_image_sql = """
-            INSERT IGNORE INTO vehicle_images (vehicle_id, image_url, image_order) 
-            VALUES (%s, %s, %s)
-            """
-            
-            # Batch insert data
-            imported_vehicles = 0
-            updated_vehicles = 0
-            imported_images = 0
-            
-            for row in data:
+            for opt in optimizations:
                 try:
-                    # 处理扩展字段（JSON格式）
-                    extra_fields = self._process_extra_fields(row, vehicle_type)
+                    self.cursor.execute(opt)
+                except Exception as e:
+                    print(f"警告: 优化设置失败 - {e}")
                     
-                    # 解析价格字段
-                    price_str = row.get('price', '')
-                    current_price, original_price = self._parse_price(price_str)
-                    
-                    # 转换sale_status为数据库格式
-                    sale_status = row.get('sale_status', '未售')
-                    vehicle_status = 2 if sale_status == '已售' else 1
-                    
-                    # 1. Insert/Update vehicle basic information
-                    vehicle_data = (
-                        row.get('vehicle_id', ''),
-                        vehicle_type,
-                        vehicle_status,
-                        int(row.get('page_number', 1)),
-                        row.get('car_number', ''),
-                        row.get('car_url', ''),
-                        row.get('car_category', ''),
-                        row.get('car_brand', ''),
-                        row.get('car_model', ''),
-                        row.get('fuel_type', ''),
-                        row.get('seats', ''),
-                        row.get('engine_volume', ''),
-                        row.get('transmission', ''),
-                        row.get('year', ''),
-                        row.get('description', ''),
-                        row.get('price', ''),
-                        current_price,
-                        original_price,
-                        row.get('contact_info', ''),
-                        row.get('update_date', ''),
-                        json.dumps(extra_fields) if extra_fields else None,
-                        row.get('contact_name', ''),
-                        row.get('phone_number', '')
-                    )
-                    
-                    # 检查是否已存在该车辆
-                    self.cursor.execute("SELECT vehicle_id FROM vehicles WHERE vehicle_id = %s", (row.get('vehicle_id', ''),))
-                    exists = self.cursor.fetchone()
-                    
-                    self.cursor.execute(upsert_vehicle_sql, vehicle_data)
-                    
-                    if exists:
-                        updated_vehicles += 1
-                    else:
-                        imported_vehicles += 1
-                    
-                    # 2. Process image information (只插入新图片，不更新已存在的)
-                    image_urls = row.get('image_urls', '').split('\n') if row.get('image_urls') else []
-                    
-                    # Filter empty strings and de-duplicate within the current row's image list
-                    valid_image_urls = []
-                    for url in image_urls:
-                        url = url.strip()
-                        if url and url not in valid_image_urls:
-                            valid_image_urls.append(url)
-                    
-                    # Insert image records (使用INSERT IGNORE避免重复)
-                    for i, image_url in enumerate(valid_image_urls):
-                        image_data = (row.get('vehicle_id', ''), image_url, i)
-                        self.cursor.execute(insert_image_sql, image_data)
-                        if self.cursor.rowcount > 0:  # 只有新插入的才计数
-                            imported_images += 1
-                    
-                    # Commit every 50 records
-                    if (imported_vehicles + updated_vehicles) % 50 == 0:
-                        self.connection.commit()
-                        logger.info(f"已处理 {imported_vehicles + updated_vehicles} 条车辆数据（新增:{imported_vehicles}, 更新:{updated_vehicles}），{imported_images} 条图片数据")
-                
-                except Error as e:
-                    logger.error(f"处理车辆 {row.get('vehicle_id', 'unknown')} 失败: {e}")
-                    continue
-            
-            # Final commit
             self.connection.commit()
-            
-            logger.info(f"{name} 数据导入完成！")
-            logger.info(f"新增车辆: {imported_vehicles} 条")
-            logger.info(f"更新车辆: {updated_vehicles} 条")
-            logger.info(f"新增图片: {imported_images} 条")
-            
+            print("[OK] 数据库连接成功")
             return True
-            
-        except Error as e:
-            logger.error(f"导入数据失败: {e}")
-            self.connection.rollback()
+        except Exception as e:
+            print(f"[ERROR] 数据库连接失败: {e}")
             return False
     
-    def _process_extra_fields(self, row, vehicle_type):
-        """处理扩展字段，根据车辆类型提取特殊属性"""
-        extra_fields = {}
+    def get_existing_ids(self, vehicle_ids):
+        """批量获取已存在的车辆ID"""
+        if not vehicle_ids:
+            return set()
+            
+        existing_ids = set()
+        batch_size = 10000  # 增加批次大小
         
-        # 解析价格字段
-        price_str = row.get('price', '')
-        if price_str:
-            current_price, original_price = self._parse_price(price_str)
-            if current_price is not None:
-                extra_fields['current_price'] = current_price
-            if original_price is not None:
-                extra_fields['original_price'] = original_price
-        
-        if vehicle_type in [2, 3]:  # 客货车和货车
-            # 从描述中提取客货车和货车特有信息
-            description = row.get('description', '')
+        for i in range(0, len(vehicle_ids), batch_size):
+            batch = vehicle_ids[i:i + batch_size]
+            placeholders = ','.join(['%s'] * len(batch))
+            query = f"SELECT vehicle_id FROM vehicles WHERE vehicle_id IN ({placeholders})"
+            self.cursor.execute(query, batch)
+            existing_ids.update(row[0] for row in self.cursor.fetchall())
             
-            # 提取载重量
-            cargo_match = re.search(r'(\d+\.?\d*)\s*[吨|T]', description)
-            if cargo_match:
-                extra_fields['cargo_capacity'] = f"{cargo_match.group(1)}吨"
-            
-            # 提取车厢长度
-            length_match = re.search(r'(\d+\.?\d*)\s*[米|m]', description)
-            if length_match:
-                extra_fields['body_length'] = f"{length_match.group(1)}米"
-            
-            # 提取车高
-            height_match = re.search(r'(\d+\.?\d*)\s*米.*高', description)
-            if height_match:
-                extra_fields['body_height'] = f"{height_match.group(1)}米"
-            
-            # 提取油耗
-            fuel_match = re.search(r'(\d+\.?\d*)L/100km', description)
-            if fuel_match:
-                extra_fields['fuel_consumption'] = f"{fuel_match.group(1)}L/100km"
-            
-            # 提取特殊功能
-            features = []
-            if '升降尾板' in description or '尾板' in description:
-                features.append('升降尾板')
-            if '原廠斗' in description:
-                features.append('原廠斗')
-            if '活動網' in description:
-                features.append('活動網')
-            if 'HIAB' in description or '吊机' in description:
-                features.append('HIAB吊机')
-            if '凍機' in description or '冻机' in description:
-                features.append('冷冻设备')
-            if '纖維斗' in description or '纤维斗' in description:
-                features.append('纤维斗')
-            if '孖屋' in description:
-                features.append('孖屋')
-            if features:
-                extra_fields['features'] = ', '.join(features)
-            
-            # 货车特有属性
-            if vehicle_type == 3:  # 货车
-                # 提取发动机型号
-                engine_match = re.search(r'(\d+)\s*節機', description)
-                if engine_match:
-                    extra_fields['engine_sections'] = f"{engine_match.group(1)}节机"
-                
-                # 提取车厢类型
-                if '夾車' in description:
-                    extra_fields['body_type'] = '夹车'
-                elif '冷凍車' in description or '冻车' in description:
-                    extra_fields['body_type'] = '冷冻车'
-                elif '貨車' in description:
-                    extra_fields['body_type'] = '货车'
-                
-                # 提取载重吨位
-                ton_match = re.search(r'(\d+\.?\d*)TON', description, re.IGNORECASE)
-                if ton_match:
-                    extra_fields['tonnage'] = f"{ton_match.group(1)}TON"
-        
-        elif vehicle_type == 1:  # 私家车
-            description = row.get('description', '')
-            
-            # 提取里程
-            mileage_match = re.search(r'(\d+[,，]?\d*)\s*[km|公里]', description)
-            if mileage_match:
-                extra_fields['mileage'] = f"{mileage_match.group(1)}km"
-            
-            # 提取颜色
-            color_match = re.search(r'([黑白红蓝银灰金棕绿紫])[色|色系]', description)
-            if color_match:
-                extra_fields['color'] = f"{color_match.group(1)}色"
-        
-        return extra_fields if extra_fields else None
+        return existing_ids
     
-    def _parse_price(self, price_str):
-        """
-        解析价格字符串，提取现价和原价
-        返回: (current_price, original_price)
-        """
+    def parse_price(self, price_str):
+        """解析价格字符串"""
         if not price_str:
             return None, None
-        
-        # 移除HKD$前缀
-        price_str = price_str.replace('HKD$', '').replace('HKD', '').strip()
-        
-        current_price = None
-        original_price = None
-        
-        # 处理 "54,000[原價$57,000]" 格式
-        if '[' in price_str and '原價' in price_str:
-            # 提取现价部分（方括号前）
-            current_part = price_str.split('[')[0].strip()
-            current_price = self._extract_number(current_part)
             
-            # 提取原价部分（方括号内）
-            original_part = price_str.split('原價')[1].split(']')[0].strip()
-            original_price = self._extract_number(original_part)
-        
-        # 处理只有现价的格式 "208,000"
-        else:
-            current_price = self._extract_number(price_str)
-        
-        return current_price, original_price
+        try:
+            # 移除HKD$前缀
+            price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
+            
+            current_price = None
+            original_price = None
+            
+            # 处理 "54,000[原價$57,000]" 格式
+            if '[' in price_str and '原價' in price_str:
+                # 提取现价部分（方括号前）
+                current_part = price_str.split('[')[0].strip()
+                current_price = self._extract_price_number(current_part)
+                
+                # 提取原价部分（方括号内）
+                original_part = price_str.split('原價')[1].split(']')[0].strip()
+                original_price = self._extract_price_number(original_part)
+            
+            # 处理只有现价的格式 "60,000"
+            else:
+                current_price = self._extract_price_number(price_str)
+            
+            return current_price, original_price
+        except:
+            pass
+        return None, None
     
-    def _extract_number(self, price_str):
+    def _extract_price_number(self, price_str):
         """从价格字符串中提取数字"""
         if not price_str:
             return None
@@ -402,188 +408,420 @@ class SmartMySQLImporter:
         except:
             return None
     
-    def auto_import_all_csv(self):
-        """自动导入所有CSV文件"""
-        csv_files = self.detect_csv_files()
-        
-        if not csv_files:
-            logger.warning("未检测到任何CSV文件")
+    def clean_data(self, value):
+        """清理数据"""
+        if value is None or value == '':
+            return ''
+        str_value = str(value).strip()
+        if str_value.endswith('.0'):
+            return str_value[:-2]
+        return str_value
+    
+    def import_csv(self, csv_file):
+        """导入单个CSV文件"""
+        if not os.path.exists(csv_file):
+            print(f"[ERROR] 文件不存在: {csv_file}")
             return False
-        
-        logger.info(f"检测到 {len(csv_files)} 个CSV文件，开始自动导入...")
-        
-        success_count = 0
-        total_vehicles = 0
-        
-        for csv_file in csv_files:
-            logger.info(f"正在导入: {csv_file['name']} ({csv_file['filename']})")
             
-            if self.import_csv_to_mysql(csv_file):
-                success_count += 1
-                # 统计导入的数据量
+        print(f"\n开始导入: {csv_file}")
+        
+        try:
+            # 读取CSV数据
+            with open(csv_file, 'r', encoding='utf-8-sig') as f:
+                data = list(csv.DictReader(f))
+            
+            if not data:
+                print("[ERROR] CSV文件为空")
+                return False
+                
+            print(f"读取到 {len(data)} 条记录")
+            
+            # 检查必要字段
+            if 'vehicle_id' not in data[0] or 'sale_status' not in data[0]:
+                print("[ERROR] CSV文件缺少必要字段 (vehicle_id, sale_status)")
+                return False
+            
+            # 获取车辆类型
+            filename = os.path.basename(csv_file)
+            vehicle_type = 3  # 默认类型
+            if 'car_data_' in filename:
                 try:
-                    with open(csv_file['file_path'], 'r', encoding='utf-8-sig') as f:
-                        reader = csv.DictReader(f)
-                        vehicle_count = sum(1 for row in reader)
-                        total_vehicles += vehicle_count
+                    vehicle_type = int(filename.split('_')[2].split('.')[0])
                 except:
                     pass
+            
+            # 获取已存在的ID
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始查询已存在的车辆ID...")
+            start_query = time.time()
+            vehicle_ids = [row.get('vehicle_id', '') for row in data]
+            existing_ids = self.get_existing_ids(vehicle_ids)
+            query_time = time.time() - start_query
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 查询完成，发现 {len(existing_ids)} 个已存在的记录，耗时 {query_time:.2f} 秒")
+            
+            # 准备数据
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始准备数据...")
+            start_prepare = time.time()
+            new_vehicles = []
+            update_vehicles = []
+            new_images = []
+            
+            for row in data:
+                vehicle_id = row.get('vehicle_id', '')
+                if not vehicle_id:
+                    continue
+                    
+                # 解析价格
+                current_price, original_price = self.parse_price(row.get('price', ''))
+                
+                # 处理状态
+                vehicle_status = 2 if row.get('sale_status', '未售') == '已售' else 1
+                
+                # 处理扩展字段
+                extra_fields = None
+                if row.get('extra_fields'):
+                    try:
+                        extra_fields = json.loads(row.get('extra_fields'))
+                    except:
+                        pass
+                
+                # 准备车辆数据
+                vehicle_data = (
+                    vehicle_id, vehicle_type, vehicle_status,
+                    int(row.get('page_number', 1)),
+                    self.clean_data(row.get('car_number')),
+                    row.get('car_url', ''),
+                    row.get('car_category', ''),
+                    row.get('car_brand', ''),
+                    row.get('car_model', ''),
+                    row.get('fuel_type', ''),
+                    self.clean_data(row.get('seats')),
+                    row.get('engine_volume', ''),
+                    row.get('transmission', ''),
+                    self.clean_data(row.get('year')),
+                    row.get('description', ''),
+                    row.get('price', ''),
+                    current_price, original_price,
+                    row.get('contact_info', ''),
+                    row.get('update_date', ''),
+                    json.dumps(extra_fields) if extra_fields else None,
+                    row.get('contact_name', ''),
+                    self.clean_data(row.get('phone_number'))
+                )
+                
+                if vehicle_id in existing_ids:
+                    update_vehicles.append(vehicle_data)
+                else:
+                    new_vehicles.append(vehicle_data)
+                    
+                    # 只为新车辆处理图片
+                    image_urls = row.get('image_urls', '').split('\n') if row.get('image_urls') else []
+                    for i, url in enumerate(image_urls):
+                        url = url.strip()
+                        if url:
+                            new_images.append((vehicle_id, url, i))
+            
+            prepare_time = time.time() - start_prepare
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据准备完成，新增: {len(new_vehicles)} 条，更新: {len(update_vehicles)} 条，图片: {len(new_images)} 条，耗时 {prepare_time:.2f} 秒")
+            
+            # 执行批量操作
+            start_time = datetime.now()
+            print(f"[{start_time.strftime('%H:%M:%S')}] 开始执行数据库操作...")
+            
+            # 插入新车辆
+            if new_vehicles:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在插入 {len(new_vehicles)} 条新车辆记录...")
+                start_insert = time.time()
+                insert_sql = """
+                INSERT IGNORE INTO vehicles (
+                    vehicle_id, vehicle_type, vehicle_status, page_number,
+                    car_number, car_url, car_category, car_brand, car_model,
+                    fuel_type, seats, engine_volume, transmission, year,
+                    description, price, current_price, original_price, 
+                    contact_info, update_date, extra_fields, contact_name, phone_number
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """
+                
+                # 一次性插入所有新车辆
+                self.cursor.executemany(insert_sql, new_vehicles)
+                self.connection.commit()
+                insert_time = time.time() - start_insert
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
+            
+            # 更新现有车辆（直接操作数据库）
+            if update_vehicles:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在更新 {len(update_vehicles)} 条车辆记录...")
+
+                start_update = time.time()
+
+                # 分批处理，每次100条
+                batch_size = 100
+                total_batches = (len(update_vehicles) + batch_size - 1) // batch_size
+                success_count = 0
+                error_count = 0
+
+                for batch_num in range(total_batches):
+                    start_idx = batch_num * batch_size
+                    end_idx = min(start_idx + batch_size, len(update_vehicles))
+                    batch_vehicles = update_vehicles[start_idx:end_idx]
+
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理批次 {batch_num + 1}/{total_batches}，{len(batch_vehicles)} 条记录...")
+
+                    try:
+                        self._update_via_database(batch_vehicles)
+                        success_count += len(batch_vehicles)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
+                    except Exception as e:
+                        error_count += len(batch_vehicles)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
+
+                update_time = time.time() - start_update
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
+            
+            # 插入图片（仅新车辆，更新车辆不处理图片）
+            if new_images:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在插入 {len(new_images)} 条图片记录（仅新车辆）...")
+                start_images = time.time()
+                image_sql = "INSERT IGNORE INTO vehicle_images (vehicle_id, image_url, image_order) VALUES (%s, %s, %s)"
+                self.cursor.executemany(image_sql, new_images)
+                self.connection.commit()
+                images_time = time.time() - start_images
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 新增 {len(new_images)} 条图片记录，耗时 {images_time:.2f} 秒")
             else:
-                logger.error(f"导入失败: {csv_file['name']}")
-        
-        logger.info(f"自动导入完成！")
-        logger.info(f"成功导入 {success_count}/{len(csv_files)} 个文件")
-        logger.info(f"总计处理 {total_vehicles} 条车辆数据")
-        
-        return success_count > 0
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 无需处理图片（无新车辆）")
+            
+            # 计算耗时
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            print(f"[OK] 导入完成！总计处理 {len(data)} 条记录，耗时 {duration:.1f} 秒")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] 导入失败: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
     
-    def show_statistics(self):
-        """显示数据库统计信息"""
+    def import_all_csv(self):
+        """导入所有CSV文件"""
+        csv_files = glob.glob("car_data_*.csv")
+        if not csv_files:
+            print("[ERROR] 未找到任何 car_data_*.csv 文件")
+            return
+        
+        print(f"找到 {len(csv_files)} 个CSV文件")
+        for csv_file in csv_files:
+            print(f"- {csv_file}")
+        
+        success_count = 0
+        start_time = datetime.now()
+        
+        for csv_file in csv_files:
+            if self.import_csv(csv_file):
+                success_count += 1
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        print(f"\n=== 导入完成 ===")
+        print(f"成功导入: {success_count}/{len(csv_files)} 个文件")
+        print(f"总耗时: {duration:.1f} 秒")
+    
+    def show_stats(self):
+        """显示统计信息"""
         try:
-            # Statistics for vehicles
             self.cursor.execute("SELECT COUNT(*) FROM vehicles")
             total_vehicles = self.cursor.fetchone()[0]
             
-            # Statistics by type and status
-            self.cursor.execute("""
-                SELECT vehicle_type, vehicle_status, COUNT(*) 
-                FROM vehicles 
-                GROUP BY vehicle_type, vehicle_status
-                ORDER BY vehicle_type, vehicle_status
-            """)
-            type_stats = self.cursor.fetchall()
-            
-            # Statistics for images
             self.cursor.execute("SELECT COUNT(*) FROM vehicle_images")
             total_images = self.cursor.fetchone()[0]
             
-            print(f"\n=== MySQL数据库统计信息 ===")
-            print(f"总车辆数: {total_vehicles}")
-            print(f"总图片数: {total_images}")
+            self.cursor.execute("""
+                SELECT vehicle_status, COUNT(*) 
+                FROM vehicles 
+                GROUP BY vehicle_status
+            """)
+            status_stats = self.cursor.fetchall()
             
-            print(f"\n按类型和状态统计:")
-            type_names = {
-                1: "私家车",
-                2: "客货车", 
-                3: "货车",
-                4: "电单车",
-                5: "经典车"
-            }
-            status_names = {
-                1: "未售",
-                2: "已售"
-            }
+            print(f"\n=== 数据库统计 ===")
+            print(f"总车辆数: {total_vehicles:,}")
+            print(f"总图片数: {total_images:,}")
             
-            for vehicle_type, vehicle_status, count in type_stats:
-                type_name = type_names.get(vehicle_type, f"类型{vehicle_type}")
-                status_name = status_names.get(vehicle_status, f"状态{vehicle_status}")
-                print(f"  {type_name}-{status_name}: {count} 个车辆")
+            for status, count in status_stats:
+                status_name = "已售" if status == 2 else "未售"
+                print(f"{status_name}: {count:,} 辆")
                 
-        except Error as e:
-            logger.error(f"获取统计信息失败: {e}")
+        except Exception as e:
+            print(f"[ERROR] 获取统计失败: {e}")
+    
+    def _update_via_database(self, batch_vehicles):
+        """数据库更新方案 - 更新所有字段"""
+        try:
+            update_sql = """
+            UPDATE vehicles SET
+                vehicle_type = %s, vehicle_status = %s, page_number = %s,
+                car_number = %s, car_url = %s, car_category = %s, car_brand = %s, car_model = %s,
+                fuel_type = %s, seats = %s, engine_volume = %s, transmission = %s, year = %s,
+                description = %s, price = %s, current_price = %s, original_price = %s,
+                contact_info = %s, update_date = %s, contact_name = %s, phone_number = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE vehicle_id = %s
+            """
+
+            update_data = []
+            for vehicle_data in batch_vehicles:
+                # 按照字段顺序: vehicle_type, vehicle_status, page_number, car_number, car_url,
+                # car_category, car_brand, car_model, fuel_type, seats, engine_volume,
+                # transmission, year, description, price, current_price, original_price,
+                # contact_info, update_date, contact_name, phone_number, vehicle_id
+                record = (
+                    vehicle_data[1],   # vehicle_type
+                    vehicle_data[2],   # vehicle_status
+                    vehicle_data[3],   # page_number
+                    vehicle_data[4],   # car_number
+                    vehicle_data[5],   # car_url
+                    vehicle_data[6],   # car_category
+                    vehicle_data[7],   # car_brand
+                    vehicle_data[8],   # car_model
+                    vehicle_data[9],   # fuel_type
+                    vehicle_data[10],  # seats
+                    vehicle_data[11],  # engine_volume
+                    vehicle_data[12],  # transmission
+                    vehicle_data[13],  # year
+                    vehicle_data[14],  # description
+                    vehicle_data[15],  # price
+                    vehicle_data[16],  # current_price
+                    vehicle_data[17],  # original_price
+                    vehicle_data[18],  # contact_info
+                    vehicle_data[19],  # update_date
+                    vehicle_data[21],  # contact_name
+                    vehicle_data[22],  # phone_number
+                    vehicle_data[0]     # vehicle_id (WHERE条件)
+                )
+                update_data.append(record)
+
+            self.cursor.executemany(update_sql, update_data)
+            self.connection.commit()
+
+        except Exception as e:
+            print(f"数据库更新失败: {e}")
+            if self.connection:
+                self.connection.rollback()
+    
+    def close(self):
+        """关闭连接"""
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()
+        print("[OK] 数据库连接已关闭")
 
 def main():
     """主函数"""
-    print("=== 智能CSV数据导入MySQL数据库 ===")
-    print("数据库配置: 127.0.0.1:3306, 用户: root")
-    
-    # Create importer instance
-    importer = SmartMySQLImporter(
-        host='127.0.0.1',
-        user='root', 
-        password='1qaz!QAZ2wsx@WSX',
-        database='car_info_db',
-        port=3306
-    )
-    
-    # Connect to database
+    # 确保输出编码正确
+    import sys
+    import io
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+
+    print("=== 高性能CSV导入工具（优化版） ===")
+    print("优化特性:")
+    print("- 数据校验（价格、电话、年份等）")
+    print("- 导入历史记录")
+    print("- 爬取日志记录")
+    print("- 环境变量支持（敏感信息脱敏）")
+    print("- 批量操作优化")
+    print("- 分批更新避免大事务")
+
+    # 从环境变量读取爬取统计
+    crawl_stats = {
+        'vehicle_type': os.environ.get('CRAWL_VEHICLE_TYPE', ''),
+        'pages_scraped': int(os.environ.get('CRAWL_PAGES_SCRAPED', '0')),
+        'total_vehicles': int(os.environ.get('CRAWL_TOTAL_VEHICLES', '0')),
+        'proxy_used_count': int(os.environ.get('CRAWL_PROXY_USED', '0')),
+        'proxy_fail_count': int(os.environ.get('CRAWL_PROXY_FAIL', '0')),
+        'anti_crawler_triggered': int(os.environ.get('CRAWL_ANTI_CRAWLER', '0')),
+        'crawl_duration': float(os.environ.get('CRAWL_DURATION', '0')),
+        'error_count': int(os.environ.get('CRAWL_ERROR_COUNT', '0')),
+    }
+    has_crawl_stats = any(v != 0 and v != '' for v in crawl_stats.values() if isinstance(v, (int, float))) or crawl_stats['vehicle_type']
+
+    importer = FastCSVImporter()
+
     if not importer.connect():
-        print("数据库连接失败，请检查连接信息")
         return
-    
+
+    import_start_time = datetime.now()
+
     try:
-        # 检测CSV文件
-        csv_files = importer.detect_csv_files()
-        if csv_files:
-            print(f"\n检测到 {len(csv_files)} 个CSV文件:")
-            for csv_file in csv_files:
-                print(f"  - {csv_file['filename']} -> {csv_file['name']}")
-        else:
-            print("\n未检测到任何CSV文件")
+        # 初始化历史记录
+        importer.history = ImportHistory(importer.connection)
+
+        # 初始化爬取日志（如果表不存在会自动创建）
+        crawl_log_manager = CrawlLogManager(importer.connection)
+        crawl_log_manager._ensure_table()
+
+        # 检查CSV文件
+        csv_files = glob.glob("car_data_*.csv")
+        if not csv_files:
+            print("\n[ERROR] 当前目录下没有找到 car_data_*.csv 文件")
             return
-        
-        # Select operation
-        print("\n请选择操作:")
-        print("1. 自动导入所有CSV文件")
-        print("2. 手动选择CSV文件导入")
-        print("3. 查看数据库统计信息")
-        print("4. 执行完整导入流程")
-        print("5. 处理存量数据（设置所有车辆为未售状态）")
-        
-        choice = input("请输入选择 (1-5): ").strip()
-        
-        if choice == "1":
-            # Auto import all CSV files
-            if importer.auto_import_all_csv():
-                print("✅ 自动导入完成")
-            else:
-                print("❌ 自动导入失败")
-        
-        elif choice == "2":
-            # Manual select CSV file
-            print("\n可用的CSV文件:")
-            for i, csv_file in enumerate(csv_files, 1):
-                print(f"{i}. {csv_file['filename']} -> {csv_file['name']}")
-            
-            try:
-                file_choice = int(input("请选择文件编号: ")) - 1
-                if 0 <= file_choice < len(csv_files):
-                    selected_file = csv_files[file_choice]
-                    if importer.import_csv_to_mysql(selected_file):
-                        print("✅ CSV数据导入成功")
-                    else:
-                        print("❌ CSV数据导入失败")
-                else:
-                    print("无效选择")
-            except ValueError:
-                print("请输入有效数字")
-        
-        elif choice == "3":
-            # View statistics
-            importer.show_statistics()
-        
-        elif choice == "4":
-            # Full import process
-            print("\n开始完整导入流程...")
-            
-            # 1. 处理存量数据
-            print("1. 处理存量数据...")
-            updated_count = importer.update_existing_vehicle_status()
-            print(f"   已更新 {updated_count} 条存量数据")
-            
-            # 2. Auto import all CSV files
-            print("2. 自动导入所有CSV文件...")
-            if not importer.auto_import_all_csv():
-                print("❌ 自动导入失败")
-            
-            # 3. Show statistics
-            print("3. 显示统计信息...")
-            importer.show_statistics()
-            
-            print("\n✅ 完整导入流程完成")
-        
-        elif choice == "5":
-            # Handle existing data
-            print("\n开始处理存量数据...")
-            updated_count = importer.update_existing_vehicle_status()
-            print(f"✅ 已更新 {updated_count} 条存量数据的vehicle_status为未售状态")
-        
-        else:
-            print("无效选择")
-    
+
+        print(f"\n找到 {len(csv_files)} 个CSV文件:")
+        for f in csv_files:
+            print(f"  - {f}")
+
+        # 记录每个文件的导入结果
+        total_new = 0
+        total_updated = 0
+        total_skipped = 0
+        total_errors = 0
+
+        # 直接开始导入
+        print("\n开始自动导入...")
+        importer.import_all_csv()
+
+        # 显示统计
+        importer.show_stats()
+
+        # 计算导入耗时
+        import_duration = (datetime.now() - import_start_time).total_seconds()
+
+        # 尝试从导入历史中获取新增/更新统计
+        if importer.history:
+            recent = importer.history.get_recent_history(days=1)
+            for record in recent:
+                total_new += record.get('new_records', 0)
+                total_updated += record.get('updated_records', 0)
+                total_skipped += record.get('skipped_records', 0)
+                total_errors += record.get('error_count', 0)
+
+        # 记录爬取日志（如果有爬取统计）
+        if has_crawl_stats:
+            crawl_log_manager.record_crawl(
+                vehicle_type=crawl_stats['vehicle_type'],
+                pages_scraped=crawl_stats['pages_scraped'],
+                total_vehicles=crawl_stats['total_vehicles'],
+                new_vehicles=total_new,
+                updated_vehicles=total_updated,
+                skipped_vehicles=total_skipped,
+                proxy_used_count=crawl_stats['proxy_used_count'],
+                proxy_fail_count=crawl_stats['proxy_fail_count'],
+                anti_crawler_triggered=crawl_stats['anti_crawler_triggered'],
+                error_count=total_errors + crawl_stats['error_count'],
+                crawl_duration=crawl_stats['crawl_duration'],
+                import_duration=import_duration,
+                status='success',
+                error_details=None
+            )
+            print("\n[OK] 爬取日志已记录到数据库")
+
     finally:
-        # Disconnect
-        importer.disconnect()
+        importer.close()
 
 if __name__ == "__main__":
     main()

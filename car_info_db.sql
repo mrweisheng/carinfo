@@ -11,11 +11,65 @@
  Target Server Version : 80042 (8.0.42-0ubuntu0.20.04.1)
  File Encoding         : 65001
 
- Date: 18/08/2025 09:57:04
+ Date: 22/08/2025 17:08:53
 */
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
+
+-- ----------------------------
+-- Table structure for daily_visitors
+-- ----------------------------
+DROP TABLE IF EXISTS `daily_visitors`;
+CREATE TABLE `daily_visitors`  (
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '记录ID（自增主键）',
+  `ip_address` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '访客IP地址',
+  `visit_date` date NOT NULL COMMENT '访问日期（年月日）',
+  `request_count` int NOT NULL DEFAULT 1 COMMENT '当日请求次数',
+  `first_visit_time` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次访问时间',
+  `last_visit_time` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后访问时间',
+  `user_agent` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT '用户代理信息',
+  `country` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '国家',
+  `region` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '省份/州',
+  `city` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '城市',
+  `isp` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '网络服务商',
+  `timezone` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '时区',
+  `location_updated_at` timestamp NULL DEFAULT NULL COMMENT '地理位置更新时间',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `uk_ip_date`(`ip_address` ASC, `visit_date` ASC) USING BTREE COMMENT 'IP地址和日期的唯一索引',
+  INDEX `idx_visit_date`(`visit_date` ASC) USING BTREE COMMENT '访问日期索引',
+  INDEX `idx_ip_address`(`ip_address` ASC) USING BTREE COMMENT 'IP地址索引',
+  INDEX `idx_request_count`(`request_count` ASC) USING BTREE COMMENT '请求次数索引',
+  INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
+  INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
+  INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引'
+) ENGINE = InnoDB AUTO_INCREMENT = 1026 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '每日访客统计表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for ip_location_cache
+-- ----------------------------
+DROP TABLE IF EXISTS `ip_location_cache`;
+CREATE TABLE `ip_location_cache`  (
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '缓存ID',
+  `ip_address` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'IP地址',
+  `country` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '国家',
+  `region` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '省份/州',
+  `city` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '城市',
+  `isp` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '网络服务商',
+  `timezone` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '时区',
+  `latitude` decimal(10, 8) NULL DEFAULT NULL COMMENT '纬度',
+  `longitude` decimal(11, 8) NULL DEFAULT NULL COMMENT '经度',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `uk_ip_address`(`ip_address` ASC) USING BTREE COMMENT 'IP地址唯一索引',
+  INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
+  INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
+  INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引',
+  INDEX `idx_updated_at`(`updated_at` ASC) USING BTREE COMMENT '更新时间索引'
+) ENGINE = InnoDB AUTO_INCREMENT = 114 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = 'IP地理位置缓存表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for user_browsing_history
@@ -28,10 +82,19 @@ CREATE TABLE `user_browsing_history`  (
   `browse_time` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '浏览时间',
   `ip_address` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT 'IP地址',
   `user_agent` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT '用户代理',
+  `country` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '国家',
+  `region` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '省份/州',
+  `city` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '城市',
+  `isp` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '网络服务商',
+  `timezone` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '时区',
+  `location_updated_at` timestamp NULL DEFAULT NULL COMMENT '地理位置更新时间',
   PRIMARY KEY (`id`) USING BTREE,
   INDEX `idx_user_id`(`user_id` ASC) USING BTREE,
   INDEX `idx_vehicle_id`(`vehicle_id` ASC) USING BTREE,
   INDEX `idx_browse_time`(`browse_time` ASC) USING BTREE,
+  INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
+  INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
+  INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引',
   CONSTRAINT `user_browsing_history_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE RESTRICT,
   CONSTRAINT `user_browsing_history_ibfk_2` FOREIGN KEY (`vehicle_id`) REFERENCES `vehicles` (`vehicle_id`) ON DELETE CASCADE ON UPDATE RESTRICT
 ) ENGINE = InnoDB AUTO_INCREMENT = 1 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用户浏览历史表' ROW_FORMAT = DYNAMIC;
@@ -86,6 +149,12 @@ CREATE TABLE `user_sessions`  (
   `refresh_token` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '刷新令牌',
   `ip_address` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT 'IP地址',
   `user_agent` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT '用户代理',
+  `country` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '国家',
+  `region` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '省份/州',
+  `city` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '城市',
+  `isp` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '网络服务商',
+  `timezone` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '时区',
+  `location_updated_at` timestamp NULL DEFAULT NULL COMMENT '地理位置更新时间',
   `expires_at` timestamp NOT NULL COMMENT '过期时间',
   `is_active` tinyint NOT NULL DEFAULT 1 COMMENT '是否活跃：1=是, 0=否',
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -95,6 +164,9 @@ CREATE TABLE `user_sessions`  (
   INDEX `idx_user_id`(`user_id` ASC) USING BTREE,
   INDEX `idx_expires_at`(`expires_at` ASC) USING BTREE,
   INDEX `idx_is_active`(`is_active` ASC) USING BTREE,
+  INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
+  INDEX `idx_region`(`region` ASC) USING BTREE COMMENT '省份索引',
+  INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引',
   CONSTRAINT `user_sessions_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE RESTRICT
 ) ENGINE = InnoDB AUTO_INCREMENT = 1 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用户会话表' ROW_FORMAT = DYNAMIC;
 
@@ -119,6 +191,11 @@ CREATE TABLE `users`  (
   `gender` enum('male','female','other') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '性别',
   `region` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '地区（根据IP自动获取）',
   `ip_address` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '注册时的IP地址',
+  `country` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '国家',
+  `city` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '城市',
+  `isp` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '网络服务商',
+  `timezone` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '时区',
+  `location_updated_at` timestamp NULL DEFAULT NULL COMMENT '地理位置更新时间',
   PRIMARY KEY (`id`) USING BTREE,
   UNIQUE INDEX `uk_username`(`username` ASC) USING BTREE,
   UNIQUE INDEX `username`(`username` ASC) USING BTREE,
@@ -142,7 +219,9 @@ CREATE TABLE `users`  (
   INDEX `idx_created_at`(`created_at` ASC) USING BTREE,
   INDEX `idx_gender`(`gender` ASC) USING BTREE,
   INDEX `idx_region`(`region` ASC) USING BTREE,
-  INDEX `idx_ip_address`(`ip_address` ASC) USING BTREE
+  INDEX `idx_ip_address`(`ip_address` ASC) USING BTREE,
+  INDEX `idx_country`(`country` ASC) USING BTREE COMMENT '国家索引',
+  INDEX `idx_city`(`city` ASC) USING BTREE COMMENT '城市索引'
 ) ENGINE = InnoDB AUTO_INCREMENT = 5 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用户表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
@@ -160,7 +239,7 @@ CREATE TABLE `vehicle_images`  (
   INDEX `idx_vehicle_id`(`vehicle_id` ASC) USING BTREE,
   INDEX `idx_image_order`(`image_order` ASC) USING BTREE,
   CONSTRAINT `vehicle_images_ibfk_1` FOREIGN KEY (`vehicle_id`) REFERENCES `vehicles` (`vehicle_id`) ON DELETE CASCADE ON UPDATE RESTRICT
-) ENGINE = InnoDB AUTO_INCREMENT = 95358 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆图片表' ROW_FORMAT = DYNAMIC;
+) ENGINE = InnoDB AUTO_INCREMENT = 100641 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆图片表' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for vehicles
@@ -194,6 +273,7 @@ CREATE TABLE `vehicles`  (
   `contact_name` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '联系人姓名',
   `phone_number` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '联系电话',
   `is_special_offer` tinyint NOT NULL DEFAULT 0 COMMENT '是否特价车辆：1=是, 0=否',
+  `transport_purpose` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '运输用途（如：冷链、普货、危化品、建材、快递等）',
   PRIMARY KEY (`id`) USING BTREE,
   UNIQUE INDEX `uk_vehicle_id`(`vehicle_id` ASC) USING BTREE,
   INDEX `idx_vehicle_id`(`vehicle_id` ASC) USING BTREE,
@@ -205,13 +285,34 @@ CREATE TABLE `vehicles`  (
   INDEX `idx_original_price`(`original_price` ASC) USING BTREE,
   INDEX `idx_contact_name`(`contact_name` ASC) USING BTREE,
   INDEX `idx_phone_number`(`phone_number` ASC) USING BTREE,
-  INDEX `idx_is_special_offer`(`is_special_offer` ASC) USING BTREE
-) ENGINE = InnoDB AUTO_INCREMENT = 20748 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆基础信息表' ROW_FORMAT = DYNAMIC;
+  INDEX `idx_is_special_offer`(`is_special_offer` ASC) USING BTREE,
+  INDEX `idx_seats`(`seats` ASC) USING BTREE COMMENT '座位数量索引',
+  INDEX `idx_seats_price`(`seats` ASC, `current_price` ASC) USING BTREE COMMENT '座位+价格复合索引',
+  INDEX `idx_seats_brand`(`seats` ASC, `car_brand` ASC) USING BTREE COMMENT '座位+品牌复合索引'
+) ENGINE = InnoDB AUTO_INCREMENT = 24183 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '车辆基础信息表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- View structure for daily_visitor_summary
+-- ----------------------------
+DROP VIEW IF EXISTS `daily_visitor_summary`;
+CREATE ALGORITHM = UNDEFINED SQL SECURITY DEFINER VIEW `daily_visitor_summary` AS select `daily_visitors`.`visit_date` AS `date`,count(0) AS `unique_visitors`,sum(`daily_visitors`.`request_count`) AS `total_requests`,avg(`daily_visitors`.`request_count`) AS `avg_requests_per_visitor`,min(`daily_visitors`.`first_visit_time`) AS `first_visit_of_day`,max(`daily_visitors`.`last_visit_time`) AS `last_visit_of_day` from `daily_visitors` group by `daily_visitors`.`visit_date` order by `daily_visitors`.`visit_date` desc;
+
+-- ----------------------------
+-- View structure for user_location_summary
+-- ----------------------------
+DROP VIEW IF EXISTS `user_location_summary`;
+CREATE ALGORITHM = UNDEFINED SQL SECURITY DEFINER VIEW `user_location_summary` AS select `users`.`country` AS `country`,`users`.`region` AS `region`,`users`.`city` AS `city`,count(0) AS `user_count`,count((case when (`users`.`status` = 1) then 1 end)) AS `active_users`,count((case when (`users`.`role` = 2) then 1 end)) AS `admin_users`,min(`users`.`created_at`) AS `first_registration`,max(`users`.`created_at`) AS `last_registration` from `users` where (`users`.`country` is not null) group by `users`.`country`,`users`.`region`,`users`.`city` order by `user_count` desc;
 
 -- ----------------------------
 -- View structure for vehicle_summary
 -- ----------------------------
 DROP VIEW IF EXISTS `vehicle_summary`;
 CREATE ALGORITHM = UNDEFINED SQL SECURITY DEFINER VIEW `vehicle_summary` AS select `v`.`id` AS `id`,`v`.`vehicle_id` AS `vehicle_id`,`v`.`vehicle_type` AS `vehicle_type`,`v`.`vehicle_status` AS `vehicle_status`,`v`.`page_number` AS `page_number`,`v`.`car_number` AS `car_number`,`v`.`car_url` AS `car_url`,`v`.`car_category` AS `car_category`,`v`.`car_brand` AS `car_brand`,`v`.`car_model` AS `car_model`,`v`.`fuel_type` AS `fuel_type`,`v`.`seats` AS `seats`,`v`.`engine_volume` AS `engine_volume`,`v`.`transmission` AS `transmission`,`v`.`year` AS `year`,`v`.`description` AS `description`,`v`.`price` AS `price`,`v`.`contact_info` AS `contact_info`,`v`.`update_date` AS `update_date`,`v`.`created_at` AS `created_at`,`v`.`updated_at` AS `updated_at`,count(`vi`.`id`) AS `image_count`,group_concat(`vi`.`image_url` order by `vi`.`image_order` ASC separator '\n') AS `all_image_urls` from (`vehicles` `v` left join `vehicle_images` `vi` on((`v`.`vehicle_id` = `vi`.`vehicle_id`))) group by `v`.`id`;
+
+-- ----------------------------
+-- View structure for visitor_location_summary
+-- ----------------------------
+DROP VIEW IF EXISTS `visitor_location_summary`;
+CREATE ALGORITHM = UNDEFINED SQL SECURITY DEFINER VIEW `visitor_location_summary` AS select `daily_visitors`.`country` AS `country`,`daily_visitors`.`region` AS `region`,`daily_visitors`.`city` AS `city`,count(0) AS `visitor_count`,sum(`daily_visitors`.`request_count`) AS `total_requests`,avg(`daily_visitors`.`request_count`) AS `avg_requests_per_visitor`,min(`daily_visitors`.`first_visit_time`) AS `first_visit`,max(`daily_visitors`.`last_visit_time`) AS `last_visit` from `daily_visitors` where (`daily_visitors`.`country` is not null) group by `daily_visitors`.`country`,`daily_visitors`.`region`,`daily_visitors`.`city` order by `visitor_count` desc;
 
 SET FOREIGN_KEY_CHECKS = 1;
