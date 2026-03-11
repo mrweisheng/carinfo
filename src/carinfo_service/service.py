@@ -296,8 +296,17 @@ class CarinfoService:
             self.lock.release()
 
     def run_forever(self) -> None:
-        self._log("服务启动：立即执行一次任务（如果当前无任务运行）", level="INFO")
-        self._run_one_job()
+        # 启动时检查今天是否已执行
+        state = self._load_state()
+        now = now_beijing()
+        today_str = now.strftime("%Y-%m-%d")
+        last_run_date = state.get("last_run_date", "")
+
+        if last_run_date == today_str:
+            self._log(f"今天({today_str})已执行过任务，启动后等待下一周期", level="INFO")
+        else:
+            self._log("启动时检测今天未执行，立即执行任务", level="INFO")
+            self._run_one_job()
 
         start_h, start_m = self.window.start_hm
         end_h, end_m = self.window.end_hm
