@@ -536,6 +536,7 @@ class FastCSVImporter:
             print(f"[{start_time.strftime('%H:%M:%S')}] 开始执行数据库操作...")
             
             # 插入新车辆
+            inserted_count = 0
             if new_vehicles:
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在插入 {len(new_vehicles)} 条新车辆记录...")
                 start_insert = time.time()
@@ -555,10 +556,13 @@ class FastCSVImporter:
                 # 一次性插入所有新车辆
                 self.cursor.executemany(insert_sql, new_vehicles)
                 self.connection.commit()
+                inserted_count = len(new_vehicles)
                 insert_time = time.time() - start_insert
-                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {len(new_vehicles)} 条车辆记录，耗时 {insert_time:.2f} 秒")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {inserted_count} 条车辆记录，耗时 {insert_time:.2f} 秒")
             
             # 更新现有车辆（直接操作数据库）
+            success_update_count = 0
+            error_update_count = 0
             if update_vehicles:
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在更新 {len(update_vehicles)} 条车辆记录...")
 
@@ -567,8 +571,6 @@ class FastCSVImporter:
                 # 分批处理，每次100条
                 batch_size = 100
                 total_batches = (len(update_vehicles) + batch_size - 1) // batch_size
-                success_count = 0
-                error_count = 0
 
                 for batch_num in range(total_batches):
                     start_idx = batch_num * batch_size
@@ -579,14 +581,14 @@ class FastCSVImporter:
 
                     try:
                         self._update_via_database(batch_vehicles)
-                        success_count += len(batch_vehicles)
+                        success_update_count += len(batch_vehicles)
                         print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 批次 {batch_num + 1} 完成: 成功 {len(batch_vehicles)}, 失败 0")
                     except Exception as e:
-                        error_count += len(batch_vehicles)
+                        error_update_count += len(batch_vehicles)
                         print(f"[{now_beijing().strftime('%H:%M:%S')}] [ERROR] 批次 {batch_num + 1} 更新失败: {e}")
 
                 update_time = time.time() - start_update
-                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_count}, 失败 {error_count}, 总耗时 {update_time:.2f} 秒")
+                print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_update_count}, 失败 {error_update_count}, 总耗时 {update_time:.2f} 秒")
             
             # 插入图片（仅新车辆，更新车辆不处理图片）
             if new_images:
@@ -604,31 +606,56 @@ class FastCSVImporter:
             end_time = now_beijing()
             duration = (end_time - start_time).total_seconds()
             print(f"[OK] 导入完成！总计处理 {len(data)} 条记录，耗时 {duration:.1f} 秒")
-            return True
+            return {
+                "success": True,
+                "new": inserted_count,
+                "updated": success_update_count,
+                "errors": error_update_count
+            }
             
         except Exception as e:
             print(f"[ERROR] 导入失败: {e}")
             if self.connection:
                 self.connection.rollback()
-            return False
+            return {
+                "success": False,
+                "new": 0,
+                "updated": 0,
+                "errors": 1
+            }
     
     def import_all_csv(self):
         """导入所有CSV文件"""
         csv_files = glob.glob("car_data_*.csv")
         if not csv_files:
             print("[ERROR] 未找到任何 car_data_*.csv 文件")
-            return
+            return {
+                "success_count": 0,
+                "total_files": 0,
+                "total_new": 0,
+                "total_updated": 0,
+                "total_errors": 0
+            }
         
         print(f"找到 {len(csv_files)} 个CSV文件")
         for csv_file in csv_files:
             print(f"- {csv_file}")
         
         success_count = 0
+        total_new = 0
+        total_updated = 0
+        total_errors = 0
         start_time = now_beijing()
         
         for csv_file in csv_files:
-            if self.import_csv(csv_file):
+            result = self.import_csv(csv_file)
+            if result and result.get("success"):
                 success_count += 1
+            
+            if result:
+                total_new += result.get("new", 0)
+                total_updated += result.get("updated", 0)
+                total_errors += result.get("errors", 0)
         
         end_time = now_beijing()
         duration = (end_time - start_time).total_seconds()
@@ -636,6 +663,14 @@ class FastCSVImporter:
         print(f"\n=== 导入完成 ===")
         print(f"成功导入: {success_count}/{len(csv_files)} 个文件")
         print(f"总耗时: {duration:.1f} 秒")
+        
+        return {
+            "success_count": success_count,
+            "total_files": len(csv_files),
+            "total_new": total_new,
+            "total_updated": total_updated,
+            "total_errors": total_errors
+        }
     
     def show_stats(self):
         """显示统计信息"""
@@ -791,22 +826,17 @@ def main():
 
         # 直接开始导入
         print("\n开始自动导入...")
-        importer.import_all_csv()
+        import_result = importer.import_all_csv()
+        if import_result:
+            total_new = import_result.get("total_new", 0)
+            total_updated = import_result.get("total_updated", 0)
+            total_errors = import_result.get("total_errors", 0)
 
         # 显示统计
         importer.show_stats()
 
         # 计算导入耗时
         import_duration = (now_beijing() - import_start_time).total_seconds()
-
-        # 尝试从导入历史中获取新增/更新统计
-        if importer.history:
-            recent = importer.history.get_recent_history(days=1)
-            for record in recent:
-                total_new += record.get('new_records', 0)
-                total_updated += record.get('updated_records', 0)
-                total_skipped += record.get('skipped_records', 0)
-                total_errors += record.get('error_count', 0)
 
         # 记录爬取日志（如果有爬取统计）
         if has_crawl_stats:
