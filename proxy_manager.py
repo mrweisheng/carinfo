@@ -42,17 +42,17 @@ class ProxyManager:
 
         # 数据库配置
         self.db_config = {
-            'host': os.getenv('DB_HOST'),
-            'port': int(os.getenv('DB_PORT', 3306)),
-            'user': os.getenv('DB_USER'),
-            'password': os.getenv('DB_PASSWORD'),
-            'database': os.getenv('DB_NAME'),
-            'charset': 'utf8mb4',
-            'autocommit': False,
-            'buffered': True,
-            'connect_timeout': 30,
-            'use_unicode': True,
-            'sql_mode': ''
+            "host": os.getenv("DB_HOST"),
+            "port": int(os.getenv("DB_PORT", 3306)),
+            "user": os.getenv("DB_USER"),
+            "password": os.getenv("DB_PASSWORD"),
+            "database": os.getenv("DB_NAME"),
+            "charset": "utf8mb4",
+            "autocommit": False,
+            "buffered": True,
+            "connect_timeout": 30,
+            "use_unicode": True,
+            "sql_mode": "",
         }
 
         # 启动时立即加载代理
@@ -81,10 +81,10 @@ class ProxyManager:
 
                 self.proxy_pool = [
                     {
-                        'name': row[0],
-                        'http': row[1],
-                        'https': row[2],
-                        'fail_count': row[3]
+                        "name": row[0],
+                        "http": row[1],
+                        "https": row[2],
+                        "fail_count": row[3],
                     }
                     for row in results
                 ]
@@ -96,7 +96,9 @@ class ProxyManager:
                 cursor.close()
                 conn.close()
 
-                logger.info(f"✓ 从数据库加载了 {len(self.proxy_pool)} 个代理 (第{self.load_count}次加载)")
+                logger.info(
+                    f"✓ 从数据库加载了 {len(self.proxy_pool)} 个代理 (第{self.load_count}次加载)"
+                )
 
         except Exception as e:
             logger.error(f"✗ 加载代理失败: {e}")
@@ -115,13 +117,14 @@ class ProxyManager:
 
             # 当可用代理少于20%时重新加载
             if available_count < self.pool_size * 0.2:
-                logger.info(f"可用代理不足({available_count}/{self.pool_size})，重新加载...")
+                logger.info(
+                    f"可用代理不足({available_count}/{self.pool_size})，重新加载..."
+                )
                 self.load_proxies_from_db()
 
             # 从未失败的代理中随机选择
             available = [
-                p for p in self.proxy_pool
-                if p['name'] not in self.failed_proxies
+                p for p in self.proxy_pool if p["name"] not in self.failed_proxies
             ]
 
             if not available:
@@ -130,8 +133,7 @@ class ProxyManager:
 
                 # 重新尝试获取
                 available = [
-                    p for p in self.proxy_pool
-                    if p['name'] not in self.failed_proxies
+                    p for p in self.proxy_pool if p["name"] not in self.failed_proxies
                 ]
 
                 if not available:
@@ -140,9 +142,9 @@ class ProxyManager:
 
             proxy = random.choice(available)
             return {
-                'http': proxy['http'],
-                'https': proxy['https'],
-                'name': proxy['name']
+                "http": proxy["http"],
+                "https": proxy["https"],
+                "name": proxy["name"],
             }
 
     def mark_proxy_failed(self, proxy_name):
@@ -262,14 +264,14 @@ class ProxyManager:
             available_count = len(self.proxy_pool) - len(self.failed_proxies)
 
             stats = {
-                'total_proxies': total,
-                'enabled_proxies': enabled,
-                'healthy_proxies': healthy,
-                'pool_size': len(self.proxy_pool),
-                'available_in_pool': available_count,
-                'failed_in_session': len(self.failed_proxies),
-                'load_count': self.load_count,
-                'last_load_time': self.last_load_time
+                "total_proxies": total,
+                "enabled_proxies": enabled,
+                "healthy_proxies": healthy,
+                "pool_size": len(self.proxy_pool),
+                "available_in_pool": available_count,
+                "failed_in_session": len(self.failed_proxies),
+                "load_count": self.load_count,
+                "last_load_time": self.last_load_time,
             }
 
             cursor.close()
@@ -325,6 +327,74 @@ class ProxyManager:
         pass
 
 
+def check_db_connection():
+    """
+    启动时检查数据库连接是否正常（轻量级，不初始化代理池）
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        host = os.getenv("DB_HOST")
+        user = os.getenv("DB_USER")
+        password = os.getenv("DB_PASSWORD")
+        database = os.getenv("DB_NAME")
+
+        if not all([host, user, password, database]):
+            missing = [
+                k
+                for k, v in {
+                    "DB_HOST": host,
+                    "DB_USER": user,
+                    "DB_PASSWORD": password,
+                    "DB_NAME": database,
+                }.items()
+                if not v
+            ]
+            return False, f"数据库配置缺失: {', '.join(missing)}，请检查 .env 文件"
+
+        db_config = {
+            "host": host,
+            "port": int(os.getenv("DB_PORT", 3306)),
+            "user": user,
+            "password": password,
+            "database": database,
+            "charset": "utf8mb4",
+            "connect_timeout": 5,
+            "use_unicode": True,
+        }
+
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM proxies WHERE enabled = TRUE AND is_healthy = TRUE AND fail_count < 10"
+        )
+        healthy_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM proxies")
+        total_count = cursor.fetchone()[0]
+
+        cursor.close()
+        conn.close()
+
+        if healthy_count > 0:
+            return (
+                True,
+                f"数据库连接正常 (总计 {total_count} 个代理，可用 {healthy_count} 个)",
+            )
+        else:
+            return (
+                False,
+                f"数据库连接正常，但无可用代理 (总计 {total_count} 个，无健康代理)",
+            )
+
+    except mysql.connector.Error as e:
+        return False, f"数据库连接失败: {e}"
+    except Exception as e:
+        return False, f"数据库检查异常: {e}"
+
+
 # 全局实例和锁
 _proxy_manager_instance = None
 _proxy_manager_lock = threading.Lock()
@@ -348,7 +418,9 @@ def get_proxy_manager(pool_size=2000):
         else:
             # 如果池大小不同，重新初始化
             if _proxy_manager_instance.pool_size != pool_size:
-                logger.info(f"代理池大小变更: {_proxy_manager_instance.pool_size} -> {pool_size}，重新初始化")
+                logger.info(
+                    f"代理池大小变更: {_proxy_manager_instance.pool_size} -> {pool_size}，重新初始化"
+                )
                 _proxy_manager_instance = ProxyManager(pool_size)
 
     return _proxy_manager_instance
@@ -366,7 +438,7 @@ def reset_proxy_manager():
     logger.info("代理管理器已重置")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # 测试代码
     logging.basicConfig(level=logging.INFO)
 
@@ -379,7 +451,7 @@ if __name__ == '__main__':
     for i in range(5):
         proxy = pm1.get_random_proxy()
         if proxy:
-            print(f"{i+1}. {proxy['name']}")
+            print(f"{i + 1}. {proxy['name']}")
 
     # 显示统计信息
     stats = pm1.get_stats()

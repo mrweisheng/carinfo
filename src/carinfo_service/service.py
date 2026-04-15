@@ -72,7 +72,10 @@ class FileLock:
             fd = os.open(self.path, flags)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"pid": os.getpid(), "created_at": now_beijing().isoformat(timespec="seconds")},
+                    {
+                        "pid": os.getpid(),
+                        "created_at": now_beijing().isoformat(timespec="seconds"),
+                    },
                     f,
                     ensure_ascii=False,
                 )
@@ -92,7 +95,11 @@ class FileLock:
 
 
 class CarinfoService:
-    def __init__(self, lock_file: str = "carinfo_run.lock", state_file: str = ".carinfo_service_state.json"):
+    def __init__(
+        self,
+        lock_file: str = "carinfo_run.lock",
+        state_file: str = ".carinfo_service_state.json",
+    ):
         self.lock = FileLock(lock_file)
         self.state_file = state_file
         self._running = True
@@ -100,35 +107,40 @@ class CarinfoService:
         # 从配置文件加载时间和页数配置
         self._load_config()
 
+        # 启动时检查数据库连接
+        self._check_database()
+
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
     def _load_config(self):
         """从配置文件加载配置"""
-        config_file = 'config.json'
+        config_file = "config.json"
         if not os.path.exists(config_file):
-            raise FileNotFoundError(f"配置文件 {config_file} 不存在，请创建配置文件后重试")
+            raise FileNotFoundError(
+                f"配置文件 {config_file} 不存在，请创建配置文件后重试"
+            )
 
         try:
-            with open(config_file, 'r', encoding='utf-8') as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 config = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"配置文件 {config_file} 格式错误: {e}")
 
         # 加载爬取页数配置
-        vehicle_types = config.get('scraping', {}).get('vehicle_types', {})
+        vehicle_types = config.get("scraping", {}).get("vehicle_types", {})
         if not vehicle_types:
             raise ValueError("配置文件中缺少 vehicle_types 配置")
 
         self.pages_by_type = {}
         for type_id, type_config in vehicle_types.items():
-            pages = type_config.get('pages', 0)
+            pages = type_config.get("pages", 0)
             self.pages_by_type[int(type_id)] = pages
 
         # 加载定时任务配置（从 schedule 配置中读取）
         # 默认使用早上8点到下午6点之间
-        schedule = config.get('schedule', {})
-        times = schedule.get('times', ['08:00', '18:00'])
+        schedule = config.get("schedule", {})
+        times = schedule.get("times", ["08:00", "18:00"])
 
         if len(times) >= 2:
             start_time = self._parse_time(times[0])
@@ -142,13 +154,38 @@ class CarinfoService:
     def _parse_time(self, time_str: str) -> Tuple[int, int]:
         """解析时间字符串为 (hour, minute)"""
         try:
-            parts = time_str.split(':')
+            parts = time_str.split(":")
             return int(parts[0]), int(parts[1])
         except (ValueError, IndexError):
             return 8, 0  # 默认早上8点
 
+    def _check_database(self):
+        """启动时检查数据库连接和代理可用性"""
+        try:
+            if os.getcwd() not in sys.path:
+                sys.path.insert(0, os.getcwd())
+
+            from proxy_manager import check_db_connection
+
+            success, message = check_db_connection()
+
+            if success:
+                self._log(f"✓ {message}")
+            else:
+                self._log(f"✗ {message}", level="ERROR")
+                self._log(
+                    "数据库不可用，爬取任务将无法使用代理，请尽快修复", level="WARNING"
+                )
+        except ImportError as e:
+            self._log(f"✗ 无法导入 proxy_manager 模块: {e}", level="ERROR")
+        except Exception as e:
+            self._log(f"✗ 数据库健康检查异常: {e}", level="ERROR")
+
     def _handle_signal(self, *_):
-        self._log("收到停止信号，准备退出（若正在执行任务，将在本轮结束后退出）", level="WARNING")
+        self._log(
+            "收到停止信号，准备退出（若正在执行任务，将在本轮结束后退出）",
+            level="WARNING",
+        )
         self._running = False
 
     def _log(self, msg: str, level: str = "INFO"):
@@ -169,9 +206,15 @@ class CarinfoService:
         except Exception as e:
             self._log(f"保存状态文件失败: {e}", level="WARNING")
 
-    def _window_bounds(self, day: datetime, window: TimeWindow) -> Tuple[datetime, datetime]:
-        start = day.replace(hour=window.start_hm[0], minute=window.start_hm[1], second=0, microsecond=0)
-        end = day.replace(hour=window.end_hm[0], minute=window.end_hm[1], second=0, microsecond=0)
+    def _window_bounds(
+        self, day: datetime, window: TimeWindow
+    ) -> Tuple[datetime, datetime]:
+        start = day.replace(
+            hour=window.start_hm[0], minute=window.start_hm[1], second=0, microsecond=0
+        )
+        end = day.replace(
+            hour=window.end_hm[0], minute=window.end_hm[1], second=0, microsecond=0
+        )
         return start, end
 
     def _pick_random_time(self, now: datetime, window: TimeWindow) -> datetime:
@@ -249,7 +292,9 @@ class CarinfoService:
 
     def _run_one_job(self) -> None:
         if not self.lock.acquire():
-            self._log("检测到已有任务在运行（lock存在），本次不启动新任务", level="WARNING")
+            self._log(
+                "检测到已有任务在运行（lock存在），本次不启动新任务", level="WARNING"
+            )
             return
 
         start = time.time()
@@ -273,13 +318,15 @@ class CarinfoService:
                 total += carinfo.scrape_vehicle_type(t, pages, csv, start_page=1)
 
             if total == 0:
-                self._log("没有需要爬取的车辆类型（所有类型pages都为0）", level="WARNING")
+                self._log(
+                    "没有需要爬取的车辆类型（所有类型pages都为0）", level="WARNING"
+                )
 
             self._log(f"爬取结束，累计抓取 {total} 条，准备入库...", level="INFO")
             carinfo.auto_import_to_database()
 
             cost = time.time() - start
-            self._log(f"=== 任务完成，耗时 {cost/60:.1f} 分钟 ===", level="INFO")
+            self._log(f"=== 任务完成，耗时 {cost / 60:.1f} 分钟 ===", level="INFO")
 
             # 记录本次执行日期，防止同一天重复执行
             state = self._load_state()
@@ -303,14 +350,19 @@ class CarinfoService:
         last_run_date = state.get("last_run_date", "")
 
         if last_run_date == today_str:
-            self._log(f"今天({today_str})已执行过任务，启动后等待下一周期", level="INFO")
+            self._log(
+                f"今天({today_str})已执行过任务，启动后等待下一周期", level="INFO"
+            )
         else:
             self._log("启动时检测今天未执行，立即执行任务", level="INFO")
             self._run_one_job()
 
         start_h, start_m = self.window.start_hm
         end_h, end_m = self.window.end_hm
-        self._log(f"进入调度循环：每天 {start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d} 之间随机执行一次", level="INFO")
+        self._log(
+            f"进入调度循环：每天 {start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d} 之间随机执行一次",
+            level="INFO",
+        )
 
         while self._running:
             next_run = self._ensure_next_time()
@@ -332,7 +384,10 @@ class CarinfoService:
                 break
 
             if os.path.exists(self.lock.path) and not self.lock._is_stale():
-                self._log("到达触发时间，但上一次任务仍在运行，跳过并顺延重排", level="WARNING")
+                self._log(
+                    "到达触发时间，但上一次任务仍在运行，跳过并顺延重排",
+                    level="WARNING",
+                )
                 self._reschedule_after_skip()
                 continue
 
