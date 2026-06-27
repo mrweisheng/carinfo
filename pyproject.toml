@@ -1,27 +1,28 @@
- [build-system]
- requires = ["setuptools>=69", "wheel"]
- build-backend = "setuptools.build_meta"
- 
- [project]
- name = "carinfo-service"
- version = "0.1.0"
- description = "Carinfo scraper service (scheduler + one-shot run)"
- requires-python = ">=3.10"
- dependencies = [
-   "pandas==2.1.4",
-   "requests==2.31.0",
-   "beautifulsoup4==4.12.2",
-   "PyMySQL==1.1.0",
-   "mysql-connector-python==8.2.0",
-   "schedule==1.2.0",
-   "python-dotenv==1.0.0",
- ]
- 
- [tool.setuptools]
- package-dir = {"" = "src"}
- 
- [tool.setuptools.packages.find]
- where = ["src"]
- 
- [project.scripts]
- carinfo-service = "carinfo_service.cli:main"
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carinfo"
+version = "0.2.0"
+description = "carinfo: 香港汽车信息爬取与调度服务（多站点可扩展架构）"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.0.0,<3.0.0",
+  "requests==2.31.0",
+  "beautifulsoup4==4.12.2",
+  "PyMySQL==1.1.0",
+  "mysql-connector-python==8.2.0",
+  "schedule==1.2.0",
+  "python-dotenv==1.0.0",
+  "curl_cffi",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+carinfo-service = "carinfo.cli:main"

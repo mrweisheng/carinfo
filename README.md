@@ -30,7 +30,7 @@ python run_service.py
 或使用标准项目方式（需要先 `pip install -e .`）：
 
  ```bash
- python -m carinfo_service
+ python -m carinfo
  ```
  
  或（如果安装了 `pip install -e .`）：

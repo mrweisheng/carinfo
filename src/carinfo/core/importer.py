@@ -12,6 +12,8 @@ import json
 import glob
 from datetime import datetime, timezone, timedelta
 
+from carinfo.utils import parse_price
+
 # 北京时间时区
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -372,50 +374,7 @@ class FastCSVImporter:
             existing_ids.update(row[0] for row in self.cursor.fetchall())
             
         return existing_ids
-    
-    def parse_price(self, price_str):
-        """解析价格字符串"""
-        if not price_str:
-            return None, None
-            
-        try:
-            # 移除HKD$前缀
-            price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
-            
-            current_price = None
-            original_price = None
-            
-            # 处理 "54,000[原價$57,000]" 格式
-            if '[' in price_str and '原價' in price_str:
-                # 提取现价部分（方括号前）
-                current_part = price_str.split('[')[0].strip()
-                current_price = self._extract_price_number(current_part)
-                
-                # 提取原价部分（方括号内）
-                original_part = price_str.split('原價')[1].split(']')[0].strip()
-                original_price = self._extract_price_number(original_part)
-            
-            # 处理只有现价的格式 "60,000"
-            else:
-                current_price = self._extract_price_number(price_str)
-            
-            return current_price, original_price
-        except:
-            pass
-        return None, None
-    
-    def _extract_price_number(self, price_str):
-        """从价格字符串中提取数字"""
-        if not price_str:
-            return None
-        
-        # 移除逗号、$符号并转换为数字
-        clean_str = price_str.replace(',', '').replace('$', '').strip()
-        try:
-            return float(clean_str)
-        except:
-            return None
-    
+
     def clean_data(self, value):
         """清理数据"""
         if value is None or value == '':
@@ -479,7 +438,7 @@ class FastCSVImporter:
                     continue
                     
                 # 解析价格
-                current_price, original_price = self.parse_price(row.get('price', ''))
+                current_price, original_price = parse_price(row.get('price', ''))
                 
                 # 处理状态
                 vehicle_status = 2 if row.get('sale_status', '未售') == '已售' else 1
@@ -626,9 +585,9 @@ class FastCSVImporter:
     
     def import_all_csv(self):
         """导入所有CSV文件"""
-        csv_files = glob.glob("car_data_*.csv")
+        csv_files = glob.glob("data/csv/car_data_*.csv")
         if not csv_files:
-            print("[ERROR] 未找到任何 car_data_*.csv 文件")
+            print("[ERROR] 未找到任何 data/csv/car_data_*.csv 文件")
             return {
                 "success_count": 0,
                 "total_files": 0,
@@ -809,9 +768,9 @@ def main():
         crawl_log_manager._ensure_table()
 
         # 检查CSV文件
-        csv_files = glob.glob("car_data_*.csv")
+        csv_files = glob.glob("data/csv/car_data_*.csv")
         if not csv_files:
-            print("\n[ERROR] 当前目录下没有找到 car_data_*.csv 文件")
+            print("\n[ERROR] data/csv/ 目录下没有找到 car_data_*.csv 文件")
             return
 
         print(f"\n找到 {len(csv_files)} 个CSV文件:")

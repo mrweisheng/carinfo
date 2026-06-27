@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import glob
 import pandas as pd
@@ -21,7 +20,10 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from proxy_manager import get_proxy_manager
+
+from carinfo.core.proxy import get_proxy_manager
+from carinfo.core.base_spider import BaseSpider
+from carinfo.utils import parse_price, parse_contact_info
 
 # 设置日志时区为北京时间
 class BeijingTimeFormatter(logging.Formatter):
@@ -42,6 +44,9 @@ logger = logging.getLogger(__name__)
 # 并发配置
 DEFAULT_CONCURRENCY = 5  # 默认并发数
 DEFAULT_PROXY_POOL_SIZE = 2000  # 默认代理池大小
+
+# 28car 站点根 URL（实际是动态域名，需要时手动更新）
+BASE_URL = "https://dj1jklak2e.28car.com"
 
 
 # User-Agent 池 - 模拟多种浏览器
@@ -113,12 +118,14 @@ def load_config_from_file(config_file='config.json'):
         raise RuntimeError(f"加载配置文件 {config_file} 失败: {e}")
 
 
-class CarScraper:
+class Car28Spider(BaseSpider):
+    site_name = "28car"
+    base_url = BASE_URL
+
     def __init__(self, PAGE, vehicle_type=1):
         self.PAGE = PAGE
         self.vehicle_type = vehicle_type
         self.car_data = []
-        self.base_url = "https://dj1jklak2e.28car.com"
         self.output_dir = "."
 
         # 并发设置
@@ -130,8 +137,8 @@ class CarScraper:
         self.current_page = 1
         self.current_detail_index = 0
 
-        # 使用新的数据库代理管理器（每次启动随机抽取2000个）
-        self.proxy_manager = get_proxy_manager(pool_size=2000)
+        # 使用新的数据库代理管理器（每次启动随机抽取代理池）
+        self.proxy_manager = get_proxy_manager(pool_size=DEFAULT_PROXY_POOL_SIZE)
         self.current_proxy = None
 
         self.vehicle_types = {
@@ -148,6 +155,24 @@ class CarScraper:
         self.max_delay = 3.0  # 最大延迟（秒）
         self.consecutive_failures = 0  # 连续失败次数
         self.failure_threshold = 3  # 连续失败多少次后降速
+
+    # ==== BaseSpider 接口实现（薄包装） ====
+
+    def list_url(self, page: int) -> str:
+        params = self.vehicle_types[self.vehicle_type]['param'] + f'&h_page={page}'
+        return f"{BASE_URL}/sell_lst.php?{params}"
+
+    def detail_url(self, native_id: str) -> str:
+        return f"{BASE_URL}/sell_dsp.php?h_vid={native_id}&h_vw=y"
+
+    def parse_list(self, html: str) -> list:
+        """从列表页 HTML 提取所有 h_vid。"""
+        records = self.get_date_code(html)
+        return [r['code'] for r in records if r.get('code')]
+
+    def parse_detail(self, html: str, native_id: str):
+        """从详情页 HTML 提取标准化字段 dict（失败返 None）。"""
+        return self.extract_car_info(html, native_id)
 
     def _load_concurrency(self):
         """从配置文件加载并发数"""
@@ -386,12 +411,10 @@ class CarScraper:
 
     def get_html_1(self, page):
         """获取车辆列表页"""
-        vehicle_config = self.vehicle_types.get(self.vehicle_type, self.vehicle_types[1])
-        params = vehicle_config['param'] + '&h_page=' + str(page)
-        url = f"https://dj1jklak2e.28car.com/sell_lst.php?{params}"
+        url = self.list_url(page)
 
         # 模拟从首页进入列表页
-        headers = self._build_headers(referer=self.base_url)
+        headers = self._build_headers(referer=BASE_URL)
 
         logger.info(f"请求URL: {url}, 车辆类型: {self.vehicle_type}")
 
@@ -399,11 +422,11 @@ class CarScraper:
 
     def get_detail_content(self, h_vid):
         """获取车辆详情页"""
-        url = f"https://dj1jklak2e.28car.com/sell_dsp.php?h_vid={h_vid}&h_vw=y"
+        url = self.detail_url(h_vid)
 
         # 模拟从列表页进入详情页
         vehicle_config = self.vehicle_types.get(self.vehicle_type, self.vehicle_types[1])
-        list_url = f"https://dj1jklak2e.28car.com/sell_lst.php?{vehicle_config['param']}"
+        list_url = f"{BASE_URL}/sell_lst.php?{vehicle_config['param']}"
         headers = self._build_headers(referer=list_url)
 
         logger.info(f"请求详情页面URL: {url}")
@@ -458,14 +481,14 @@ class CarScraper:
 
         if '售價' in car_data:
             price_text = car_data['售價']
-            current_price, original_price = self._parse_price(price_text)
+            current_price, original_price = parse_price(price_text)
             car_data['current_price'] = current_price
             car_data['original_price'] = original_price
             car_data['price'] = price_text
 
         if '聯絡人資料' in car_data:
             contact_text = car_data['聯絡人資料']
-            contact_name, phone_number = self._parse_contact_info(contact_text)
+            contact_name, phone_number = parse_contact_info(contact_text)
             car_data['contact_name'] = contact_name
             car_data['phone_number'] = phone_number
 
@@ -634,67 +657,6 @@ class CarScraper:
             logger.warning("没有数据可写入CSV")
             return None
 
-    def _parse_price(self, price_str):
-        """解析价格字符串"""
-        if not price_str:
-            return None, None
-
-        price_str = price_str.replace('HKD$', '').replace('HKD', '').strip()
-
-        current_price = None
-        original_price = None
-
-        if '[' in price_str and '原價' in price_str:
-            current_part = price_str.split('[')[0].strip()
-            current_price = self._extract_number(current_part)
-
-            original_part = price_str.split('原價')[1].split(']')[0].strip()
-            original_price = self._extract_number(original_part)
-        else:
-            current_price = self._extract_number(price_str)
-
-        return current_price, original_price
-
-    def _extract_number(self, price_str):
-        """从价格字符串中提取数字"""
-        if not price_str:
-            return None
-        clean_str = price_str.replace(',', '').replace('$', '').strip()
-        try:
-            return float(clean_str)
-        except (ValueError, TypeError):
-            return None
-
-    def _parse_contact_info(self, contact_str):
-        """解析联系人信息"""
-        if not contact_str:
-            return None, None
-
-        contact_name = None
-        phone_number = None
-
-        if '電話:' in contact_str:
-            parts = contact_str.split('電話:')
-            if len(parts) == 2:
-                contact_name = parts[0].strip()
-                phone_number = parts[1].strip()
-        elif '電話' in contact_str:
-            phone_match = re.search(r'電話\s*(\d+)', contact_str)
-            if phone_match:
-                phone_number = phone_match.group(1)
-                name_part = contact_str.split('電話')[0].strip()
-                if name_part:
-                    contact_name = name_part
-        else:
-            phone_match = re.search(r'(\d{8})', contact_str)
-            if phone_match:
-                phone_number = phone_match.group(1)
-                name_part = contact_str.replace(phone_number, '').strip()
-                if name_part:
-                    contact_name = name_part
-
-        return contact_name, phone_number
-
     def _process_extra_fields(self, car_data):
         """根据车辆类型处理扩展字段"""
         extra_fields = {}
@@ -859,9 +821,9 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
     pages_scraped = 0
     error_count = 0
 
-    # 每次定时任务启动时，刷新代理池（重新随机抽取2000个）
-    proxy_manager = get_proxy_manager(pool_size=2000)
-    print("正在刷新代理池（从数据库随机抽取2000个代理）...")
+    # 每次定时任务启动时，刷新代理池（重新随机抽取代理池）
+    proxy_manager = get_proxy_manager(pool_size=DEFAULT_PROXY_POOL_SIZE)
+    print(f"正在刷新代理池（从数据库随机抽取{DEFAULT_PROXY_POOL_SIZE}个代理）...")
     proxy_manager.refresh()
 
     # 显示代理统计信息
@@ -881,7 +843,7 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
     for page in range(start_page, pages + 1):
         print(f'\n=== 正在处理第 {page} 页 ===')
 
-        scraper = CarScraper(pages, vehicle_type)
+        scraper = Car28Spider(pages, vehicle_type)
 
         print(f'正在获取第 {page} 页车辆列表...')
         decoded_html = scraper.get_html_1(page)
@@ -941,32 +903,21 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
 
 
 def auto_import_to_database():
-    """自动执行数据库导入"""
+    """自动执行数据库导入（直接调用 core.importer.main，不再走 subprocess）"""
     try:
-        print("正在启动数据库导入脚本...")
+        print("正在启动数据库导入...")
 
-        csv_files = glob.glob("car_data_*.csv")
+        csv_files = glob.glob("data/csv/car_data_*.csv")
         if not csv_files:
             print("[ERROR] 没有找到CSV文件，跳过数据库导入")
             return False
 
         print(f"找到 {len(csv_files)} 个CSV文件，开始导入...")
 
-        result = subprocess.run(
-            [sys.executable, "import_to_mysql.py"],
-            capture_output=True, text=True, encoding='utf-8', errors='ignore'
-        )
-
-        if result.returncode == 0:
-            print("[OK] 数据库导入成功完成！")
-            print("导入结果:")
-            print(result.stdout)
-            return True
-        else:
-            print("[ERROR] 数据库导入失败")
-            print("错误信息:")
-            print(result.stderr)
-            return False
+        from carinfo.core import importer
+        importer.main()
+        print("[OK] 数据库导入成功完成！")
+        return True
 
     except Exception as e:
         print(f"[ERROR] 执行数据库导入时发生错误: {e}")
@@ -1002,10 +953,12 @@ def main():
             print(f"  - {type_config['name']} (类型{type_id}): {type_config['pages']}页")
 
         total_vehicles = 0
+        csv_dir = "data/csv"
+        os.makedirs(csv_dir, exist_ok=True)
         for type_id, type_config in enabled_types.items():
             type_name = type_config['name']
             pages = type_config['pages']
-            csv_filename = f"car_data_{type_id}.csv"
+            csv_filename = os.path.join(csv_dir, f"car_data_{type_id}.csv")
 
             total_vehicles += scrape_vehicle_type(type_id, pages, csv_filename)
 
@@ -1013,7 +966,7 @@ def main():
         print(f"总共获取车辆数: {total_vehicles}")
         print(f"生成的CSV文件:")
         for type_id in enabled_types.keys():
-            csv_filename = f"car_data_{type_id}.csv"
+            csv_filename = os.path.join(csv_dir, f"car_data_{type_id}.csv")
             if os.path.exists(csv_filename):
                 print(f"  - {csv_filename}")
         print(f"所有CSV文件可直接用于数据库导入！")

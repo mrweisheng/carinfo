@@ -162,10 +162,7 @@ class CarinfoService:
     def _check_database(self):
         """启动时检查数据库连接和代理可用性"""
         try:
-            if os.getcwd() not in sys.path:
-                sys.path.insert(0, os.getcwd())
-
-            from proxy_manager import check_db_connection
+            from carinfo.core.proxy import check_db_connection
 
             success, message = check_db_connection()
 
@@ -177,7 +174,7 @@ class CarinfoService:
                     "数据库不可用，爬取任务将无法使用代理，请尽快修复", level="WARNING"
                 )
         except ImportError as e:
-            self._log(f"✗ 无法导入 proxy_manager 模块: {e}", level="ERROR")
+            self._log(f"✗ 无法导入 carinfo.core.proxy 模块: {e}", level="ERROR")
         except Exception as e:
             self._log(f"✗ 数据库健康检查异常: {e}", level="ERROR")
 
@@ -304,7 +301,10 @@ class CarinfoService:
             if os.getcwd() not in sys.path:
                 sys.path.insert(0, os.getcwd())
 
-            import carinfo
+            from carinfo.sites import car28 as carinfo
+
+            csv_dir = "data/csv"
+            os.makedirs(csv_dir, exist_ok=True)
 
             total = 0
             for t in (1, 2, 3, 4, 5):
@@ -313,7 +313,7 @@ class CarinfoService:
                     self._log(f"跳过类型{t}（pages=0）", level="INFO")
                     continue
 
-                csv = f"car_data_{t}.csv"
+                csv = os.path.join(csv_dir, f"car_data_{t}.csv")
                 self._log(f"开始类型{t}，页数={pages}", level="INFO")
                 total += carinfo.scrape_vehicle_type(t, pages, csv, start_page=1)
 

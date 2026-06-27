@@ -17,7 +17,10 @@ def main():
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
 
-    from carinfo_service.cli import main as cli_main
+    # 切到项目根，确保 config.json / 状态文件 / 锁文件 等相对路径在 cron/systemd 下也能解析
+    os.chdir(repo_root)
+
+    from carinfo.cli import main as cli_main
 
     cli_main()
 
