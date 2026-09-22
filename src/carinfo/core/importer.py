@@ -711,6 +711,9 @@ class FastCSVImporter:
             print(f"数据库更新失败: {e}")
             if self.connection:
                 self.connection.rollback()
+            # 必须向上抛：调用方靠异常把该批次计入 error_update_count，
+            # 吞掉异常会让失败批次被记成成功，爬取日志统计失真
+            raise
     
     def close(self):
         """关闭连接"""
