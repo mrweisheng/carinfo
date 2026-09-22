@@ -128,8 +128,16 @@ class Car28Spider(BaseSpider):
         self.car_data = []
         self.output_dir = "."
 
-        # 并发设置
-        self.concurrency = self._load_concurrency()
+        # 一次性加载配置（避免每次 HTTP 请求都重复读盘）
+        scraping_cfg = self._load_scraping_config()
+        self.concurrency = scraping_cfg.get('concurrency', DEFAULT_CONCURRENCY)
+        self.max_retries = scraping_cfg.get('max_retries', 3)
+        self.retry_delay = scraping_cfg.get('retry_delay', 5)
+        self.request_timeout = scraping_cfg.get('request_timeout', 90)
+        logger.info(
+            f"已加载爬取配置: concurrency={self.concurrency}, "
+            f"max_retries={self.max_retries}, timeout={self.request_timeout}s"
+        )
 
         self.anti_crawler_triggered = False
         self.list_trigger_count = 0
@@ -174,17 +182,14 @@ class Car28Spider(BaseSpider):
         """从详情页 HTML 提取标准化字段 dict（失败返 None）。"""
         return self.extract_car_info(html, native_id)
 
-    def _load_concurrency(self):
-        """从配置文件加载并发数"""
+    def _load_scraping_config(self):
+        """一次性加载 config.json 中的 scraping 段，失败返回空 dict。"""
         try:
             with open('config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            concurrency = config.get('scraping', {}).get('concurrency', DEFAULT_CONCURRENCY)
-            logger.info(f"从配置文件加载并发数: {concurrency}")
-            return concurrency
+                return json.load(f).get('scraping', {})
         except Exception as e:
-            logger.warning(f"加载并发配置失败，使用默认值: {e}")
-            return DEFAULT_CONCURRENCY
+            logger.warning(f"加载爬取配置失败，使用默认值: {e}")
+            return {}
 
     def _adjust_delay(self):
         """根据连续失败次数动态调整延迟"""
@@ -235,18 +240,9 @@ class Car28Spider(BaseSpider):
 
     def _make_request_with_retry(self, url, headers, request_type='list'):
         """使用代理和重试机制发送HTTP请求"""
-        # 从配置文件读取超时设置
-        try:
-            with open('config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            scraping_config = config.get('scraping', {})
-            max_retries = scraping_config.get('max_retries', 3)
-            retry_delay = scraping_config.get('retry_delay', 5)
-            timeout = scraping_config.get('request_timeout', 90)
-        except:
-            max_retries = 3
-            retry_delay = 5
-            timeout = 90  # 默认90秒，适合住宅代理
+        max_retries = self.max_retries
+        retry_delay = self.retry_delay
+        timeout = self.request_timeout
 
         for attempt in range(max_retries + 1):
             try:

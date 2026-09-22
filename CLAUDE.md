@@ -29,7 +29,7 @@ carinfo/
 ├── README.md
 ├── CLAUDE.md                       # 本文件
 ├── pyproject.toml                  # 项目元数据（包名 carinfo，入口 carinfo-service）
-├── requirements.txt
+├── uv.lock                         # uv 依赖锁
 ├── env.example
 ├── .env                            # 数据库凭证（gitignored）
 ├── config.json                     # 爬取配置（gitignored）
@@ -40,10 +40,7 @@ carinfo/
 │       ├── __main__.py             # python -m carinfo 入口
 │       ├── cli.py                  # 命令行接口
 │       ├── service.py              # 调度服务（FileLock + 时间窗口）
-│       ├── config_manager.py       # 配置管理（预留，未接入）
-│       ├── logger.py               # 日志（预留，未接入）
-│       ├── utils.py                # parse_price / parse_contact_info 等通用工具
-│       ├── task_history.py         # 任务历史（预留，未接入）
+│       ├── utils.py                # parse_price / parse_contact_info / extract_number
 │       ├── core/                   # 通用爬虫基础设施
 │       │   ├── __init__.py
 │       │   ├── base_spider.py      # 站点爬虫抽象基类（4 抽象方法）
@@ -103,7 +100,7 @@ HTTP 请求 / 代理 / 反爬退避 / CSV 写出 / DB 导入等基础设施**当
 
 ### service.py — 调度服务
 
-- FileLock：`O_CREAT | O_EXCL` 跨进程互斥锁
+- FileLock：`O_CREAT | O_EXCL | O_WRONLY` 跨进程互斥锁
 - CarinfoService：每天时间窗口内随机执行一次，同一天不重复
 - 优雅退出（SIGINT/SIGTERM）
 - 启动时检查数据库健康状态
@@ -137,34 +134,41 @@ MySQL (car_info_db)
 ## 启动方式
 
 ```bash
-# 直接启动（推荐）
-python run_service.py
-
+# uv（推荐）
+uv sync
+uv run python run_service.py
 # 或安装后
+uv run carinfo-service
+
+# 或不用 uv
 pip install -e .
+python run_service.py
 python -m carinfo
-carinfo-service
 ```
 
 ## 已知问题与注意事项
 
 1. **历史包袱：vehicle_id 不带 28car 前缀** —— 现存 11 万+ 行数据 vehicle_id 无前缀，且 `vehicle_images` 有 FK + `ON UPDATE RESTRICT`，无法批量改写。新站点统一用 `{site_name}_{native_id}` 前缀；详见 `core/base_spider.py:vehicle_id()` docstring。
-2. **死代码模块**：`config_manager.py` / `logger.py` / `task_history.py` 目前未被任何模块 import，保留备用。
-3. **无测试**：项目没有任何单元测试或集成测试。
-4. **相对路径依赖**：`config.json`、状态文件、CSV 等都用相对路径，依赖 `run_service.py` 中的 `os.chdir(repo_root)`。
-5. **CSV 中间格式**：爬虫先写 `data/csv/*.csv` 再导入 MySQL，是有意设计（便于补导入和审计）。
-6. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
+2. **BaseSpider 目前是空壳抽象**：4 个抽象方法定义了但调度流程没真正调用——`scrape_vehicle_type` 走的是 `get_html_1` / `get_date_code` / `extract_car_info`。接入第二站时需要把 HTTP/代理/反爬 等基础设施真的下沉到 core，并让 `scrape_vehicle_type` 改成基于 `spider.list_url()` / `spider.parse_list()` 的通用流程。
+3. **`os.environ` 传爬取统计**：`scrape_vehicle_type` 把 `CRAWL_*` 系列统计塞到环境变量，`importer.py` 读回。这是反模式（进程级全局状态，多类型连续跑会互相覆盖）——等需要的时候改成函数返回值。
+4. **无测试**：项目没有任何单元测试或集成测试。
+5. **相对路径依赖**：`config.json`、状态文件、CSV 等都用相对路径，依赖 `run_service.py` 中的 `os.chdir(repo_root)`。
+6. **CSV 中间格式**：爬虫先写 `data/csv/*.csv` 再导入 MySQL，是有意设计（便于补导入和审计）。
+7. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
 
 ## 加新站点的步骤
+
+> ⚠️ 目前 `BaseSpider` 的 4 个抽象方法实际未被调度流程调用（见已知问题 2）。真正接入第二站时，需要先把 `scrape_vehicle_type` 改造成通用流程，否则光实现 4 个方法跑不起来。
 
 1. 在 `src/carinfo/sites/` 下新建 `xxx.py`
 2. 定义 `class XxxSpider(BaseSpider)`，设置 `site_name` 和 `base_url`
 3. 实现 4 个抽象方法（`list_url`/`detail_url`/`parse_list`/`parse_detail`）
-4. 在 `service.py` 或新 runner 中调度该 spider
-5. CSV 列名/DB 字段对齐既有 schema，或单独评估扩展
+4. 把 `car28.py` 中的 HTTP/代理/反爬/CSV/并发逻辑下沉到 `core/`（出现真实复用需求时）
+5. 在 `service.py` 中调度该 spider
+6. CSV 列名/DB 字段对齐既有 schema，或单独评估扩展
 
 ## 编辑注意事项
 
-- 修改爬虫字段时，确保 `sites/car28.py` 的 `extract_car_info`、`utils.py` 的 `validate_vehicle_data`、`core/importer.py` 的 SQL 语句三者保持一致
+- 修改爬虫字段时，确保 `sites/car28.py` 的 `extract_car_info` 与 `core/importer.py` 的 SQL 语句保持一致
 - 代理相关改动需同步 `core/proxy.py` 和 `sites/car28.py` 中的 `scrape_vehicle_type` 函数
 - 不要提交 `.env`（含真实密码）和 `config.json`（含代理配置）
