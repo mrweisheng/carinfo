@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import glob
+import threading
 import pandas as pd
 import requests
 from curl_cffi import requests as curl_requests
@@ -147,7 +148,11 @@ class Car28Spider(BaseSpider):
 
         # 使用新的数据库代理管理器（每次启动随机抽取代理池）
         self.proxy_manager = get_proxy_manager(pool_size=DEFAULT_PROXY_POOL_SIZE)
-        self.current_proxy = None
+
+        # 并发请求下的共享计数/自适应延迟保护（scrape_cars 用线程池并发跑）
+        self._stats_lock = threading.Lock()
+        self._anti_lock = threading.Lock()
+        self.proxy_fail_count = 0
 
         self.vehicle_types = {
             1: {'name': '私家车', 'param': 'h_f_ty=1'},
@@ -238,6 +243,40 @@ class Car28Spider(BaseSpider):
         time.sleep(delay)
         return delay
 
+    def _decode_response(self, response):
+        """解码响应体。
+
+        优先使用 HTTP Header / 页面 meta 声明的字符集；未声明时按站点默认
+        big5 解码（与历史行为一致）。不能用 errors='replace' 逐个试探——
+        replace 模式下 decode 永不抛异常，探测循环永远命中第一个编码。
+        """
+        content = response.content
+
+        declared = None
+        try:
+            content_type = response.headers.get('Content-Type', '') or ''
+        except Exception:
+            content_type = ''
+        m = re.search(r'charset=["\']?([\w-]+)', content_type, re.IGNORECASE)
+        if m:
+            declared = m.group(1)
+        else:
+            m = re.search(rb'charset=["\']?([\w-]+)', content[:2048], re.IGNORECASE)
+            if m:
+                declared = m.group(1).decode('ascii', errors='ignore')
+
+        if declared:
+            try:
+                html = content.decode(declared)
+                logger.info(f"按声明的 {declared} 编码解码成功")
+                return html
+            except (UnicodeDecodeError, LookupError):
+                logger.warning(f"声明的 {declared} 编码解码失败，回退站点默认 big5")
+        else:
+            logger.info("响应未声明字符集，按站点默认 big5 解码")
+
+        return content.decode('big5', errors='replace')
+
     def _make_request_with_retry(self, url, headers, request_type='list'):
         """使用代理和重试机制发送HTTP请求"""
         max_retries = self.max_retries
@@ -249,18 +288,19 @@ class Car28Spider(BaseSpider):
                 # 从代理管理器获取随机代理
                 proxy_info = self.proxy_manager.get_random_proxy()
 
+                # 代理名放在局部变量：本方法在线程池中并发执行，
+                # 共享实例字段会把失败记到别的请求刚换上的代理头上
+                proxy_name = proxy_info.get('name') if proxy_info else None
+
                 if proxy_info:
-                    proxy_name = proxy_info.get('name', 'unknown')
                     proxies = {
                         'http': proxy_info.get('http'),
                         'https': proxy_info.get('https')
                     }
-                    self.current_proxy = proxy_info
                     logger.info(f"尝试 {attempt + 1}/{max_retries + 1}: 使用代理 {proxy_name}")
                 else:
                     logger.warning(f"尝试 {attempt + 1}/{max_retries + 1}: 无可用代理，使用直连")
                     proxies = None
-                    self.current_proxy = None
 
                 response = curl_requests.get(
                     url,
@@ -272,20 +312,7 @@ class Car28Spider(BaseSpider):
                 )
 
                 if response.status_code == 200:
-                    decoded_html = None
-                    encodings = ['big5', 'utf-8', 'gbk', 'gb2312', 'latin1']
-
-                    for encoding in encodings:
-                        try:
-                            decoded_html = response.content.decode(encoding, errors='replace')
-                            logger.info(f"成功使用 {encoding} 编码解码")
-                            break
-                        except UnicodeDecodeError:
-                            continue
-
-                    if decoded_html is None:
-                        decoded_html = response.content.decode('latin1', errors='replace')
-                        logger.warning("使用latin1编码作为后备方案")
+                    decoded_html = self._decode_response(response)
 
                     logger.info(f"响应状态码: {response.status_code}, 内容长度: {len(decoded_html)}")
 
@@ -293,12 +320,14 @@ class Car28Spider(BaseSpider):
                     if proxy_name:
                         self.proxy_manager.mark_proxy_success(proxy_name)
 
-                    # 触发延迟调整
-                    self.request_count += 1
-                    self.consecutive_failures = 0
-                    self._adjust_delay()
+                    with self._stats_lock:
+                        self.request_count += 1
+                        self.consecutive_failures = 0
+                        self._adjust_delay()
 
-                    if 'msg_busy.php' in decoded_html or 'busy' in decoded_html.lower():
+                    # 只认明确的重定向特征；正文里普通 "busy" 单词（如車輛簡評的
+                    # 英文描述）不是反爬信号
+                    if 'msg_busy.php' in decoded_html:
                         logger.warning(f"{request_type}页面被重定向到busy页面，触发反爬虫机制")
                         if not self._handle_anti_crawler(request_type):
                             return None
@@ -309,15 +338,16 @@ class Car28Spider(BaseSpider):
                     logger.warning(f"HTTP请求失败，状态码: {response.status_code}")
                     raise requests.RequestException(f"HTTP {response.status_code}")
 
-            except (requests.RequestException, requests.Timeout, Exception) as e:
+            except Exception as e:
                 logger.error(f"请求失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
 
-                # 请求失败，增加失败计数
-                self.consecutive_failures += 1
+                with self._stats_lock:
+                    self.consecutive_failures += 1
+                    self.proxy_fail_count += 1
+                    self._adjust_delay()
 
                 # 标记代理失败
-                if self.current_proxy:
-                    proxy_name = self.current_proxy.get('name')
+                if proxy_name:
                     self.proxy_manager.mark_proxy_failed(proxy_name)
 
                 if attempt < max_retries:
@@ -558,7 +588,7 @@ class Car28Spider(BaseSpider):
                 logger.error(f"车辆 {h_vid} 因反爬虫终止而跳过")
                 return None
 
-            if 'msg_busy.php' in html_content or 'busy' in html_content.lower():
+            if 'msg_busy.php' in html_content:
                 logger.warning(f"车辆 {h_vid} 被重定向到busy页面，可能触发了反爬虫机制")
                 return None
 
@@ -778,12 +808,14 @@ class Car28Spider(BaseSpider):
 
     def _handle_anti_crawler(self, trigger_type):
         """处理反爬虫触发"""
-        if trigger_type == "list":
-            self.list_trigger_count += 1
-            trigger_count = self.list_trigger_count
-        else:
-            self.detail_trigger_count += 1
-            trigger_count = self.detail_trigger_count
+        # 计数加锁（工作线程并发调用），等待在锁外进行避免互相阻塞
+        with self._anti_lock:
+            if trigger_type == "list":
+                self.list_trigger_count += 1
+                trigger_count = self.list_trigger_count
+            else:
+                self.detail_trigger_count += 1
+                trigger_count = self.detail_trigger_count
 
         if trigger_count > 3:
             logger.error(f"{trigger_type}页面触发反爬虫超过3次，终止爬取")
