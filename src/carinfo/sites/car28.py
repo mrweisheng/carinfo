@@ -605,26 +605,17 @@ class Car28Spider(BaseSpider):
             logger.error(f"处理车辆 {h_vid} 时出错: {e}")
             return None
 
-    def create_csv_file(self, filename=None, append_mode=False):
-        """创建CSV文件"""
-        if not self.car_data:
-            logger.warning("没有数据可写入CSV")
-            return None
-
-        if filename is None:
-            filename = f"car_data_{self.vehicle_type}.csv"
-
-        csv_path = os.path.join(self.output_dir, filename)
-        csv_data = []
+    def build_rows(self):
+        """把爬取到的车辆数据转换为统一的行格式（CSV 备份与直接入库共用）。"""
+        rows = []
         current_timestamp = int(time.time())
 
         for i, car in enumerate(self.car_data, 1):
-            price_str = car.get('售價', '')
             current_price = car.get('current_price')
             original_price = car.get('original_price')
             extra_fields = car.get('extra_fields', {})
 
-            row = {
+            rows.append({
                 'vehicle_id': car.get('編號', ''),
                 'page_number': current_timestamp + i,
                 'car_number': car.get('編號', ''),
@@ -648,40 +639,49 @@ class Car28Spider(BaseSpider):
                 'image_urls': '\n'.join(car.get('图片URLs', [])),
                 'sale_status': car.get('sale_status', '未知'),
                 'extra_fields': json.dumps(extra_fields) if extra_fields else ''
-            }
-            csv_data.append(row)
+            })
+        return rows
 
-        if csv_data:
-            df = pd.DataFrame(csv_data)
+    def create_csv_file(self, filename=None, append_mode=False, rows=None):
+        """写入CSV备份文件（入库不再依赖此文件，仅供排查/审计）。"""
+        if rows is None:
+            rows = self.build_rows()
 
-            string_columns = ['year', 'phone_number', 'seats', 'engine_volume']
-            for col in string_columns:
-                if col in df.columns:
-                    df[col] = df[col].astype(str).str.replace('.0', '', regex=False)
-
-            if append_mode and os.path.exists(csv_path):
-                existing_df = pd.read_csv(csv_path, encoding='utf-8-sig')
-                
-                # 去重：基于vehicle_id保留最新的记录
-                if 'vehicle_id' in existing_df.columns and 'vehicle_id' in df.columns:
-                    # 合并数据
-                    combined_df = pd.concat([existing_df, df], ignore_index=True)
-                    # 按vehicle_id去重，保留最后一条（即最新的）
-                    combined_df = combined_df.drop_duplicates(subset=['vehicle_id'], keep='last')
-                    combined_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                    logger.info(f"数据已追加并去重，原始{len(existing_df)}条 + 新增{len(df)}条 = 去重后{len(combined_df)}条")
-                else:
-                    combined_df = pd.concat([existing_df, df], ignore_index=True)
-                    combined_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                    logger.info(f"数据已追加到现有CSV文件: {csv_path}")
-            else:
-                df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                logger.info(f"CSV文件已保存: {csv_path}")
-
-            return csv_path
-        else:
+        if not rows:
             logger.warning("没有数据可写入CSV")
             return None
+
+        if filename is None:
+            filename = f"car_data_{self.vehicle_type}.csv"
+
+        csv_path = os.path.join(self.output_dir, filename)
+        df = pd.DataFrame(rows)
+
+        string_columns = ['year', 'phone_number', 'seats', 'engine_volume']
+        for col in string_columns:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace('.0', '', regex=False)
+
+        if append_mode and os.path.exists(csv_path):
+            existing_df = pd.read_csv(csv_path, encoding='utf-8-sig')
+
+            # 去重：基于vehicle_id保留最新的记录
+            if 'vehicle_id' in existing_df.columns and 'vehicle_id' in df.columns:
+                # 合并数据
+                combined_df = pd.concat([existing_df, df], ignore_index=True)
+                # 按vehicle_id去重，保留最后一条（即最新的）
+                combined_df = combined_df.drop_duplicates(subset=['vehicle_id'], keep='last')
+                combined_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                logger.info(f"数据已追加并去重，原始{len(existing_df)}条 + 新增{len(df)}条 = 去重后{len(combined_df)}条")
+            else:
+                combined_df = pd.concat([existing_df, df], ignore_index=True)
+                combined_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                logger.info(f"数据已追加到现有CSV文件: {csv_path}")
+        else:
+            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            logger.info(f"CSV文件已保存: {csv_path}")
+
+        return csv_path
 
     def _process_extra_fields(self, car_data):
         """根据车辆类型处理扩展字段"""
@@ -832,22 +832,34 @@ class Car28Spider(BaseSpider):
         return True
 
 
-def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
-    """爬取指定类型的车辆
+def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1, db_importer=None):
+    """爬取指定类型的车辆，逐页直接入库（CSV 仅作备份，入库不依赖它）。
+
     Args:
         vehicle_type: 车辆类型ID
         pages: 总共爬取多少页
-        csv_filename: CSV文件名
+        csv_filename: CSV备份文件名
         start_page: 起始页码（默认为1）
+        db_importer: 复用的 FastCSVImporter；为 None 时内部创建
+
+    Returns:
+        dict: 本类型的爬取与入库统计
     """
     print(f"\n=== 开始爬取 (类型{vehicle_type}) ===")
 
-    # 爬取统计
     crawl_start_time = time.time()
-    anti_crawler_triggered = 0
-    proxy_fail_count = 0
     pages_scraped = 0
-    error_count = 0
+    total_vehicles = 0
+    detail_errors = 0
+    proxy_fail_count = 0
+    anti_crawler_triggered = 0
+    status = 'success'
+
+    # 入库统计（内存传递，不再走环境变量）
+    new_total = 0
+    updated_total = 0
+    error_total = 0
+    import_seconds = 0.0
 
     # 每次定时任务启动时，刷新代理池（重新随机抽取代理池）
     proxy_manager = get_proxy_manager(pool_size=DEFAULT_PROXY_POOL_SIZE)
@@ -858,13 +870,16 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
     stats = proxy_manager.get_stats()
     print(f"[*] 代理池已就绪: {stats.get('pool_size', 0)}个代理")
 
+    if db_importer is None:
+        from carinfo.core.importer import FastCSVImporter
+        db_importer = FastCSVImporter()
+
     append_mode = os.path.exists(csv_filename)
     if append_mode:
-        print(f"发现现有文件，将追加数据到: {csv_filename}")
+        print(f"发现现有CSV备份，将追加数据到: {csv_filename}")
     else:
-        print(f"将创建新文件: {csv_filename}")
+        print(f"将创建CSV备份: {csv_filename}")
 
-    total_vehicles = 0
     vehicle_type_names = {1: '私家车', 2: '客货车', 3: '货车', 4: '电单车', 5: '经典车'}
     vehicle_type_name = vehicle_type_names.get(vehicle_type, f'类型{vehicle_type}')
 
@@ -879,6 +894,7 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
         if decoded_html is None:
             print(f'第 {page} 页因反爬虫终止，停止爬取')
             anti_crawler_triggered += 1
+            status = 'partial'
             break
 
         dateCode_i = scraper.get_date_code(decoded_html)
@@ -893,19 +909,38 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
         vehicle_ids = [int(it['code']) for it in dateCode_i]
         scraper.scrape_cars(vehicle_ids, sale_status_list)
 
-        if len(scraper.car_data) == 0 and any(status == "未售" for status in sale_status_list):
+        detail_errors += len(vehicle_ids) - len(scraper.car_data)
+        proxy_fail_count += scraper.proxy_fail_count
+
+        if len(scraper.car_data) == 0 and any(s == "未售" for s in sale_status_list):
             print(f'第 {page} 页详情爬取因反爬虫终止，停止爬取')
             anti_crawler_triggered += 1
+            status = 'partial'
             break
 
         if scraper.car_data:
-            csv_path = scraper.create_csv_file(csv_filename, append_mode)
+            rows = scraper.build_rows()
+
+            # CSV 备份只写不读，供排查；失败不影响入库
+            csv_path = scraper.create_csv_file(csv_filename, append_mode, rows)
             if csv_path:
-                print(f'第 {page} 页数据已保存，获取 {len(scraper.car_data)} 个车辆')
-                total_vehicles += len(scraper.car_data)
+                print(f'第 {page} 页数据已保存，获取 {len(rows)} 个车辆')
+                total_vehicles += len(rows)
                 append_mode = True
             else:
-                print(f'第 {page} 页CSV文件生成失败')
+                print(f'第 {page} 页CSV备份写入失败')
+
+            # 直接入库；失败不中断爬取（数据已留在CSV备份里）
+            try:
+                result = db_importer.import_rows(rows, vehicle_type)
+                if result.get('success'):
+                    new_total += result.get('new', 0)
+                    updated_total += result.get('updated', 0)
+                error_total += result.get('errors', 0)
+                import_seconds += result.get('duration', 0.0)
+            except Exception as e:
+                print(f'[ERROR] 第 {page} 页入库异常（数据已保留在CSV备份）: {e}')
+                error_total += len(rows)
 
         pages_scraped += 1
 
@@ -916,93 +951,76 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1):
 
     crawl_duration = time.time() - crawl_start_time
     print(f'\n爬取完成！车辆数: {total_vehicles}, 爬取页数: {pages_scraped}, 反爬触发: {anti_crawler_triggered}')
+    print(f'入库统计！新增: {new_total}, 更新: {updated_total}, 错误: {error_total}')
 
-    # 设置环境变量供导入脚本使用
-    os.environ['CRAWL_VEHICLE_TYPE'] = vehicle_type_name
-    os.environ['CRAWL_PAGES_SCRAPED'] = str(pages_scraped)
-    os.environ['CRAWL_TOTAL_VEHICLES'] = str(total_vehicles)
-    os.environ['CRAWL_PROXY_USED'] = str(stats.get('pool_size', 0))
-    os.environ['CRAWL_PROXY_FAIL'] = str(proxy_fail_count)
-    os.environ['CRAWL_ANTI_CRAWLER'] = str(anti_crawler_triggered)
-    os.environ['CRAWL_DURATION'] = str(round(crawl_duration, 2))
-    os.environ['CRAWL_ERROR_COUNT'] = str(error_count)
+    crawl_stats = {
+        'vehicle_type': vehicle_type,
+        'vehicle_type_name': vehicle_type_name,
+        'pages_scraped': pages_scraped,
+        'total_vehicles': total_vehicles,
+        'detail_errors': detail_errors,
+        'new_vehicles': new_total,
+        'updated_vehicles': updated_total,
+        'error_count': error_total + detail_errors,
+        'proxy_used_count': stats.get('pool_size', 0),
+        'proxy_fail_count': proxy_fail_count,
+        'anti_crawler_triggered': anti_crawler_triggered,
+        'crawl_duration': round(crawl_duration, 2),
+        'import_duration': round(import_seconds, 2),
+        'status': status,
+    }
 
-    return total_vehicles
+    from carinfo.core.importer import record_crawl_log
+    if record_crawl_log(db_importer, crawl_stats):
+        print('[OK] 爬取日志已记录到 crawl_logs')
 
-
-def auto_import_to_database():
-    """自动执行数据库导入（直接调用 core.importer.main，不再走 subprocess）"""
-    try:
-        print("正在启动数据库导入...")
-
-        csv_files = glob.glob("data/csv/car_data_*.csv")
-        if not csv_files:
-            print("[ERROR] 没有找到CSV文件，跳过数据库导入")
-            return False
-
-        print(f"找到 {len(csv_files)} 个CSV文件，开始导入...")
-
-        from carinfo.core import importer
-        importer.main()
-        print("[OK] 数据库导入成功完成！")
-        return True
-
-    except Exception as e:
-        print(f"[ERROR] 执行数据库导入时发生错误: {e}")
-        return False
+    return crawl_stats
 
 
 def main():
-    """主函数"""
+    """主函数：爬取并直接入库（CSV 仅作备份）"""
     import argparse
 
     parser = argparse.ArgumentParser(description='28car.com 车辆信息爬取工具')
-    parser.add_argument('--config', action='store_true', help='从配置文件读取并执行所有启用的类型')
     parser.add_argument('--config-file', default='config.json', help='配置文件路径')
 
     args = parser.parse_args()
 
-    if not args.config:
-        print("未指定参数，默认使用配置文件模式")
-        args.config = True
+    print(f"=== 配置文件模式启动 ===")
+    print(f"配置文件: {args.config_file}")
 
-    if args.config:
-        print(f"=== 配置文件模式启动 ===")
-        print(f"配置文件: {args.config_file}")
+    enabled_types = load_config_from_file(args.config_file)
 
-        enabled_types = load_config_from_file(args.config_file)
+    if not enabled_types:
+        print("[ERROR] 配置文件中没有需要爬取的车辆类型（所有类型的 pages 都为 0）")
+        sys.exit(1)
 
-        if not enabled_types:
-            print("[ERROR] 配置文件中没有需要爬取的车辆类型（所有类型的 pages 都为 0）")
-            sys.exit(1)
+    print(f"将爬取 {len(enabled_types)} 种车辆类型:")
+    for type_id, type_config in enabled_types.items():
+        print(f"  - {type_config['name']} (类型{type_id}): {type_config['pages']}页")
 
-        print(f"将爬取 {len(enabled_types)} 种车辆类型:")
+    from carinfo.core.importer import FastCSVImporter
+
+    csv_dir = "data/csv"
+    os.makedirs(csv_dir, exist_ok=True)
+
+    db_importer = FastCSVImporter()
+    total_vehicles = 0
+    try:
         for type_id, type_config in enabled_types.items():
-            print(f"  - {type_config['name']} (类型{type_id}): {type_config['pages']}页")
-
-        total_vehicles = 0
-        csv_dir = "data/csv"
-        os.makedirs(csv_dir, exist_ok=True)
-        for type_id, type_config in enabled_types.items():
-            type_name = type_config['name']
-            pages = type_config['pages']
             csv_filename = os.path.join(csv_dir, f"car_data_{type_id}.csv")
+            stats = scrape_vehicle_type(
+                type_id, type_config['pages'], csv_filename, db_importer=db_importer
+            )
+            total_vehicles += stats['total_vehicles']
+            print(f"\n类型{type_id}统计: 爬取{stats['total_vehicles']}条，"
+                  f"新增{stats['new_vehicles']}，更新{stats['updated_vehicles']}，"
+                  f"错误{stats['error_count']}，状态{stats['status']}")
+    finally:
+        db_importer.close()
 
-            total_vehicles += scrape_vehicle_type(type_id, pages, csv_filename)
-
-        print(f"\n=== 所有类型爬取完成！ ===")
-        print(f"总共获取车辆数: {total_vehicles}")
-        print(f"生成的CSV文件:")
-        for type_id in enabled_types.keys():
-            csv_filename = os.path.join(csv_dir, f"car_data_{type_id}.csv")
-            if os.path.exists(csv_filename):
-                print(f"  - {csv_filename}")
-        print(f"所有CSV文件可直接用于数据库导入！")
-
-        print(f"\n=== 开始自动导入数据库 ===")
-        auto_import_to_database()
-    else:
-        parser.print_help()
+    print(f"\n=== 所有类型爬取完成！ ===")
+    print(f"总共获取车辆数: {total_vehicles}")
 
 
 if __name__ == "__main__":

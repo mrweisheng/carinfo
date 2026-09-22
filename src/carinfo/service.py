@@ -295,38 +295,46 @@ class CarinfoService:
             return
 
         start = time.time()
-        self._log("=== 开始执行任务（从配置文件读取爬取配置）===", level="INFO")
+        self._log("=== 开始执行任务（爬取配置从 config.json 读取，逐页直接入库）===", level="INFO")
 
         try:
             if os.getcwd() not in sys.path:
                 sys.path.insert(0, os.getcwd())
 
             from carinfo.sites import car28 as carinfo
+            from carinfo.core.importer import FastCSVImporter
 
             csv_dir = "data/csv"
             os.makedirs(csv_dir, exist_ok=True)
 
+            db_importer = FastCSVImporter()
             total = 0
-            for t in (1, 2, 3, 4, 5):
-                pages = self.pages_by_type.get(t, 0)
-                if pages <= 0:
-                    self._log(f"跳过类型{t}（pages=0）", level="INFO")
-                    continue
+            try:
+                for t, pages in sorted(self.pages_by_type.items()):
+                    if pages <= 0:
+                        self._log(f"跳过类型{t}（pages=0）", level="INFO")
+                        continue
 
-                csv = os.path.join(csv_dir, f"car_data_{t}.csv")
-                self._log(f"开始类型{t}，页数={pages}", level="INFO")
-                total += carinfo.scrape_vehicle_type(t, pages, csv, start_page=1)
+                    csv = os.path.join(csv_dir, f"car_data_{t}.csv")
+                    self._log(f"开始类型{t}，页数={pages}", level="INFO")
+                    stats = carinfo.scrape_vehicle_type(
+                        t, pages, csv, start_page=1, db_importer=db_importer
+                    )
+                    total += stats['total_vehicles']
+                    self._log(
+                        f"类型{t}完成: 爬取{stats['total_vehicles']}条，"
+                        f"新增{stats['new_vehicles']}，更新{stats['updated_vehicles']}，"
+                        f"错误{stats['error_count']}，状态{stats['status']}",
+                        level="INFO",
+                    )
+            finally:
+                db_importer.close()
 
             if total == 0:
-                self._log(
-                    "没有需要爬取的车辆类型（所有类型pages都为0）", level="WARNING"
-                )
-
-            self._log(f"爬取结束，累计抓取 {total} 条，准备入库...", level="INFO")
-            carinfo.auto_import_to_database()
+                self._log("没有需要爬取的车辆类型或未抓到数据", level="WARNING")
 
             cost = time.time() - start
-            self._log(f"=== 任务完成，耗时 {cost / 60:.1f} 分钟 ===", level="INFO")
+            self._log(f"=== 任务完成，累计抓取 {total} 条，耗时 {cost / 60:.1f} 分钟 ===", level="INFO")
 
             # 记录本次执行日期，防止同一天重复执行
             state = self._load_state()

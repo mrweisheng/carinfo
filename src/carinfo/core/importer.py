@@ -295,6 +295,39 @@ class CrawlLogManager:
             return False
 
 
+def record_crawl_log(db_importer, stats: dict) -> bool:
+    """把一次爬取统计写入 crawl_logs（连接不可用时跳过，不影响主流程）。
+
+    stats 键：vehicle_type_name / pages_scraped / total_vehicles / new_vehicles /
+    updated_vehicles / error_count / proxy_used_count / proxy_fail_count /
+    anti_crawler_triggered / crawl_duration / import_duration / status
+    """
+    if getattr(db_importer, 'connection', None) is None:
+        print("[WARN] 无数据库连接，跳过爬取日志记录")
+        return False
+    try:
+        mgr = CrawlLogManager(db_importer.connection)
+        mgr._ensure_table()
+        return mgr.record_crawl(
+            vehicle_type=stats['vehicle_type_name'],
+            pages_scraped=stats['pages_scraped'],
+            total_vehicles=stats['total_vehicles'],
+            new_vehicles=stats['new_vehicles'],
+            updated_vehicles=stats['updated_vehicles'],
+            skipped_vehicles=0,
+            proxy_used_count=stats['proxy_used_count'],
+            proxy_fail_count=stats['proxy_fail_count'],
+            anti_crawler_triggered=stats['anti_crawler_triggered'],
+            error_count=stats['error_count'],
+            crawl_duration=stats['crawl_duration'],
+            import_duration=stats['import_duration'],
+            status=stats.get('status', 'success'),
+        )
+    except Exception as e:
+        print(f"[WARN] 记录爬取日志失败: {e}")
+        return False
+
+
 class FastCSVImporter:
     def __init__(self):
         """初始化数据库连接"""
@@ -385,29 +418,29 @@ class FastCSVImporter:
         return str_value
     
     def import_csv(self, csv_file):
-        """导入单个CSV文件"""
+        """导入单个CSV文件（手动/独立通道：读CSV后走 import_rows）"""
         if not os.path.exists(csv_file):
             print(f"[ERROR] 文件不存在: {csv_file}")
             return False
-            
+
         print(f"\n开始导入: {csv_file}")
-        
+
         try:
             # 读取CSV数据
             with open(csv_file, 'r', encoding='utf-8-sig') as f:
                 data = list(csv.DictReader(f))
-            
+
             if not data:
                 print("[ERROR] CSV文件为空")
                 return False
-                
+
             print(f"读取到 {len(data)} 条记录")
-            
+
             # 检查必要字段
             if 'vehicle_id' not in data[0] or 'sale_status' not in data[0]:
                 print("[ERROR] CSV文件缺少必要字段 (vehicle_id, sale_status)")
                 return False
-            
+
             # 获取车辆类型
             filename = os.path.basename(csv_file)
             vehicle_type = 3  # 默认类型
@@ -416,33 +449,67 @@ class FastCSVImporter:
                     vehicle_type = int(filename.split('_')[2].split('.')[0])
                 except:
                     pass
-            
+
+            return self.import_rows(data, vehicle_type)
+
+        except Exception as e:
+            print(f"[ERROR] 导入失败: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+
+    def _ensure_connection(self) -> bool:
+        """确保数据库连接可用（懒连接 + 断线重连），供逐页直接入库复用。"""
+        if self.connection is not None:
+            try:
+                self.connection.ping(reconnect=True, attempts=1, delay=0)
+                return True
+            except mysql.connector.Error:
+                print("[WARN] 数据库连接已断开，尝试重连...")
+                self.connection = None
+                self.cursor = None
+        return self.connect()
+
+    def import_rows(self, rows: List[dict], vehicle_type: int) -> dict:
+        """把内存行直接写入数据库（爬取主通道，CSV 备份之外的正路）。
+
+        新车辆 INSERT IGNORE，已存在车辆分批全字段 UPDATE，图片仅补新车辆。
+        返回 {"success", "new", "updated", "errors", "duration"}。
+        """
+        started = time.time()
+        if not rows:
+            return {"success": True, "new": 0, "updated": 0, "errors": 0, "duration": 0.0}
+
+        if not self._ensure_connection():
+            return {"success": False, "new": 0, "updated": 0, "errors": len(rows), "duration": 0.0}
+
+        try:
             # 获取已存在的ID
             print(f"[{now_beijing().strftime('%H:%M:%S')}] 开始查询已存在的车辆ID...")
             start_query = time.time()
-            vehicle_ids = [row.get('vehicle_id', '') for row in data]
+            vehicle_ids = [row.get('vehicle_id', '') for row in rows]
             existing_ids = self.get_existing_ids(vehicle_ids)
             query_time = time.time() - start_query
             print(f"[{now_beijing().strftime('%H:%M:%S')}] 查询完成，发现 {len(existing_ids)} 个已存在的记录，耗时 {query_time:.2f} 秒")
-            
+
             # 准备数据
             print(f"[{now_beijing().strftime('%H:%M:%S')}] 开始准备数据...")
             start_prepare = time.time()
             new_vehicles = []
             update_vehicles = []
             new_images = []
-            
-            for row in data:
+
+            for row in rows:
                 vehicle_id = row.get('vehicle_id', '')
                 if not vehicle_id:
                     continue
-                    
+
                 # 解析价格
                 current_price, original_price = parse_price(row.get('price', ''))
-                
+
                 # 处理状态
                 vehicle_status = 2 if row.get('sale_status', '未售') == '已售' else 1
-                
+
                 # 处理扩展字段
                 extra_fields = None
                 if row.get('extra_fields'):
@@ -450,7 +517,7 @@ class FastCSVImporter:
                         extra_fields = json.loads(row.get('extra_fields'))
                     except:
                         pass
-                
+
                 # 准备车辆数据
                 vehicle_data = (
                     vehicle_id, vehicle_type, vehicle_status,
@@ -474,26 +541,26 @@ class FastCSVImporter:
                     row.get('contact_name', ''),
                     self.clean_data(row.get('phone_number'))
                 )
-                
+
                 if vehicle_id in existing_ids:
                     update_vehicles.append(vehicle_data)
                 else:
                     new_vehicles.append(vehicle_data)
-                    
+
                     # 只为新车辆处理图片
                     image_urls = row.get('image_urls', '').split('\n') if row.get('image_urls') else []
                     for i, url in enumerate(image_urls):
                         url = url.strip()
                         if url:
                             new_images.append((vehicle_id, url, i))
-            
+
             prepare_time = time.time() - start_prepare
             print(f"[{now_beijing().strftime('%H:%M:%S')}] 数据准备完成，新增: {len(new_vehicles)} 条，更新: {len(update_vehicles)} 条，图片: {len(new_images)} 条，耗时 {prepare_time:.2f} 秒")
-            
+
             # 执行批量操作
             start_time = now_beijing()
             print(f"[{start_time.strftime('%H:%M:%S')}] 开始执行数据库操作...")
-            
+
             # 插入新车辆
             inserted_count = 0
             if new_vehicles:
@@ -504,21 +571,21 @@ class FastCSVImporter:
                     vehicle_id, vehicle_type, vehicle_status, page_number,
                     car_number, car_url, car_category, car_brand, car_model,
                     fuel_type, seats, engine_volume, transmission, year,
-                    description, price, current_price, original_price, 
+                    description, price, current_price, original_price,
                     contact_info, update_date, extra_fields, contact_name, phone_number
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """
-                
+
                 # 一次性插入所有新车辆
                 self.cursor.executemany(insert_sql, new_vehicles)
                 self.connection.commit()
                 inserted_count = len(new_vehicles)
                 insert_time = time.time() - start_insert
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {inserted_count} 条车辆记录，耗时 {insert_time:.2f} 秒")
-            
+
             # 更新现有车辆（直接操作数据库）
             success_update_count = 0
             error_update_count = 0
@@ -548,7 +615,7 @@ class FastCSVImporter:
 
                 update_time = time.time() - start_update
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 数据库更新完成: 成功 {success_update_count}, 失败 {error_update_count}, 总耗时 {update_time:.2f} 秒")
-            
+
             # 插入图片（仅新车辆，更新车辆不处理图片）
             if new_images:
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] 正在插入 {len(new_images)} 条图片记录（仅新车辆）...")
@@ -560,18 +627,19 @@ class FastCSVImporter:
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] [OK] 新增 {len(new_images)} 条图片记录，耗时 {images_time:.2f} 秒")
             else:
                 print(f"[{now_beijing().strftime('%H:%M:%S')}] 无需处理图片（无新车辆）")
-            
+
             # 计算耗时
             end_time = now_beijing()
             duration = (end_time - start_time).total_seconds()
-            print(f"[OK] 导入完成！总计处理 {len(data)} 条记录，耗时 {duration:.1f} 秒")
+            print(f"[OK] 导入完成！总计处理 {len(rows)} 条记录，耗时 {duration:.1f} 秒")
             return {
                 "success": True,
                 "new": inserted_count,
                 "updated": success_update_count,
-                "errors": error_update_count
+                "errors": error_update_count,
+                "duration": time.time() - started
             }
-            
+
         except Exception as e:
             print(f"[ERROR] 导入失败: {e}")
             if self.connection:
@@ -580,9 +648,10 @@ class FastCSVImporter:
                 "success": False,
                 "new": 0,
                 "updated": 0,
-                "errors": 1
+                "errors": len(rows),
+                "duration": time.time() - started
             }
-    
+
     def import_all_csv(self):
         """导入所有CSV文件"""
         csv_files = glob.glob("data/csv/car_data_*.csv")

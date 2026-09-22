@@ -45,12 +45,12 @@ carinfo/
 │       │   ├── __init__.py
 │       │   ├── base_spider.py      # 站点爬虫抽象基类（4 抽象方法）
 │       │   ├── proxy.py            # 代理池（原 proxy_manager.py）
-│       │   └── importer.py         # CSV → MySQL 导入（原 import_to_mysql.py）
+│       │   └── importer.py         # 直接入库 import_rows()（主通道）+ CSV 手动补导（原 import_to_mysql.py）
 │       └── sites/                  # 各站点业务实现
 │           ├── __init__.py
 │           └── car28.py            # 28car.com 业务（Car28Spider）
 ├── data/
-│   └── csv/                        # CSV 爬取产物（gitignored）
+│   └── csv/                        # CSV 备份（只写不读，供排查/补导；gitignored）
 └── archive/                        # 历史 dump / 调试遗留（gitignored）
 ```
 
@@ -92,10 +92,11 @@ HTTP 请求 / 代理 / 反爬退避 / CSV 写出 / DB 导入等基础设施**当
 
 ### core/importer.py — 数据导入
 
-- DataValidator：校验 vehicle_id、价格、电话、年份、座位数
-- ImportHistory：记录导入历史到 `import_history` 表
-- CrawlLogManager：记录爬取统计到 `crawl_logs` 表
-- FastCSVImporter：批量 INSERT IGNORE + 分批 UPDATE
+- DataValidator：校验 vehicle_id、价格、电话、年份、座位数（**注意：当前未被调用，接入时二选一：接入或删除**）
+- ImportHistory：`import_history` 表（表结构会自动创建，`record_import` 当前未接线）
+- CrawlLogManager：记录爬取统计到 `crawl_logs` 表（爬取主通道每类型记录一条）
+- FastCSVImporter：批量 INSERT IGNORE + 分批 UPDATE；`import_rows(rows, type)` 是爬取主通道入口（懒连接 + 断线重连），`import_csv()` 是手动补导 CSV 的独立通道
+- `record_crawl_log()`：把单类型爬取统计写入 crawl_logs
 - 价格解析复用 `carinfo.utils.parse_price`
 
 ### service.py — 调度服务
@@ -116,13 +117,12 @@ service.py (run_service.py / python -m carinfo)
     ▼
 sites/car28.py:scrape_vehicle_type()
     │ 通过 core/proxy.py 取代理
-    ▼
-data/csv/car_data_{type}.csv
-    │ auto_import_to_database()
-    ▼
-core/importer.py:main()
-    ▼
-MySQL (car_info_db)
+    ├──────────────────────────────┐
+    ▼                              ▼
+data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入库）
+（只写不读的备份，供排查）           │ 统计经返回值内存传递
+                                   ▼
+                               MySQL (car_info_db) + crawl_logs
 ```
 
 ## 数据库
@@ -150,10 +150,12 @@ python -m carinfo
 
 1. **历史包袱：vehicle_id 不带 28car 前缀** —— 现存 11 万+ 行数据 vehicle_id 无前缀，且 `vehicle_images` 有 FK + `ON UPDATE RESTRICT`，无法批量改写。新站点统一用 `{site_name}_{native_id}` 前缀；详见 `core/base_spider.py:vehicle_id()` docstring。
 2. **BaseSpider 目前是空壳抽象**：4 个抽象方法定义了但调度流程没真正调用——`scrape_vehicle_type` 走的是 `get_html_1` / `get_date_code` / `extract_car_info`。接入第二站时需要把 HTTP/代理/反爬 等基础设施真的下沉到 core，并让 `scrape_vehicle_type` 改成基于 `spider.list_url()` / `spider.parse_list()` 的通用流程。
-3. **`os.environ` 传爬取统计**：`scrape_vehicle_type` 把 `CRAWL_*` 系列统计塞到环境变量，`importer.py` 读回。这是反模式（进程级全局状态，多类型连续跑会互相覆盖）——等需要的时候改成函数返回值。
-4. **无测试**：项目没有任何单元测试或集成测试。
+3. **`os.environ` 传爬取统计**：~~已修复~~ 现已改为 `scrape_vehicle_type()` 返回统计 dict，由 `service.py` 聚合；`importer.py:main()` 手动补导时仍读环境变量（可选）。
+4. **无测试**：项目没有常驻的单元测试（历次修复靠一次性脚本验证，建议后续补 pytest）。
 5. **相对路径依赖**：`config.json`、状态文件、CSV 等都用相对路径，依赖 `run_service.py` 中的 `os.chdir(repo_root)`。
-6. **CSV 中间格式**：爬虫先写 `data/csv/*.csv` 再导入 MySQL，是有意设计（便于补导入和审计）。
+6. **CSV 现在只是备份**：爬取结果逐页通过 `import_rows()` 直接入库；`data/csv/*.csv` 只写不读，供排查/审计/手动补导（`python -m carinfo.core.importer` 仍可从 CSV 补导）。入库失败时该页数据仍在 CSV 里可补救。
+7. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
+8. **行为变更提醒**：改为直接入库后，掉出配置页数范围（前 N 页）的旧车不再被每日刷新 `updated_at`——这是有意为之（恢复 updated_at 的"最近仍在售"语义）。若下游有依赖旧行为需回退。
 7. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
 
 ## 加新站点的步骤
