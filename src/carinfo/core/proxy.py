@@ -36,7 +36,9 @@ class ProxyManager:
         self.pool_size = pool_size
         self.proxy_pool = []  # 内存中的代理池
         self.failed_proxies = set()  # 本次会话失败的代理
-        self.lock = threading.Lock()  # 线程锁
+        # 必须用可重入锁：get_random_proxy 持锁期间会调用 load_proxies_from_db，
+        # 普通 Lock 同线程重复加锁会永久死锁（可用代理低于池 20% 时必触发）
+        self.lock = threading.RLock()
         self.last_load_time = None
         self.load_count = 0  # 加载次数统计
 
