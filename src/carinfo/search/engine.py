@@ -161,6 +161,8 @@ class ScoredVehicle:
     seats: str | None
     engine_volume: str | None
 
+    #: 首图(封面)URL。TopN 切片后由 `_attach_covers` 单独补上,不参与主扫描查询
+    image_url: str | None = None
     base_model: str | None = None
     brand_norm: str | None = None
     price_ratio: float | None = None
@@ -195,6 +197,7 @@ class ScoredVehicle:
             "year": self.year,
             "price": self.price,
             "car_url": self.car_url,
+            "image_url": self.image_url,
             "seats": self.seats,
             "engine_volume": self.engine_volume,
             "base_model": self.base_model,
@@ -243,6 +246,15 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
 FROM vehicles v
 JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_status = 1 AND v.current_price IS NOT NULL AND v.current_price > 0
+"""
+
+#: TopN 的首图(封面)。DISTINCT ON 取每车 image_order 最小的一张 —— 不写死
+#: `image_order = 0`,首张非 0 的脏数据也能兜住。
+_COVER_SQL = """
+SELECT DISTINCT ON (vehicle_id) vehicle_id, image_url
+FROM vehicle_images
+WHERE vehicle_id = ANY(%s)
+ORDER BY vehicle_id, image_order
 """
 
 
@@ -485,6 +497,25 @@ def _mileage_of(ef: dict) -> int | None:
     return km if km and 0 < km <= 1_000_000 else None
 
 
+def _attach_covers(conn, items: list[ScoredVehicle]) -> None:
+    """给**已切片的 TopN** 补首图。列表语义只带一张,全量图片走详情接口。
+
+    为什么不把 vehicle_images join 进 _SELECT:主查询要**全量拉候选进内存打分**
+    (见 MAX_SCAN_ROWS 的注释),join 会让行数 × 每车图片数(库内 ≤5),还得
+    GROUP BY 去重还原,全库扫描直接翻几倍;而真正需要图的只有 limit(≤50)条 ——
+    切片后用 `= ANY(...)` 一次点查,走 (vehicle_id, image_order) 复合索引,毫秒级。
+    API 与 MCP 共用 `search()`,这里补一次,两个入口同时受益。
+    """
+    if not items:
+        return
+    cur = conn.cursor()
+    cur.execute(_COVER_SQL, ([it.vehicle_id for it in items],))
+    covers = dict(cur.fetchall())
+    cur.close()
+    for it in items:
+        it.image_url = covers.get(it.vehicle_id)
+
+
 def search(conn, spec: SearchSpec) -> SearchResult:
     """主入口。conn 由调用方给（API 层用连接池，MCP 用单连接）。"""
     t0 = time.perf_counter()
@@ -564,6 +595,7 @@ def search(conn, spec: SearchSpec) -> SearchResult:
 
     _sort_items(items, spec)
     items = items[: spec.limit]
+    _attach_covers(conn, items)
     elapsed = int((time.perf_counter() - t0) * 1000)
     return SearchResult(
         spec=spec, items=items, total_matched=total_matched, scanned=scanned,

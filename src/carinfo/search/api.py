@@ -164,6 +164,11 @@ LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1
 """
 
+#: 详情图片:全量按页面原始顺序(image_order)。列表的首图由 engine._attach_covers 负责
+_IMAGES_SQL = """
+SELECT image_url FROM vehicle_images WHERE vehicle_id = %s ORDER BY image_order
+"""
+
 _MODELS_SQL = """
 SELECT base_model, count(*) AS n,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY v.current_price) AS median
@@ -179,11 +184,15 @@ def _do_vehicle(conn, vehicle_id: str) -> dict[str, Any] | None:
     cur.execute(_VEHICLE_SQL, (vehicle_id,))
     row = cur.fetchone()
     cols = [d[0] for d in cur.description]
-    cur.close()
     if row is None:
+        cur.close()
         return None
+    cur.execute(_IMAGES_SQL, (vehicle_id,))
+    images = [r[0] for r in cur.fetchall()]
+    cur.close()
 
     data = dict(zip(cols, row))
+    data["images"] = images
     for k in ("current_price", "original_price", "market_median", "market_p25", "market_p75",
               "price_ratio", "condition_score", "heat_score"):
         if data.get(k) is not None:

@@ -144,6 +144,7 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "labels": it["labels"],
                 "why": it["explain"],
                 "url": it["car_url"],
+                "image_url": it["image_url"],
             }
             for it in out.items
         ],
@@ -162,6 +163,11 @@ LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1
 """
 
+#: 详情图片:全量按页面原始顺序。列表首图由 engine._attach_covers 负责
+_IMAGES_SQL = """
+SELECT image_url FROM vehicle_images WHERE vehicle_id = %s ORDER BY image_order
+"""
+
 _HOT_MODELS_SQL = """
 SELECT f.base_model, count(*) AS n,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY v.current_price) AS median
@@ -177,11 +183,15 @@ def _do_car_detail(conn, vehicle_id: str) -> dict[str, Any]:
     cur.execute(_DETAIL_SQL, (vehicle_id,))
     row = cur.fetchone()
     cols = [d[0] for d in cur.description]
-    cur.close()
     if row is None:
+        cur.close()
         return {"error": "车源不存在或已下架", "vehicle_id": vehicle_id}
+    cur.execute(_IMAGES_SQL, (vehicle_id,))
+    images = [r[0] for r in cur.fetchall()]
+    cur.close()
 
     data = dict(zip(cols, row))
+    data["images"] = images
     for k in ("current_price", "original_price", "market_median", "market_p25", "market_p75",
               "price_ratio", "condition_score", "heat_score"):
         if data.get(k) is not None:
@@ -216,6 +226,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
                 "year": it["year"],
                 "price": it["price"],
                 "price_ratio": it["price_ratio"],
+                "image_url": it["image_url"],
                 "labels": it["labels"],
             }
             for it in out.items
@@ -228,7 +239,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
     name="search_cars",
     description=(
         "按中文/粤语自然语言或英文车系名检索香港二手车源，返回按综合分排序的候选，"
-        "含比价依据（与同款同年段中位价的比值）。"
+        "含比价依据（与同款同年段中位价的比值）与首图 image_url。"
         "例：'五十萬以內的阿尔法'、'2015年打後的一手威尔法'、'最便宜的七座MPV'。"
         "价格均为港币。"
     ),
@@ -240,7 +251,7 @@ def search_cars(query: str, limit: int = 5) -> dict[str, Any]:
 
 @server.tool(
     name="get_car_detail",
-    description="按 vehicle_id 取单车完整信息与比价依据（含同款 p25/中位/p75 价、行情样本数、车况原始字段）。",
+    description="按 vehicle_id 取单车完整信息与比价依据（含同款 p25/中位/p75 价、行情样本数、车况原始字段、全部图片 images）。",
 )
 def get_car_detail(vehicle_id: str) -> dict[str, Any]:
     return fetch(lambda conn: _do_car_detail(conn, vehicle_id))

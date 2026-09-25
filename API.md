@@ -68,6 +68,8 @@ curl -H "X-API-Key: <你的43位key>" https://searchcar.eazycar.top/health
 - 默认只搜**私家车**(vehicle_type=1)——库里其他车型是历史遗留,要放开显式传 null。
 - 默认剔除疑似问题车(价格低于同款行情 50% 的异常标价,`is_anomaly`)。
 - 车源数据每日爬取更新;搜索依赖的行情/特征表由运维重算,行情类字段可能滞后数日。
+- 图片是 28car CDN 的直链,**没有热链防盗**(无 Referer 也能访问)。在售车源的图基本
+  可用;车下架久了原图可能被 CDN 清理(404),前端/客户端要做好图片挂掉的兜底。
 
 ---
 
@@ -111,6 +113,7 @@ curl -s -H "X-API-Key: $KEY" \
 - `parse_source`:`llm`(模型解析)/ `fallback`(规则降级,`notes` 里会写原因)。
 - `spec`:这次查询实际生效的检索条件,**建议在 UI 上回显它**,让用户知道系统理解成了什么。
 - `total_matched`:满足硬过滤的候选总数(不是返回条数)。
+- **`image_url`**:每条候选的**首图(封面)**;要全部图片(每车 ≤5 张)用 `/vehicle/{id}` 的 `images`。
 
 **它能听懂什么**(中文/粤语/英文混合):
 
@@ -174,7 +177,8 @@ curl -s -H "X-API-Key: $KEY" https://searchcar.eazycar.top/vehicle/s2689574
 
 返回车辆全量字段(含原始 `description`、`extra_fields`)+ 行情比价数据
 (`price_ratio` / `market_p25` / `market_median` / `market_p75` / `market_level` /
-`market_ref_n`)+ 格式化好的 `price_text` / `price_verdict`("比同款行情低 12%")。
+`market_ref_n`)+ 格式化好的 `price_text` / `price_verdict`("比同款行情低 12%")
++ **全部图片 `images`**(URL 数组,按原页顺序,每车 ≤5 张)。
 不存在或已下架 → 404。
 
 ### 2.5 `GET /models` — 库内车系榜
@@ -275,11 +279,11 @@ curl -sS -X POST -H "X-API-Key: $KEY" \
 #### `search_cars(query, limit=5)` — 自然语言检索(主力)
 
 和 HTTP `GET /search` 同一内核,含大模型解析(约数秒)。`query` 支持的写法见 §2.2 的表。
-返回摘要 + 候选列表(每条带 `why` 比价解释、`market_basis` 行情依据、`url`)。
+返回摘要 + 候选列表(每条带 `why` 比价解释、`market_basis` 行情依据、`url`、首图 `image_url`)。
 
 #### `get_car_detail(vehicle_id)` — 单车详情
 
-和 HTTP `GET /vehicle/{id}` 同数据。车源不存在时**不抛错**,返回
+和 HTTP `GET /vehicle/{id}` 同数据(含全部图片 `images`)。车源不存在时**不抛错**,返回
 `{"error": "车源不存在或已下架", "vehicle_id": "..."}`——模型能优雅转述。
 
 #### `list_hot_models(limit=30)` — 库内车系榜(上限 200)
@@ -312,6 +316,8 @@ seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默
 | `license_until` | 牌費到期(原文片段,如「26年12月」;剩余牌費可退,香港买家高度关心) |
 | `china_plate` / `is_swap` | 中港牌 / 换车帖(可作检索条件,见 spec 字段表) |
 | `age_days` | 挂牌天数 |
+| `image_url` | 搜索候选的**首图(封面)**URL,28car CDN 直链(见 §1.5 的失效说明) |
+| `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张) |
 
 ---
 
