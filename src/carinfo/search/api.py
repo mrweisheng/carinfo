@@ -155,6 +155,7 @@ SELECT v.vehicle_id, v.car_brand, v.car_model, v.year, v.current_price,
        v.original_price, v.seats, v.engine_volume, v.transmission,
        v.fuel_type, v.car_url, v.car_category, v.extra_fields,
        v.description,
+       v.contact_name, v.phone_number, v.contact_email, v.contact_info,
        f.base_model, f.brand_norm, f.price_ratio, f.market_median,
        f.market_p25, f.market_p75, f.market_bucket, f.market_level,
        f.market_ref_n, f.condition_score, f.has_condition, f.age_days,
@@ -193,6 +194,18 @@ def _do_vehicle(conn, vehicle_id: str) -> dict[str, Any] | None:
 
     data = dict(zip(cols, row))
     data["images"] = images
+
+    # 联系人展示串：找车的最终目的是联系车主，详情必带（电话优先，仅邮箱带「電郵」前缀）
+    name = (data.get("contact_name") or "").strip()
+    phone = (data.get("phone_number") or "").strip()
+    email = (data.get("contact_email") or "").strip()
+    if phone:
+        data["contact_display"] = f"{name} · {phone}" if name else phone
+    elif email:
+        data["contact_display"] = f"{name} · 電郵 {email}" if name else f"電郵 {email}"
+    else:
+        data["contact_display"] = None
+
     for k in ("current_price", "original_price", "market_median", "market_p25", "market_p75",
               "price_ratio", "condition_score", "heat_score"):
         if data.get(k) is not None:

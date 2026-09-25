@@ -114,6 +114,7 @@ curl -s -H "X-API-Key: $KEY" \
 - `spec`:这次查询实际生效的检索条件,**建议在 UI 上回显它**,让用户知道系统理解成了什么。
 - `total_matched`:满足硬过滤的候选总数(不是返回条数)。
 - **`image_url`**:每条候选的**首图(封面)**;要全部图片(每车 ≤5 张)用 `/vehicle/{id}` 的 `images`。
+- **`contact_display`**:每条候选的**卖家联系方式**(如 `Chan · 98524136`),拿到检索结果即可直接联系车主,无需再查详情。检索只返回**在售且带联系方式**的车源(电话或邮箱);仅留邮箱的卖家联系方式慢,统一排在有电话的车源之后,并打「仅邮箱联系」标签。
 
 **它能听懂什么**(中文/粤语/英文混合):
 
@@ -178,7 +179,10 @@ curl -s -H "X-API-Key: $KEY" https://searchcar.eazycar.top/vehicle/s2689574
 返回车辆全量字段(含原始 `description`、`extra_fields`)+ 行情比价数据
 (`price_ratio` / `market_p25` / `market_median` / `market_p75` / `market_level` /
 `market_ref_n`)+ 格式化好的 `price_text` / `price_verdict`("比同款行情低 12%")
-+ **全部图片 `images`**(URL 数组,按原页顺序,每车 ≤5 张)。
++ **全部图片 `images`**(URL 数组,按原页顺序,每车 ≤5 张)
++ **卖家联系方式**:`contact_name` / `phone_number`(8 位手机号) /
+`contact_email`(仅留邮箱的卖家,约 7%) / `contact_info`(原始文本) /
+`contact_display`(一行式,如 `陳生 · 62037222` 或 `趙生 · 電郵 xxx@yahoo.com.hk`)。
 不存在或已下架 → 404。
 
 ### 2.5 `GET /models` — 库内车系榜
@@ -279,11 +283,14 @@ curl -sS -X POST -H "X-API-Key: $KEY" \
 #### `search_cars(query, limit=5)` — 自然语言检索(主力)
 
 和 HTTP `GET /search` 同一内核,含大模型解析(约数秒)。`query` 支持的写法见 §2.2 的表。
-返回摘要 + 候选列表(每条带 `why` 比价解释、`market_basis` 行情依据、`url`、首图 `image_url`)。
+返回摘要 + 候选列表(每条带 `why` 比价解释、`market_basis` 行情依据、`url`、首图 `image_url`、
+`contact` 卖家联系方式——拿到结果即可联系车主,无需再查详情)。
 
 #### `get_car_detail(vehicle_id)` — 单车详情
 
-和 HTTP `GET /vehicle/{id}` 同数据(含全部图片 `images`)。车源不存在时**不抛错**,返回
+和 HTTP `GET /vehicle/{id}` 同数据(含全部图片 `images`、卖家联系方式
+`contact_name` / `phone_number` / `contact_email` / `contact_display`)。
+车源不存在时**不抛错**,返回
 `{"error": "车源不存在或已下架", "vehicle_id": "..."}`——模型能优雅转述。
 
 #### `list_hot_models(limit=30)` — 库内车系榜(上限 200)
@@ -318,6 +325,8 @@ seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默
 | `age_days` | 挂牌天数 |
 | `image_url` | 搜索候选的**首图(封面)**URL,28car CDN 直链(见 §1.5 的失效说明) |
 | `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张) |
+| `contact_display` / MCP 列表的 `contact` | 卖家联系方式一行式:电话型 `Chan · 98524136`;仅邮箱型 `趙生 · 電郵 xxx@yahoo.com.hk`。检索结果只含在售且带联系方式的车源,仅邮箱的排在有电话的之后 |
+| `contact_name` / `phone_number` / `contact_email` / `contact_info` | 详情接口的结构化联系人:姓名 / 8 位电话 / 邮箱(约 7% 卖家只留邮箱) / 原始文本 |
 
 ---
 

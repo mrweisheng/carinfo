@@ -663,9 +663,10 @@ class Car28Spider(BaseSpider):
 
         if '聯絡人資料' in car_data:
             contact_text = car_data['聯絡人資料']
-            contact_name, phone_number = parse_contact_info(contact_text)
+            contact_name, phone_number, contact_email = parse_contact_info(contact_text)
             car_data['contact_name'] = contact_name
             car_data['phone_number'] = phone_number
+            car_data['contact_email'] = contact_email
 
         extra_fields = self._process_extra_fields(car_data)
         # 修复：此前只把扩展字段平铺进 car_data 顶层，build_rows 读取的
@@ -815,6 +816,7 @@ class Car28Spider(BaseSpider):
                 'contact_info': car.get('聯絡人資料', ''),
                 'contact_name': car.get('contact_name', ''),
                 'phone_number': car.get('phone_number', ''),
+                'contact_email': car.get('contact_email', ''),
                 'update_date': car.get('更新日期', ''),
                 'image_urls': '\n'.join(car.get('图片URLs', [])),
                 'sale_status': car.get('sale_status', '未知'),

@@ -105,6 +105,9 @@ def item_labels(item: ScoredVehicle) -> list[str]:
     # 换车帖只标注不隐藏:对买家是背景信息,对车商是收购线索
     if item.is_swap:
         tags.append("可换车")
+    # 仅邮箱联系:联系慢、优先级被排后,如实标注让调用方知道为什么靠后
+    if not item.has_phone:
+        tags.append("仅邮箱联系")
     if item.view_count is not None and item.view_count >= 200:
         tags.append(f"浏览 {item.view_count} 次")
 

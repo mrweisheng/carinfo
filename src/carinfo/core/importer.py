@@ -608,11 +608,12 @@ class FastCSVImporter:
                     row.get('description', ''),
                     row.get('price', ''),
                     current_price, original_price,
-                    row.get('contact_info', ''),
+                    row.get('contact_info', '') or None,
                     row.get('update_date', ''),
                     json.dumps(extra_fields) if extra_fields else None,
-                    row.get('contact_name', ''),
-                    self.clean_data(row.get('phone_number'))
+                    row.get('contact_name', '') or None,
+                    self.clean_data(row.get('phone_number')) or None,
+                    self.clean_data(row.get('contact_email')) or None
                 )
 
                 if vehicle_id in existing_ids:
@@ -660,7 +661,8 @@ class FastCSVImporter:
                     car_number, car_url, car_category, car_brand, car_model,
                     fuel_type, seats, engine_volume, transmission, year,
                     description, price, current_price, original_price,
-                    contact_info, update_date, extra_fields, contact_name, phone_number
+                    contact_info, update_date, extra_fields, contact_name,
+                    phone_number, contact_email
                 ) VALUES %s
                 ON CONFLICT (vehicle_id) DO NOTHING
                 """
@@ -834,7 +836,8 @@ class FastCSVImporter:
         """兜底行专用更新：只写列表页可靠的字段。
 
         为什么单独一条 SQL，不复用 `_update_via_database`：
-        兜底行的 description / contact_info / contact_name / phone_number / extra_fields
+        兜底行的 description / contact_info / contact_name / phone_number /
+        contact_email / extra_fields
         都是**空值占位**（car28._build_fallback_car 只填列表页字段）。走全字段 UPDATE 会把
         这辆老车此前攒下的详情数据整行抹掉，而它一旦掉出抓取范围就再也补不回来。
         这里只更新「列表页确实有、且详情页不产出」的字段，详情字段原样保留。
@@ -862,7 +865,7 @@ class FastCSVImporter:
                 fuel_type = %s, seats = %s, engine_volume = %s, transmission = %s, year = %s,
                 description = %s, price = %s, current_price = %s, original_price = %s,
                 contact_info = %s, update_date = %s, extra_fields = %s,
-                contact_name = %s, phone_number = %s,
+                contact_name = %s, phone_number = %s, contact_email = %s,
                 updated_at = CURRENT_TIMESTAMP
             WHERE vehicle_id = %s
             """
@@ -873,7 +876,8 @@ class FastCSVImporter:
                 # vehicle_type, vehicle_status, page_number, car_number, car_url,
                 # car_category, car_brand, car_model, fuel_type, seats, engine_volume,
                 # transmission, year, description, price, current_price, original_price,
-                # contact_info, update_date, extra_fields, contact_name, phone_number, vehicle_id
+                # contact_info, update_date, extra_fields, contact_name, phone_number,
+                # contact_email, vehicle_id
                 record = (
                     vehicle_data[1],   # vehicle_type
                     vehicle_data[2],   # vehicle_status
@@ -897,6 +901,7 @@ class FastCSVImporter:
                     vehicle_data[20],  # extra_fields
                     vehicle_data[21],  # contact_name
                     vehicle_data[22],  # phone_number
+                    vehicle_data[23],  # contact_email
                     vehicle_data[0]     # vehicle_id (WHERE条件)
                 )
                 update_data.append(record)

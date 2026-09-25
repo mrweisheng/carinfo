@@ -163,6 +163,13 @@ class ScoredVehicle:
 
     #: 首图(封面)URL。TopN 切片后由 `_attach_covers` 单独补上,不参与主扫描查询
     image_url: str | None = None
+
+    #: 联系人（找车的最终目的是联系车主，2026-09-25 起检索必带）。
+    #: phone 与 email 至少有一个（无联系方式的已车被 SQL 硬过滤，不会出现在结果里）。
+    contact_name: str | None = None
+    contact_phone: str | None = None
+    contact_email: str | None = None
+
     base_model: str | None = None
     brand_norm: str | None = None
     price_ratio: float | None = None
@@ -189,6 +196,21 @@ class ScoredVehicle:
     #: 实际参与的维度（缺维不在其中），让上游能如实说"这条没车况数据"
     used_dims: list[str] = field(default_factory=list)
 
+    @property
+    def has_phone(self) -> bool:
+        """有电话 = 可直接打；仅邮箱的联系成本低优先级，排序靠后。"""
+        return bool(self.contact_phone)
+
+    @property
+    def contact_display(self) -> str | None:
+        """一行式联系方式，Agent 可直接念给用户（如 `Chan · 98524136`）。"""
+        if self.contact_phone:
+            return f"{self.contact_name} · {self.contact_phone}" if self.contact_name else self.contact_phone
+        if self.contact_email:
+            prefix = f"{self.contact_name} · " if self.contact_name else ""
+            return f"{prefix}電郵 {self.contact_email}"
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "vehicle_id": self.vehicle_id,
@@ -198,6 +220,11 @@ class ScoredVehicle:
             "price": self.price,
             "car_url": self.car_url,
             "image_url": self.image_url,
+            "contact_name": self.contact_name,
+            "contact_phone": self.contact_phone,
+            "contact_email": self.contact_email,
+            "contact_display": self.contact_display,
+            "has_phone": self.has_phone,
             "seats": self.seats,
             "engine_volume": self.engine_volume,
             "base_model": self.base_model,
@@ -239,6 +266,7 @@ class SearchResult:
 _SELECT = """
 SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_url,
        v.seats, v.engine_volume, v.extra_fields,
+       v.contact_name, v.phone_number, v.contact_email,
        f.base_model, f.brand_norm, f.price_ratio, f.market_median, f.market_p25,
        f.market_p75, f.market_level, f.market_ref_n, f.age_days, f.condition_score,
        f.has_condition, f.heat_score, f.is_anomaly,
@@ -246,6 +274,8 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
 FROM vehicles v
 JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_status = 1 AND v.current_price IS NOT NULL AND v.current_price > 0
+  AND (length(btrim(coalesce(v.phone_number, ''))) > 0
+       OR length(btrim(coalesce(v.contact_email, ''))) > 0)
 """
 
 #: TopN 的首图(封面)。DISTINCT ON 取每车 image_order 最小的一张 —— 不写死
@@ -544,6 +574,7 @@ def search(conn, spec: SearchSpec) -> SearchResult:
     for row in rows:
         (
             vid, car_model, car_brand, year, price, car_url, seats, engine_volume, extra,
+            contact_name, phone_number, contact_email,
             base_model, brand_norm, ratio, med, p25, p75, level, ref_n, age_days, cond,
             has_cond, heat, is_anomaly, _total,
         ) = row
@@ -571,6 +602,10 @@ def search(conn, spec: SearchSpec) -> SearchResult:
                 car_url=car_url,
                 seats=seats,
                 engine_volume=engine_volume,
+                # 空串防御：importer 旧数据/CSV 回放可能带 '' 联系人（存量已清，此处兜底）
+                contact_name=(contact_name or "").strip() or None,
+                contact_phone=(phone_number or "").strip() or None,
+                contact_email=(contact_email or "").strip() or None,
                 base_model=base_model,
                 price_ratio=float(ratio) if ratio is not None else None,
                 market_median=float(med) if med is not None else None,
@@ -604,12 +639,14 @@ def search(conn, spec: SearchSpec) -> SearchResult:
 
 
 def _sort_items(items: list[ScoredVehicle], spec: SearchSpec) -> None:
+    # 首键固定「有电话在前」：仅邮箱的车联系方式慢，整体优先级靠后
+    # （2026-09-25 用户要求；同组内保持各 sort 原有排序语义，不动打分体系）
     if spec.sort == SORT_PRICE_ASC:
-        items.sort(key=lambda x: (x.price is None, x.price or 0, -x.score))
+        items.sort(key=lambda x: (not x.has_phone, x.price is None, x.price or 0, -x.score))
     elif spec.sort == SORT_PRICE_DESC:
-        items.sort(key=lambda x: (x.price is None, -(x.price or 0), -x.score))
+        items.sort(key=lambda x: (not x.has_phone, x.price is None, -(x.price or 0), -x.score))
     elif spec.sort == SORT_NEWEST:
-        items.sort(key=lambda x: (x.age_days is None, x.age_days or 0, -x.score))
+        items.sort(key=lambda x: (not x.has_phone, x.age_days is None, x.age_days or 0, -x.score))
     else:
         # 综合分降序；同分时便宜的在前（捡漏优先）
-        items.sort(key=lambda x: (-x.score, x.price or 0))
+        items.sort(key=lambda x: (not x.has_phone, -x.score, x.price or 0))

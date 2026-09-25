@@ -48,9 +48,9 @@ server = MCPServer(
     name="carinfo",
     instructions=(
         "香港 28car 二手车库检索。库内为港币报价的右舵车源，"
-        "覆盖在售与已售。查价、找车、比价都用这里。\n"
+        "检索只返回在售且带卖家联系方式的车源（电话或邮箱）。查价、找车、比价都用这里。\n"
         "典型用法：先用 list_hot_models 看看库里有哪些车系，再用 search_cars 检索，"
-        "需要细节时用 get_car_detail。"
+        "需要细节时用 get_car_detail。检索结果自带 contact（卖家联系方式），可直接联系车主。"
     ),
 )
 
@@ -145,6 +145,7 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "why": it["explain"],
                 "url": it["car_url"],
                 "image_url": it["image_url"],
+                "contact": it["contact_display"],
             }
             for it in out.items
         ],
@@ -155,6 +156,7 @@ _DETAIL_SQL = """
 SELECT v.vehicle_id, v.car_brand, v.car_model, v.year, v.current_price,
        v.original_price, v.seats, v.engine_volume, v.transmission, v.fuel_type,
        v.car_url, v.car_category, v.extra_fields,
+       v.contact_name, v.phone_number, v.contact_email, v.contact_info,
        f.base_model, f.price_ratio, f.market_median, f.market_p25, f.market_p75,
        f.market_bucket, f.market_level, f.market_ref_n, f.condition_score,
        f.has_condition, f.age_days, f.heat_score, f.is_anomaly
@@ -192,6 +194,18 @@ def _do_car_detail(conn, vehicle_id: str) -> dict[str, Any]:
 
     data = dict(zip(cols, row))
     data["images"] = images
+
+    # 联系人展示串：找车的最终目的是联系车主，详情必带（电话优先，仅邮箱带「電郵」前缀）
+    name = (data.get("contact_name") or "").strip()
+    phone = (data.get("phone_number") or "").strip()
+    email = (data.get("contact_email") or "").strip()
+    if phone:
+        data["contact_display"] = f"{name} · {phone}" if name else phone
+    elif email:
+        data["contact_display"] = f"{name} · 電郵 {email}" if name else f"電郵 {email}"
+    else:
+        data["contact_display"] = None
+
     for k in ("current_price", "original_price", "market_median", "market_p25", "market_p75",
               "price_ratio", "condition_score", "heat_score"):
         if data.get(k) is not None:
@@ -228,6 +242,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
                 "price_ratio": it["price_ratio"],
                 "image_url": it["image_url"],
                 "labels": it["labels"],
+                "contact": it["contact_display"],
             }
             for it in out.items
         ],
@@ -240,6 +255,8 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
     description=(
         "按中文/粤语自然语言或英文车系名检索香港二手车源，返回按综合分排序的候选，"
         "含比价依据（与同款同年段中位价的比值）与首图 image_url。"
+        "每条结果带 contact 字段（车主联系方式，电话优先展示），可直接联系车主，"
+        "无需再查详情；仅留邮箱的卖家排在有电话的车源之后。"
         "例：'五十萬以內的阿尔法'、'2015年打後的一手威尔法'、'最便宜的七座MPV'。"
         "价格均为港币。"
     ),
@@ -251,7 +268,11 @@ def search_cars(query: str, limit: int = 5) -> dict[str, Any]:
 
 @server.tool(
     name="get_car_detail",
-    description="按 vehicle_id 取单车完整信息与比价依据（含同款 p25/中位/p75 价、行情样本数、车况原始字段、全部图片 images）。",
+    description=(
+        "按 vehicle_id 取单车完整信息与比价依据（含同款 p25/中位/p75 价、行情样本数、"
+        "车况原始字段、全部图片 images），并返回车主联系方式"
+        "（contact_name/phone_number/contact_email/contact_display）。"
+    ),
 )
 def get_car_detail(vehicle_id: str) -> dict[str, Any]:
     return fetch(lambda conn: _do_car_detail(conn, vehicle_id))
