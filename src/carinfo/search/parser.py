@@ -43,7 +43,7 @@ ALLOWED_LLM_FIELDS = {
     "price_min", "price_max", "price_near",
     "seats", "vehicle_type", "transmission", "fuel_type",
     "import_type", "hand_max", "mileage_max", "china_plate",
-    "max_price_ratio", "exclude_anomaly",
+    "dealer", "max_price_ratio", "exclude_anomaly",
     "sort", "limit",
 }
 #: swap(换车帖)**刻意不给 NL**:「换车」歧义太大(「我想换辆车」≠「找换车帖」),
@@ -72,6 +72,7 @@ hand_max        手数上限，整数
 mileage_max     里程上限（公里），整数
 import_type     "行貨" 或 "水貨"
 china_plate     布尔。用户明确要「中港牌/兩地牌」的车 → true；没提就不输出
+dealer          布尔。「不要车行/只要私人车主/个人卖家」→ false；「只要车行」→ true；没提不输出
 transmission    "自動" / "手動"
 fuel_type       "汽油" / "柴油" / "混能" / "電動"
 vehicle_type    1=私家车 2=客货车 3=货车 4=电单车 5=经典车
@@ -396,7 +397,7 @@ def parse_query(
     for k in (
         "year_min", "year_max", "year_near", "price_min", "price_max", "price_near",
         "seats", "vehicle_type", "transmission", "fuel_type", "import_type",
-        "hand_max", "mileage_max", "max_price_ratio", "china_plate",
+        "hand_max", "mileage_max", "max_price_ratio", "china_plate", "dealer",
     ):
         if data.get(k) is not None:
             payload[k] = data[k]
@@ -669,6 +670,17 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         payload["china_plate"] = False
     elif "中港" in query:
         payload["china_plate"] = True
+
+    # --- 车行/个人卖家 ---（否定/个人诉求先判:「不要车行」是排除,主用法）
+    if re.search(
+        r"不要车行|唔要車行|唔要车行|不要車行|排除车行|排除車行"
+        r"|私人车主|私人車主|私人卖家|私人賣家|个人卖家|個人賣家|个人车主|個人車主"
+        r"|一手车主|一手車主",
+        query,
+    ):
+        payload["dealer"] = False
+    elif re.search(r"只要车行|只要車行|车行货源|車行貨源|车行的车|車行的車", query):
+        payload["dealer"] = True
 
     # --- 排序 ---
     if "最便宜" in query or "最平" in query or "最抵" in query:

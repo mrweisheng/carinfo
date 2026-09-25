@@ -159,7 +159,8 @@ SELECT v.vehicle_id, v.car_brand, v.car_model, v.year, v.current_price,
        v.contact_name, v.phone_number, v.contact_email, v.contact_info,
        f.base_model, f.price_ratio, f.market_median, f.market_p25, f.market_p75,
        f.market_bucket, f.market_level, f.market_ref_n, f.condition_score,
-       f.has_condition, f.age_days, f.heat_score, f.is_anomaly
+       f.has_condition, f.age_days, f.heat_score, f.is_anomaly,
+       f.dealer_listings, f.is_dealer
 FROM vehicles v
 LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1
@@ -257,7 +258,8 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
         "含比价依据（与同款同年段中位价的比值）与首图 image_url。"
         "每条结果带 contact 字段（车主联系方式，电话优先展示），可直接联系车主，"
         "无需再查详情；仅留邮箱的卖家排在有电话的车源之后。"
-        "例：'五十萬以內的阿尔法'、'2015年打後的一手威尔法'、'最便宜的七座MPV'。"
+        "查询里可以说「不要车行/只要私人车主」筛掉车行卖家（挂车 ≥4 台判车行，结果带「车行」标签）。"
+        "例：'五十萬以內的阿尔法'、'2015年打後的一手威尔法'、'不要车行的七座MPV'。"
         "价格均为港币。"
     ),
 )
@@ -297,8 +299,9 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
         "⚠️ 默认值不等于「不设限」，有两条隐式收窄："
         "① 只搜**私家车**（车型类别固定为私家车，不含客货车/货车/电单车/经典车）；"
         "② **自动排除疑似问题车**（比同款行情低 50% 以上的）。"
-        "china_plate/swap 是三态：None=不筛；true=只要（中港牌车 / 换车帖——换车帖对"
-        "收购场景是线索：卖家想换车=好谈价）；false=排除。"
+        "china_plate/swap/dealer 是三态：None=不筛；true=只要；false=排除。"
+        "dealer=false 表示**只要个人卖家**（不想碰车行/同行时用；判定依据=同一联系方式"
+        "在售挂车数 ≥4 台）；dealer=true 只要车行。"
         "签名里没列出的条件（变速箱、燃料、行水货、排量、关键词）则是真的不设限。"
     ),
 )
@@ -315,6 +318,7 @@ def search_by_spec(
     max_price_ratio: float | None = None,
     china_plate: bool | None = None,
     swap: bool | None = None,
+    dealer: bool | None = None,
     sort: str = "score",
     limit: int = 5,
 ) -> dict[str, Any]:
@@ -332,6 +336,7 @@ def search_by_spec(
             "max_price_ratio": max_price_ratio,
             "china_plate": china_plate,
             "swap": swap,
+            "dealer": dealer,
             "sort": sort,
             "limit": limit,
         }

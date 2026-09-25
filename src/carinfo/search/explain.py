@@ -105,6 +105,10 @@ def item_labels(item: ScoredVehicle) -> list[str]:
     # 换车帖只标注不隐藏:对买家是背景信息,对车商是收购线索
     if item.is_swap:
         tags.append("可换车")
+    # 车行标注:同一联系方式在售挂 ≥4 台(实测车行贡献 72% 盘源,
+    # 买家看到「车行」标签能调整谈价预期;不加价转卖的车行也是正常渠道)
+    if item.is_dealer:
+        tags.append(f"车行(挂{item.dealer_listings or '?'}台)")
     # 仅邮箱联系:联系慢、优先级被排后,如实标注让调用方知道为什么靠后
     if not item.has_phone:
         tags.append("仅邮箱联系")

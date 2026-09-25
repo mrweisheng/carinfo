@@ -159,7 +159,7 @@ SELECT v.vehicle_id, v.car_brand, v.car_model, v.year, v.current_price,
        f.base_model, f.brand_norm, f.price_ratio, f.market_median,
        f.market_p25, f.market_p75, f.market_bucket, f.market_level,
        f.market_ref_n, f.condition_score, f.has_condition, f.age_days,
-       f.heat_score, f.is_anomaly
+       f.heat_score, f.is_anomaly, f.dealer_listings, f.is_dealer
 FROM vehicles v
 LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1

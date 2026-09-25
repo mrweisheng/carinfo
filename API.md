@@ -130,6 +130,7 @@ curl -s -H "X-API-Key: $KEY" \
 | 五万公里以内 | 里程上限 |
 | 行货 / 水货 | 进口类型 |
 | 中港牌 / 没有中港 | 筛选/排除中港牌车 |
+| **不要车行 / 私人车主 / 个人卖家** | 只要个人卖家(排除车行);判定=同一联系方式在售挂车 ≥4 台 |
 | 3.5 | 排量(只影响排序,不硬筛) |
 | 最便宜 / 最平 / 最新 / 最貴 | 排序方式 |
 | 捡漏 / 超值 / 笋盘 / 性价比 | 只要比同款行情便宜的(打八折/九折档) |
@@ -162,6 +163,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 | `mileage_max` | int | 里程上限(公里) |
 | `china_plate` | bool | 中港牌(兩地牌):`true` 只要有中港牌的 / `false` 排除 / 不传=不筛(库里约 400 台有) |
 | `swap` | bool | 换车帖:`true` 只要换车帖(**收购线索**:卖家想换车=好谈价)/ `false` 排除 / 不传=不筛 |
+| `dealer` | bool | 车行过滤:`false` **只要个人卖家**(不想碰同行/车行时用)/ `true` 只要车行 / 不传=不筛。判定=同一联系方式在售挂车数 ≥4(实测车行贡献 72% 盘源) |
 | `max_price_ratio` | number | 只要更便宜的:0.9 = 比同款行情便宜 10% 以上 |
 | `exclude_anomaly` | bool | 剔除疑似问题车,默认 `true` |
 | `sort` | string | `score`(默认综合)/ `price_asc` / `price_desc` / `newest` |
@@ -322,6 +324,7 @@ seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默
 | `is_anomaly` | 疑似问题车/标错价(默认已剔除) |
 | `license_until` | 牌費到期(原文片段,如「26年12月」;剩余牌費可退,香港买家高度关心) |
 | `china_plate` / `is_swap` | 中港牌 / 换车帖(可作检索条件,见 spec 字段表) |
+| `is_dealer` / `dealer_listings` | 车行判定 / 该卖家在售挂车数。同一联系方式(电话或邮箱)挂 ≥4 台 = 车行;实测车行贡献 72% 在售盘源,结果里打「车行(挂N台)」标签。检索条件 `dealer`(见 spec 表) |
 | `age_days` | 挂牌天数 |
 | `image_url` | 搜索候选的**首图(封面)**URL,28car CDN 直链(见 §1.5 的失效说明) |
 | `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张) |

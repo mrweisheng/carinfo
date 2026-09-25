@@ -73,6 +73,15 @@ MILEAGE_SCORE_TAIL = 0.20
 #: 行/水货 → 分（行货是总代理正规进口，二手保值更好）
 IMPORT_SCORE = {"行貨": 1.0, "水貨": 0.70, "行货": 1.0, "水货": 0.70}
 
+#: 车行判定阈值：同一联系方式在售挂车数 ≥ 此值判为车行/同行。
+#: 依据 2026-09-25 全库实测（在售 19,927 台有电话、5,584 个去重电话）：
+#: 74.7% 卖家只挂 1 台（个人）、挂 ≥4 台的 820 个卖家贡献 72% 在售车源，
+#: 分布双峰、阈值 4 一刀切误判空间小。≤3 台刻意不再细分（用户拍板）——
+#: 2-3 台既有小车行也有家庭多车，灰区细分收益低。
+#: 附带收益：加价抄盘（复制他人车源加价重挂）99% 发生在挂 ≥4 台的卖家
+#: （327 对同文加价配对中贵方挂 1 台的为 0 对），本阈值天然覆盖。
+DEALER_THRESHOLD = 4
+
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS market_stats (
   base_model   varchar(100) NOT NULL,
@@ -103,11 +112,14 @@ CREATE TABLE IF NOT EXISTS vehicle_features (
   age_days        integer,
   heat_score      numeric(4,3),
   is_anomaly      boolean NOT NULL DEFAULT FALSE,
+  dealer_listings integer,
+  is_dealer       boolean NOT NULL DEFAULT FALSE,
   updated_at      timestamptz DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vf_base_model ON vehicle_features (base_model);
 CREATE INDEX IF NOT EXISTS idx_vf_base_bucket ON vehicle_features (base_model, year_bucket);
 CREATE INDEX IF NOT EXISTS idx_vf_ratio ON vehicle_features (price_ratio);
+CREATE INDEX IF NOT EXISTS idx_vf_is_dealer ON vehicle_features (is_dealer);
 """
 
 
@@ -138,6 +150,17 @@ class RawRow:
     hand_count: int | None
     mileage_km: int | None
     import_type: str | None
+    phone_number: str | None
+    contact_email: str | None
+
+    @property
+    def seller_key(self) -> str | None:
+        """卖家聚合键：电话为主，仅邮箱型用邮箱（同一人换渠道极少，不跨渠道合并）。"""
+        ph = (self.phone_number or "").strip()
+        if ph:
+            return f"tel:{ph}"
+        em = (self.contact_email or "").strip()
+        return f"email:{em}" if em else None
 
 
 def _to_int(val) -> int | None:
@@ -188,13 +211,14 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
                    CASE WHEN update_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
                         THEN update_date::timestamptz END,
                    created_at))) / 86400.0 AS age_days_raw,
+               phone_number, contact_email,
                extra_fields
         FROM vehicles
         WHERE vehicle_status = 1
           AND current_price IS NOT NULL AND current_price > 0
     """)
     rows: list[RawRow] = []
-    for vid, car_model, car_brand, year, price, age_raw, extra in cur.fetchall():
+    for vid, car_model, car_brand, year, price, age_raw, phone, email, extra in cur.fetchall():
         base, brand_hint, _ = normalize_model(car_model, vocab)
         ef = extra if isinstance(extra, dict) else (json.loads(extra) if extra else {})
         rows.append(
@@ -210,6 +234,8 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
                 hand_count=_to_int(ef.get("hand_count")),
                 mileage_km=_parse_mileage_km(ef.get("mileage_km"), ef.get("mileage")),
                 import_type=(clean_text(ef.get("import_type")) or None),
+                phone_number=(phone or "").strip() or None,
+                contact_email=(email or "").strip() or None,
             )
         )
     cur.close()
@@ -403,8 +429,16 @@ def build_features(
     heat, v95, c95 = build_heat(rows)
     print(f"    热度基准: 浏览量 P95={v95}, 留言数 P95={c95}, 有热度值的车 {len(heat)} 台")
 
+    # 卖家维度挂车数（电话为主，邮箱型用邮箱），≥ DEALER_THRESHOLD 判车行
+    seller_n: dict[str, int] = defaultdict(int)
+    for r in rows:
+        key = r.seller_key
+        if key:
+            seller_n[key] += 1
+
     out: list[tuple] = []
     lvl_counter: dict[str, int] = defaultdict(int)
+    n_dealer = 0
     for r in rows:
         ref = pick_reference(stats, r.base_model, r.year)
         ratio = level = None
@@ -416,6 +450,9 @@ def build_features(
                 ratio = round(r.price / med, 3)
         cond, has_cond = condition_score(r)
         is_anomaly = bool(ratio is not None and ratio < ANOMALY_RATIO)
+        dealer_n = seller_n.get(r.seller_key, 0) if r.seller_key else 0
+        is_dealer = dealer_n >= DEALER_THRESHOLD
+        n_dealer += is_dealer
         lvl_counter[level or "none"] += 1
         out.append(
             (
@@ -435,9 +472,13 @@ def build_features(
                 r.age_days,
                 heat.get(r.vehicle_id),
                 is_anomaly,
+                dealer_n or None,
+                is_dealer,
             )
         )
     print(f"    行情降级分布: {dict(lvl_counter)}")
+    print(f"    车行判定(挂>={DEALER_THRESHOLD}台): {n_dealer} 台 "
+          f"({100.0 * n_dealer / max(len(rows), 1):.1f}%)，去重卖家 {len(seller_n)} 个")
     return out
 
 
@@ -488,6 +529,7 @@ def _shadow_ddl() -> str:
         "idx_vf_base_model": "idx_vf_base_model_new",
         "idx_vf_base_bucket": "idx_vf_base_bucket_new",
         "idx_vf_ratio": "idx_vf_ratio_new",
+        "idx_vf_is_dealer": "idx_vf_is_dealer_new",
     }
     mapping = {**index_map, **table_map}   # 索引名较长，优先命中（regex alternation 顺序）
 
@@ -528,7 +570,7 @@ def write_all(conn, stats: dict, feats: list[tuple]) -> None:
            (vehicle_id, base_model, brand_norm, year_bucket, price_ratio,
             market_median, market_p25, market_p75, market_bucket, market_ref_n,
             market_level, condition_score, has_condition, age_days, heat_score,
-            is_anomaly, updated_at)
+            is_anomaly, dealer_listings, is_dealer, updated_at)
            VALUES %s""",
         [f + (_now(conn),) for f in feats],
         page_size=2000,

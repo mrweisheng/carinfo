@@ -122,6 +122,10 @@ class SearchSpec:
     #: **刻意不进 NL 解析**——「换车」在自然语言里歧义太大(「我想换辆车」
     #: ≠「找换车帖」),只给 spec/API/MCP 的程序化调用。
     swap: bool | None = None
+    #: 车行/同行过滤。None=不筛;True=只要车行;**False=只要个人卖家**(
+    #: 「不想让同行看到」的主用法)。判定:同一电话(邮箱型用邮箱)在售挂车数
+    #: ≥4 台 = 车行(features.DEALER_THRESHOLD)。≤3 台不细分。
+    dealer: bool | None = None
 
     # ---- 行情过滤 ----
     max_price_ratio: float | None = None   # 只要比同款便宜的：0.9 = 便宜 10% 以上
@@ -186,6 +190,7 @@ class SearchSpec:
         # 三态布尔字段:字符串 "false" 必须落到 False,认不出落 None(不筛)
         self.china_plate = _coerce_opt_bool(self.china_plate)
         self.swap = _coerce_opt_bool(self.swap)
+        self.dealer = _coerce_opt_bool(self.dealer)
 
         # ---- 区间写反自动纠正 ----
         if (
