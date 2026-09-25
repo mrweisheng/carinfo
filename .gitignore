@@ -5,6 +5,7 @@ __pycache__/
 .env
 test.py
 log/
+src/carinfo.egg-info/
 
 # 敏感配置文件
 proxy_config.json
@@ -21,7 +22,15 @@ data/csv/
 *.log
 *.pid
 *.lock
+# uv.lock 是依赖锁，必须入库；上面的 *.lock 只针对运行时锁文件
+!uv.lock
 .carinfo_service_state.json
 
 # 历史/调试归档
 archive/
+
+# 一次性数据库迁移脚本与备份（含凭证和数据）
+_migration/
+
+# 本地 AI 工具会话数据
+.workbuddy/

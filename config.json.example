@@ -1,0 +1,39 @@
+{
+  "schedule": {
+    "_comment": "每天只执行一次：在下面某个窗口里随机挑一个时刻跑。三个窗口不是「跑三次」，是「三个候选时段」—— 服务每天随机命中其中一个，当天跑完即标记完成，重启也不会再跑。窗口必须 start < end 且在同一天内（不支持跨午夜）。改完要重启服务才生效，并留意启动日志有没有 WARNING。",
+    "windows": [
+      {"name": "上午", "start": "08:00", "end": "12:00"},
+      {"name": "下午", "start": "12:00", "end": "18:00"},
+      {"name": "晚上", "start": "18:00", "end": "22:00"}
+    ]
+  },
+  "scraping": {
+    "_comment": "request_interval 是全局发送间隔（秒）。数字=固定，[min,max]=区间随机。调小会被站点封，慎改。busy_handling 约束：fail_streak_threshold 必须 <= busy_max_retries，且 > 并发数。",
+    "request_interval": [2.0, 3.0],
+    "busy_handling": {
+      "busy_max_retries": 20,
+      "fail_streak_threshold": 10,
+      "cooldown_minutes": [15, 30, 60]
+    },
+    "vehicle_types": {
+      "1": {"name": "私家车", "pages": 800},
+      "2": {"name": "客货车", "pages": 0},
+      "3": {"name": "货车", "pages": 0},
+      "4": {"name": "电单车", "pages": 0},
+      "5": {"name": "经典车", "pages": 0}
+    }
+  },
+  "llm": {
+    "_comment": "MiniMax 国内版。域名是 minimaxi.com（比海外版 api.minimax.io 多一个 i），写混了只会 401/404，很难查。API key 不在这里 —— 去项目根目录的 .env 填 MINIMAX_API_KEY；没填则自动降级为规则解析（功能不瘫）。下面 5 个键都是 LLMConfig.from_dict() 真正读的，加新键前先改 from_dict。",
+    "base_url": "https://api.minimaxi.com/v1",
+    "model": "MiniMax-M3",
+    "temperature": 0.2,
+    "timeout_seconds": 30,
+    "max_retries": 2
+  },
+  "search": {
+    "_comment": "智能搜索。use_llm=false 时只跑规则解析（不消耗 token，语义精度下降）。返回条数不在这里配 —— 口径单点在 spec.py 的 DEFAULT_LIMIT(5) / MAX_LIMIT(50)。",
+    "use_llm": true,
+    "polish_summary": false
+  }
+}
