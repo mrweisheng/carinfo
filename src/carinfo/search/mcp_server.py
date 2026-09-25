@@ -243,6 +243,8 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
         "⚠️ 默认值不等于「不设限」，有两条隐式收窄："
         "① 只搜**私家车**（车型类别固定为私家车，不含客货车/货车/电单车/经典车）；"
         "② **自动排除疑似问题车**（比同款行情低 50% 以上的）。"
+        "china_plate/swap 是三态：None=不筛；true=只要（中港牌车 / 换车帖——换车帖对"
+        "收购场景是线索：卖家想换车=好谈价）；false=排除。"
         "签名里没列出的条件（变速箱、燃料、行水货、排量、关键词）则是真的不设限。"
     ),
 )
@@ -257,6 +259,8 @@ def search_by_spec(
     hand_max: int | None = None,
     mileage_max: int | None = None,
     max_price_ratio: float | None = None,
+    china_plate: bool | None = None,
+    swap: bool | None = None,
     sort: str = "score",
     limit: int = 5,
 ) -> dict[str, Any]:
@@ -272,6 +276,8 @@ def search_by_spec(
             "hand_max": hand_max,
             "mileage_max": mileage_max,
             "max_price_ratio": max_price_ratio,
+            "china_plate": china_plate,
+            "swap": swap,
             "sort": sort,
             "limit": limit,
         }

@@ -37,21 +37,27 @@ from typing import Any
 from carinfo.search.normalize import clean_text
 from carinfo.search.spec import SORT_NEWEST, SORT_PRICE_ASC, SORT_PRICE_DESC, SearchSpec
 
-#: 六维权重。改这里就等于改产品口径，务必同步改 explain.py 的话术。
+#: 六维权重(2026-09-25 第二次定标,依据外部审核报告 docs/搜索排序审核报告.md 的
+#: D-1/D-2 及实测数字)。改这里就等于改产品口径,务必同步改 test_search [9] 的锁。
 #:
-#: ⚠️ 前五项的老权重被**统一乘以 0.8**，腾出 0.20 给 near。这不是随手调的：
-#: 缺维从分母去掉之后，没有「左右」的查询 near 缺席，加权平均 =
-#:   Σ(0.8·wᵢ·sᵢ) / Σ(0.8·wᵢ) = Σ(wᵢ·sᵢ)
-#: 与旧口径**数学上完全等价**。于是新维度对既有查询零影响 —— 只有带「左右」的查询
-#: 排序才变，评测里的任何差异都能 100% 归因到新功能。
-#: test_search.py 有断言锁住这个 0.8 比例，改权重前先看那条。
+#: - **near 0.20→0.08**:0.20 与性价比等权让「软偏好」退化成「准硬过滤」——实测说
+#:   「50万左右」后,无锚点第 2 名(便宜 49% 的捡漏车)掉到第 848 名,Top10 换血
+#:   0/10。boost 该有的量级必须显著低于 value(≤0.10,test_search [9] 有锁)。
+#: - **fresh 0.16→0.08**:age_days 量的是「上次被爬到时的站点更新时间」而非挂牌
+#:   时长(断层 21-161 天 0 台、54% 的车 ≤0.45 分),降权止血;根治要改爬虫抓
+#:   真实挂牌日(报告方案 A),后议。
+#: - **condition 0.12→0.20**:车况覆盖已从定权重时的 28.6% 升到 81.6%(LLM 字段
+#:   提取上线),降权的理由消失;且 D-4 修复后口径更干净。
+#: - value 0.20→0.28:用户说「50万左右」想要的仍是「这个价位里性价比最高的」。
+#: - 旧的「前五维×0.8 等比缩放」论证只保证无锚点查询不受 near 影响,没有为 0.20
+#:   提供依据(报告 D-2 指出),本轮起弃用,test_search [10] 的旧口径等价断言已删。
 WEIGHTS: dict[str, float] = {
     "match": 0.28,
-    "value": 0.20,
-    "near": 0.20,
-    "fresh": 0.16,
-    "condition": 0.12,
-    "heat": 0.04,
+    "value": 0.28,
+    "near": 0.08,
+    "fresh": 0.08,
+    "condition": 0.20,
+    "heat": 0.08,
 }
 
 DIM_LABELS = {
@@ -84,8 +90,16 @@ NEAR_YEAR_DECAY = 2.0      # → ±6 年归零
 #: 性价比：价格比 → 分。锚点之间线性插值，中位价(1.00)得 0.70 分。
 #: 为什么中位价不给 0.5 分：中位价是"正常价"，不该被判为及格线以下；
 #: 二手车市场里"和同款一个价"是正常交易，不是差评。
+#:
+#: **U 形下限(2026-09-25,外部审核 D-3)**:旧表 ratio ≤ 0.60 一律钳到满分 ——
+#: 便宜 40% 和便宜 95% 同分。实测 0.50–0.60 盲区 626 台未触发异常剔除
+#: (ANOMALY_RATIO=0.5 硬拦的只到 0.5),它们的车况数据大多为空,「便宜得可疑」
+#: 无法被核实却拿满分。现在便宜过头反而降分;「⚡ 低于行情 X%」的标签语义
+#: 与分数终于一致(便宜是好事,便宜到离谱要先打个问号)。
 VALUE_ANCHORS: tuple[tuple[float, float], ...] = (
-    (0.60, 1.00),   # 便宜 40%+
+    (0.30, 0.75),   # 便宜 70%+ —— 太离谱,先按可疑处理(标签会提示核实车况)
+    (0.45, 0.90),   # 便宜 55% —— 略降
+    (0.60, 1.00),   # 便宜 40% —— 峰值
     (0.85, 0.88),   # 便宜 15%
     (1.00, 0.70),   # 与同款同年段中位价持平
     (1.15, 0.48),   # 贵 15%
@@ -162,6 +176,11 @@ class ScoredVehicle:
     import_type: str | None = None
     view_count: int | None = None
     is_anomaly: bool = False
+    #: 描述提取的新字段(展示用;license_until 是原文片段如「26年12月」,
+    #: 牌費在香港是真金白银——剩余牌費可退,买家高度关心)
+    license_until: str | None = None
+    china_plate: bool = False
+    is_swap: bool = False
 
     scores: dict[str, float] = field(default_factory=dict)
     score: float = 0.0
@@ -192,6 +211,9 @@ class ScoredVehicle:
             "import_type": self.import_type,
             "view_count": self.view_count,
             "is_anomaly": self.is_anomaly,
+            "license_until": self.license_until,
+            "china_plate": self.china_plate,
+            "is_swap": self.is_swap,
             "score": round(self.score, 4),
             "scores": {k: round(v, 4) for k, v in self.scores.items()},
         }
@@ -294,6 +316,18 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
     if spec.import_type:
         sql += " AND v.extra_fields->>'import_type' = %s"
         params.append(_norm_import(spec.import_type))
+    if spec.china_plate is not None:
+        # jsonb ->> 出来是文本 'true'。IS DISTINCT FROM 让 NULL(描述没提)也
+        # 算"不是中港牌" —— False 是排除语义,不能把 NULL 的车留下来
+        if spec.china_plate:
+            sql += " AND v.extra_fields->>'china_plate' = 'true'"
+        else:
+            sql += " AND v.extra_fields->>'china_plate' IS DISTINCT FROM 'true'"
+    if spec.swap is not None:
+        if spec.swap:
+            sql += " AND v.extra_fields->>'is_swap' = 'true'"
+        else:
+            sql += " AND v.extra_fields->>'is_swap' IS DISTINCT FROM 'true'"
     if spec.hand_max is not None:
         sql += (" AND v.extra_fields->>'hand_count' ~ '^[0-9]+$'"
                 " AND (v.extra_fields->>'hand_count')::int <= %s")
@@ -519,6 +553,9 @@ def search(conn, spec: SearchSpec) -> SearchResult:
                 import_type=ef.get("import_type"),
                 view_count=_int_or_none(ef.get("view_count")),
                 is_anomaly=bool(is_anomaly),
+                license_until=(ef.get("license_until") or None) if isinstance(ef.get("license_until"), str) else None,
+                china_plate=bool(ef.get("china_plate")),
+                is_swap=bool(ef.get("is_swap")),
                 scores={k: float(v) for k, v in dims.items() if v is not None},
                 score=total,
                 used_dims=used,

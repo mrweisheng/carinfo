@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from carinfo.search.engine import DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
@@ -91,6 +92,19 @@ def item_labels(item: ScoredVehicle) -> list[str]:
         tags.append(fmt_km(item.mileage_km))
     if item.import_type:
         tags.append(item.import_type)
+    # 牌費到期:香港买家实打实关心(剩余牌費可退,值几万)。
+    # 值里有数字才当时间展示(「26年12月」);「有牌費/長牌費」这类非时间值
+    # (提取层偶尔摘到)只打布尔化标签,别拼出「牌費至有牌費」这种怪话
+    if item.license_until:
+        if re.search(r"[0-9]", item.license_until):
+            tags.append(f"牌費至{item.license_until}")
+        else:
+            tags.append("有牌費")
+    if item.china_plate:
+        tags.append("中港牌")
+    # 换车帖只标注不隐藏:对买家是背景信息,对车商是收购线索
+    if item.is_swap:
+        tags.append("可换车")
     if item.view_count is not None and item.view_count >= 200:
         tags.append(f"浏览 {item.view_count} 次")
 

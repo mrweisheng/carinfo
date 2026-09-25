@@ -125,6 +125,7 @@ curl -s -H "X-API-Key: $KEY" \
 | 一手车 / 零手 / 3手 | 手数上限 |
 | 五万公里以内 | 里程上限 |
 | 行货 / 水货 | 进口类型 |
+| 中港牌 / 没有中港 | 筛选/排除中港牌车 |
 | 3.5 | 排量(只影响排序,不硬筛) |
 | 最便宜 / 最平 / 最新 / 最貴 | 排序方式 |
 | 捡漏 / 超值 / 笋盘 / 性价比 | 只要比同款行情便宜的(打八折/九折档) |
@@ -155,6 +156,8 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 | `import_type` | string | `行貨` / `水貨` |
 | `hand_max` | int | 手数上限(一手车=1) |
 | `mileage_max` | int | 里程上限(公里) |
+| `china_plate` | bool | 中港牌(兩地牌):`true` 只要有中港牌的 / `false` 排除 / 不传=不筛(库里约 400 台有) |
+| `swap` | bool | 换车帖:`true` 只要换车帖(**收购线索**:卖家想换车=好谈价)/ `false` 排除 / 不传=不筛 |
 | `max_price_ratio` | number | 只要更便宜的:0.9 = 比同款行情便宜 10% 以上 |
 | `exclude_anomaly` | bool | 剔除疑似问题车,默认 `true` |
 | `sort` | string | `score`(默认综合)/ `price_asc` / `price_desc` / `newest` |
@@ -286,7 +289,9 @@ curl -sS -X POST -H "X-API-Key: $KEY" \
 #### `search_by_spec(...)` — 结构化检索
 
 参数即条件:`base_model / brand / price_min / price_max / year_min / year_max /
-seats / hand_max / mileage_max / max_price_ratio / sort(默认 score) / limit(默认 5)`。
+seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默认 score) / limit(默认 5)`。
+`china_plate`/`swap` 三态:`None` 不筛;`true` 只要(中港牌车 / 换车帖);`false` 排除。
+换车帖(`swap=true`)对收购场景是线索:卖家想换车=好谈价。
 调用方(或模型)已明确知道条件时用,跳过自然语言解析。
 
 ---
@@ -304,6 +309,8 @@ seats / hand_max / mileage_max / max_price_ratio / sort(默认 score) / limit(�
 | `score` | 综合分(0-1),六维加权:车型匹配 / 性价比 / 贴合度 / 挂牌时效 / 车况 / 关注热度 |
 | `scores` / `score_breakdown` | 各维得分明细 |
 | `is_anomaly` | 疑似问题车/标错价(默认已剔除) |
+| `license_until` | 牌費到期(原文片段,如「26年12月」;剩余牌費可退,香港买家高度关心) |
+| `china_plate` / `is_swap` | 中港牌 / 换车帖(可作检索条件,见 spec 字段表) |
 | `age_days` | 挂牌天数 |
 
 ---

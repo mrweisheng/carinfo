@@ -68,6 +68,25 @@ def _coerce_float(v: Any) -> float | None:
     return None
 
 
+def _coerce_opt_bool(v: Any) -> bool | None:
+    """三态布尔收敛:None 直通;真布尔直通;字符串只认 true/false/1/0(不分大小写)。
+
+    不能用 bool(v):模型给字符串 "false" 时 bool("false") 是 True —— 方向反了。
+    认不出的返回 None(= 不筛)。
+    """
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no"):
+            return False
+    return None
+
+
 @dataclass
 class SearchSpec:
     """一条检索请求。所有字段可选，None 表示「不限」。"""
@@ -95,6 +114,14 @@ class SearchSpec:
     import_type: str | None = None     # '行貨' / '水貨'
     hand_max: int | None = None        # 手数上限（找「一手车」就是 hand_max=1）
     mileage_max: int | None = None     # 里程上限（公里）
+    #: 中港牌(兩地牌)。None=不筛;True=只要中港牌;False=排除。
+    #: 数据来自描述提取(覆盖约 2%),筛 True 的结果天然偏少,属正常。
+    china_plate: bool | None = None
+    #: 换车帖。None=不筛(默认,4% 的量不值得默认排除);True=只要换车帖
+    #: (车商收购线索:卖家想换车=好谈价);False=排除换车帖。
+    #: **刻意不进 NL 解析**——「换车」在自然语言里歧义太大(「我想换辆车」
+    #: ≠「找换车帖」),只给 spec/API/MCP 的程序化调用。
+    swap: bool | None = None
 
     # ---- 行情过滤 ----
     max_price_ratio: float | None = None   # 只要比同款便宜的：0.9 = 便宜 10% 以上
@@ -155,6 +182,10 @@ class SearchSpec:
 
         # exclude_anomaly 只接受真布尔/可判真假的标量
         self.exclude_anomaly = bool(self.exclude_anomaly)
+
+        # 三态布尔字段:字符串 "false" 必须落到 False,认不出落 None(不筛)
+        self.china_plate = _coerce_opt_bool(self.china_plate)
+        self.swap = _coerce_opt_bool(self.swap)
 
         # ---- 区间写反自动纠正 ----
         if (

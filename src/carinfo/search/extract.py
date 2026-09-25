@@ -227,7 +227,10 @@ def write_back(conn, results: list[tuple[str, dict, dict]], stats: ExtractStats)
     """闸 4:merge-only 写库(只补 null 键 + 打标)。"""
     from psycopg2.extras import execute_batch
 
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # 带时区的北京时间:裸本地时间串会被 PG 按 session 时区误读(曾导致审计时
+    # 判"特征表落后于提取"的假象),统一 isoformat 带 +08:00
+    from datetime import datetime, timedelta, timezone
+    ts = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
     rows = []
     for vid, ef, clean in results:
         merged = dict(ef) if isinstance(ef, dict) else {}
@@ -300,7 +303,15 @@ def _connect():
 
 
 def run_incremental() -> tuple[bool, str]:
-    """给 service 每轮爬完调的程序入口。异常全包,失败不影响爬虫。"""
+    """给 service 每轮爬完调的程序入口。异常全包,失败不影响爬虫。
+
+    尾部**无条件重算特征表**(约 7 秒,features.main 已做原子切换,重算期间
+    搜索不断服):爬虫改价/新车上架/LLM 补字段都改 vehicles,而搜索 JOIN 的
+    vehicle_features 是派生表 —— 没有这一步,前面所有更新的价值都到不了搜索
+    (新车不可见、车况分陈旧)。这也是全链路唯一一处重算触发点,爬虫+提取
+    两个数据源一次覆盖。远程 API 进程的词表缓存靠 5 分钟 TTL 自然过期,
+    不需要(也无法)在这里 reset。
+    """
     try:
         from carinfo.search.config import load_llm_config
         from carinfo.search.llm import LLMClient
@@ -308,15 +319,23 @@ def run_incremental() -> tuple[bool, str]:
         cfg.disable_thinking = True
         cfg.timeout = 45.0
         llm = LLMClient(cfg)
-        if not llm.configured:
-            return False, "未配置 MINIMAX_API_KEY,跳过 LLM 字段提取"
-        conn = _connect()
-        try:
-            stats = run(conn, llm)
-            return True, (f"LLM 提取:候选 {stats.candidates},补字段 {stats.filled},"
-                          f"落库 {stats.updated_rows},失败批 {stats.llm_fail_batches}")
-        finally:
-            conn.close()
+        if llm.configured:
+            conn = _connect()
+            try:
+                stats = run(conn, llm)
+            finally:
+                conn.close()
+            msg = (f"LLM 提取:候选 {stats.candidates},补字段 {stats.filled},"
+                   f"落库 {stats.updated_rows},失败批 {stats.llm_fail_batches}")
+        else:
+            msg = "未配置 MINIMAX_API_KEY,跳过 LLM 提取"
+
+        # 特征表重算(无条件):失败只记 WARNING,不判整体失败
+        from carinfo.search.features import main as recompute_features
+        rc = recompute_features([])
+        if rc != 0:
+            return True, msg + f";⚠ 特征表重算返回码 {rc}(可用 python -m carinfo.search.features 手动重算)"
+        return True, msg + ";特征表已重算"
     except Exception as e:
         return False, f"LLM 提取异常(不影响爬取): {type(e).__name__}: {e}"
 

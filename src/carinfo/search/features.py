@@ -56,8 +56,11 @@ MIN_SAMPLES = 5
 #: 价格比低于此值判为异常（问题车/事故车/标错价），不参与捡漏推荐
 ANOMALY_RATIO = 0.5
 
-#: 车况子项权重（只在子项有值时参与，缺的子项权重从分母去掉）
-CONDITION_WEIGHTS = {"hand": 0.45, "mileage": 0.35, "import": 0.20}
+#: 车况子项权重（只在子项有值时参与，缺的子项权重从分母去掉）。
+#: import 0.20→0.10(2026-09-25,外部审核 D-4):行/水货是**来源属性**不是车况,
+#: 实测 1,000 台只填「行貨」两个字就拿车况满分,压过有真实手数/里程的车。
+#: 腾出的权重给手数/里程(0.50/0.40)——它们才是车况本体。
+CONDITION_WEIGHTS = {"hand": 0.50, "mileage": 0.40, "import": 0.10}
 
 #: 手数 → 分（0 手是新车级，逐级递减）
 HAND_SCORE = {0: 1.0, 1: 0.80, 2: 0.60, 3: 0.40, 4: 0.25}
@@ -338,12 +341,11 @@ def condition_score(r: RawRow) -> tuple[float | None, bool]:
     三项任一有值 6030 台（28.6%）。牌费到期（license_until）值形如 '11月'、
     '2027年'，语义残缺，**刻意不用**。
     """
-    parts: list[tuple[float, float]] = []  # (权重, 分)
+    parts: list[tuple[str, float, float]] = []  # (子项名, 权重, 分)
 
     if r.hand_count is not None and 0 <= r.hand_count <= 12:
-        parts.append(
-            (CONDITION_WEIGHTS["hand"], HAND_SCORE.get(r.hand_count, HAND_SCORE_TAIL))
-        )
+        parts.append(("hand", CONDITION_WEIGHTS["hand"],
+                      HAND_SCORE.get(r.hand_count, HAND_SCORE_TAIL)))
 
     if r.mileage_km is not None:
         # 年均里程：车龄至少按 1 年算，避免新车 500 公里除出天文数字
@@ -354,15 +356,20 @@ def condition_score(r: RawRow) -> tuple[float | None, bool]:
             if per_year <= limit:
                 score = s
                 break
-        parts.append((CONDITION_WEIGHTS["mileage"], score))
+        parts.append(("mileage", CONDITION_WEIGHTS["mileage"], score))
 
     if r.import_type in IMPORT_SCORE:
-        parts.append((CONDITION_WEIGHTS["import"], IMPORT_SCORE[r.import_type]))
+        parts.append(("import", CONDITION_WEIGHTS["import"], IMPORT_SCORE[r.import_type]))
 
     if not parts:
         return None, False
-    total_w = sum(w for w, _ in parts)
-    return round(sum(w * s for w, s in parts) / total_w, 3), True
+    # 只有来源属性(行/水货)、没有任何真实车况子项 → 封顶 0.60(外部审核 D-4):
+    # 「行貨」两个字不构成车况证据,不该和「0手+低里程+行货」同拿满分。
+    # 0.60 = 中性偏上:来源信息有一点价值,但远不等于车况被核实过。
+    if all(k == "import" for k, _, _ in parts):
+        return 0.600, True
+    total_w = sum(w for _, w, _ in parts)
+    return round(sum(w * s for _, w, s in parts) / total_w, 3), True
 
 
 def build_heat(rows: list[RawRow]) -> tuple[dict[str, float], float, float]:

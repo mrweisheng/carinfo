@@ -42,10 +42,12 @@ ALLOWED_LLM_FIELDS = {
     "year_min", "year_max", "year_near",
     "price_min", "price_max", "price_near",
     "seats", "vehicle_type", "transmission", "fuel_type",
-    "import_type", "hand_max", "mileage_max",
+    "import_type", "hand_max", "mileage_max", "china_plate",
     "max_price_ratio", "exclude_anomaly",
     "sort", "limit",
 }
+#: swap(换车帖)**刻意不给 NL**:「换车」歧义太大(「我想换辆车」≠「找换车帖」),
+#: 只给 spec/API/MCP 的程序化调用。
 
 SYSTEM_PROMPT = """你是香港二手车平台的查询解析器。把用户的话翻译成一个检索 JSON 对象。
 
@@ -69,6 +71,7 @@ seats           座位数，整数
 hand_max        手数上限，整数
 mileage_max     里程上限（公里），整数
 import_type     "行貨" 或 "水貨"
+china_plate     布尔。用户明确要「中港牌/兩地牌」的车 → true；没提就不输出
 transmission    "自動" / "手動"
 fuel_type       "汽油" / "柴油" / "混能" / "電動"
 vehicle_type    1=私家车 2=客货车 3=货车 4=电单车 5=经典车
@@ -393,7 +396,7 @@ def parse_query(
     for k in (
         "year_min", "year_max", "year_near", "price_min", "price_max", "price_near",
         "seats", "vehicle_type", "transmission", "fuel_type", "import_type",
-        "hand_max", "mileage_max", "max_price_ratio",
+        "hand_max", "mileage_max", "max_price_ratio", "china_plate",
     ):
         if data.get(k) is not None:
             payload[k] = data[k]
@@ -660,6 +663,12 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         payload["import_type"] = "水貨"
     elif "行貨" in query or "行货" in query:
         payload["import_type"] = "行貨"
+
+    # --- 中港牌 ---(否定式先判:「没有中港」是排除,不是筛选)
+    if re.search(r"沒有中港|无中港|沒中港|没中港", query):
+        payload["china_plate"] = False
+    elif "中港" in query:
+        payload["china_plate"] = True
 
     # --- 排序 ---
     if "最便宜" in query or "最平" in query or "最抵" in query:
