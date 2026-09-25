@@ -221,6 +221,28 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 | `auth.py` | `X-API-Key` 请求头鉴权（中间件） | 三态 **fail-closed**；API 与 MCP-over-HTTP 共用同一中间件 |
 | `api.py` | FastAPI 薄壳 | `/search`（NL）、`/search/spec`、`/vehicle/{id}`、`/models`、`/health` |
 | `mcp_server.py` | MCP 薄壳（4 工具） | mcp 2.x：`from mcp.server.mcpserver import MCPServer` |
+| `extract.py` | LLM 描述字段提取（存量+增量） | 见下方「LLM 字段提取」专节；M3 **关思考**跑，四道闸，merge-only |
+
+### LLM 字段提取（`extract.py`，2026-09-25 上线）
+
+28car 描述是粤语/繁简/黑话自由文本（「0字/1字」=N手、「未出牌」=0手、「低咪5萬」=5万公里、
+「換左全車喇叭」=换了音响**不是**换车），正则天花板 hand_count 34.5%。改用 M3 提取：
+
+- **关思考**：`thinking.type=disabled`（实测生效；`reasoning_effort`/`enable_thinking`
+  两种写法 MiniMax 静默忽略）。模式转换任务不需要推理，快数倍、省 ~70% token。
+  `LLMConfig.disable_thinking` 开关，只有 extract 用，parser/explain 保持思考开启。
+- **四道闸**（全部实测，缺一不可）：白名单+类型范围收敛 → evidence 原文逐字锚定
+  （防幻觉核心：每个值必须附原文片段，锚不到就丢）→ 语义哨兵（is_swap 的 evidence
+  必须「換車|swap」、china_plate 必须「中港|兩地」——换零件的「換」永远过不了）→
+  **merge-only 写库**（只补 null 键，绝不覆盖已有值；打 `llm_extracted_at` 标记）。
+- **候选 = 未打标的在售车**（不是「缺字段的车」——提取过但值为 null 的描述里真没写，
+  不能永远重跑）。失败批不落标，下轮自动重试（自愈）。
+- **增量接线**：`service._run_one_job` 每轮爬完、写完 `last_run_date` **之后**调
+  `run_incremental()`——放后面的原因：提取失败不能阻止完成标记（否则明天重爬整轮）。
+- **importer 必须 merge extra_fields**（`{**old, **new}`，新值优先旧值补缺）：
+  爬虫重爬老车时，正则提不到 LLM 补过的键，不合并会整个覆盖丢失。
+- 跑法：`uv run python -m carinfo.search.extract --dry-run | --limit N | --fallback`。
+  提取后**必须重算特征表**（condition/is_anomaly 依赖 hand_count/mileage_km/import_type）。
 
 ### 解析层：模型输出的两道防线（`parser.py`）
 

@@ -28,6 +28,19 @@ def now_beijing():
     return datetime.now(BEIJING_TZ)
 
 
+def _parse_extra_json(raw):
+    """extra_fields 兼容 dict / JSON 字符串两种形态;坏值给空 dict(不抛)。"""
+    if isinstance(raw, dict):
+        return raw
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
 # 加载环境变量
 try:
     from dotenv import load_dotenv
@@ -509,6 +522,22 @@ class FastCSVImporter:
             start_query = time.time()
             vehicle_ids = [row.get('vehicle_id', '') for row in rows]
             existing_ids = self.get_existing_ids(vehicle_ids)
+
+            # 已存在车辆的现有 extra_fields —— 更新时做「新值优先、旧值补缺」合并。
+            # 为什么必须合并:LLM 字段提取(search/extract.py)补的 hand_count /
+            # mileage_km / llm_extracted_at 等键只存在库里,当天爬虫的正则提取不到
+            # (写法不认识),不合并的话次日重爬老车会把它们整个覆盖丢失。
+            existing_extra = {}
+            if existing_ids:
+                cur = self.connection.cursor()
+                cur.execute(
+                    "SELECT vehicle_id, extra_fields FROM vehicles WHERE vehicle_id = ANY(%s)",
+                    (list(existing_ids),),
+                )
+                for vid, ef in cur.fetchall():
+                    existing_extra[vid] = ef if isinstance(ef, dict) else (
+                        _parse_extra_json(ef))
+                cur.close()
             query_time = time.time() - start_query
             print(f"[{now_beijing().strftime('%H:%M:%S')}] 查询完成，发现 {len(existing_ids)} 个已存在的记录，耗时 {query_time:.2f} 秒")
 
@@ -553,6 +582,14 @@ class FastCSVImporter:
                 is_list_only = bool(
                     isinstance(extra_fields, dict) and extra_fields.get('list_only')
                 )
+
+                # 更新旧车时 extra_fields 合并:今天正则提的**优先**,
+                # 库里已有而今天没提的键(LLM 补的字段 / llm_extracted_at 标记)保留。
+                # 不合并的话次日重爬老车会把 LLM 提取结果整个覆盖掉。
+                if vehicle_id in existing_ids and isinstance(extra_fields, dict):
+                    old = existing_extra.get(vehicle_id)
+                    if isinstance(old, dict) and old:
+                        extra_fields = {**old, **extra_fields}
 
                 # 准备车辆数据
                 vehicle_data = (

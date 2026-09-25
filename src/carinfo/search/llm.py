@@ -56,10 +56,15 @@ class LLMConfig:
     temperature: float = 0.2
     timeout: float = 30.0
     max_retries: int = 2
+    #: 关闭思考模式(M3 实测:`thinking.type=disabled` 生效;`reasoning_effort` /
+    #: `enable_thinking` 两种写法 MiniMax 静默忽略)。给**简单模式转换类任务**
+    #: (描述字段提取)用:输出短、快数倍、省 token。解析/摘要等需要语义
+    #: 推理的场景保持默认(思考开启)。
+    disable_thinking: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LLMConfig":
-        """只认非敏感参数。`api_key` 不从这里读 —— 那是 `.env` 的事（见 config.load_api_key）。"""
+        """只认非敏感参数。`api_key` 不从这里读 —— 那是 `.env` 的事(见 config.load_api_key)。"""
         d = data or {}
         try:
             temp = float(d.get("temperature", 0.2))
@@ -73,6 +78,7 @@ class LLMConfig:
             temperature=temp,
             timeout=float(d.get("timeout_seconds", 30)),
             max_retries=int(d.get("max_retries", 2)),
+            disable_thinking=bool(d.get("disable_thinking", False)),
         )
 
 
@@ -100,6 +106,8 @@ class LLMClient:
             "temperature": self.cfg.temperature,
             "stream": False,
         }
+        if self.cfg.disable_thinking:
+            payload["thinking"] = {"type": "disabled"}
         url = f"{self.cfg.base_url}/chat/completions"
         last_err: Exception | None = None
 

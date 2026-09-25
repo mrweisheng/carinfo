@@ -614,6 +614,19 @@ class CarinfoService:
                 level="INFO",
             )
 
+            # LLM 字段提取(增量):补本轮新爬车辆描述里正则提不出的字段
+            # (hand_count/mileage/import_type 等,详见 carinfo.search.extract)。
+            # 放在写 last_run_date **之后**:提取失败绝不能阻止「今天已完成」
+            # 标记,否则明天会重爬整轮;没打标的车下一轮增量会自动补上。
+            # run_incremental 内部已把异常全包住,这里再兜一层以防导入失败。
+            try:
+                from carinfo.search.extract import run_incremental
+
+                ok, msg = run_incremental()
+                self._log(msg, level="INFO" if ok else "WARNING")
+            except Exception as e:
+                self._log(f"LLM 字段提取入口异常(不影响调度): {e}", level="WARNING")
+
         except Exception as e:
             self._log(f"任务执行异常: {e}", level="ERROR")
             import traceback
