@@ -25,6 +25,7 @@ import os
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from carinfo.search.auth import (
     ENV_ALLOW_NO_AUTH,
@@ -56,6 +57,27 @@ server = MCPServer(
 #: HTTP 传输监听时默认绑本机：想对外必须显式改 host，别默认敞开
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8000
+
+
+def build_transport_security() -> TransportSecuritySettings:
+    """传输层 Host/Origin 校验：**关掉**。
+
+    为什么需要这么一个函数（看起来多此一举）：mcp 2.x 有段自作主张的逻辑
+    （`mcpserver/server.py` → `lowlevel/server.py` 的 "Auto-enable DNS rebinding
+    protection"）—— 只要 `transport_security is None` 且 host 属于 localhost 家族，
+    就替我们塞一份 `allowed_hosts=["127.0.0.1:*","localhost:*","[::1]:*"]`。
+    本服务绑 127.0.0.1 由 Nginx 转进来，外部请求的 Host 是公网域名，于是被判
+    **421 Misdirected Request**。这是线上 MCP 连不上的根因。
+
+    **为什么不配置白名单放行域名**：本服务对外开放，凡是拿到 key 的第三方都该能用，
+    来源不可枚举。按 Host 画线等于用「调用方在哪」代替「调用方是谁」，既拦得住陌生
+    第三方（本该放行），也拦不住伪造 Host（本该靠 key 挡）。所以这里直接关掉，
+    访问控制统一交给 `X-API-Key` 中间件 —— 那道门对所有路径生效，包括 /mcp。
+
+    必须**显式传**这个对象（而不是留 None），否则库又会按 localhost 自动兜底。
+    """
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
 
 _llm: LLMClient | None = None
 
@@ -322,10 +344,13 @@ def main(argv: list[str] | None = None) -> None:
                 f"[fatal] MCP 走 {args.transport} 会监听网络端口，必须先配鉴权。{NO_KEY_HINT}"
             )
 
+    # 显式关掉 mcp 库自带的 Host 校验（留 None 会被按 localhost 自动兜底，
+    # 反代进来就 421）。鉴权统一由下面这个 X-API-Key 中间件负责。
+    ts = build_transport_security()
     http_app = (
-        server.streamable_http_app()
+        server.streamable_http_app(transport_security=ts, host=args.host)
         if args.transport == "streamable-http"
-        else server.sse_app()
+        else server.sse_app(transport_security=ts, host=args.host)
     )
     # 与 HTTP API 共用同一个中间件，避免两份鉴权实现走偏
     http_app.add_middleware(ApiKeyMiddleware)
