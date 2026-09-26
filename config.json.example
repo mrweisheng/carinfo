@@ -8,15 +8,21 @@
     ]
   },
   "scraping": {
-    "_comment": "request_interval 是全局发送间隔（秒）。数字=固定，[min,max]=区间随机。调小会被站点封，慎改。busy_handling 约束：fail_streak_threshold 必须 <= busy_max_retries，且 > 并发数。",
+    "_comment": "request_interval 是全局发送间隔（秒）。数字=固定，[min,max]=区间随机。调小会被站点封，慎改。busy_handling 约束：fail_streak_threshold 必须 <= busy_max_retries，且 > 并发数。daily pages 是每天日常爬的页数（30 页覆盖当天全部更新）。",
     "request_interval": [2.0, 3.0],
+    "deep_crawl": {
+      "_comment": "周期性深扫：每 interval_days 天触发一次，每类爬到 pages 页（替代当天日常）。中断自动记进度、次日续跑。request_interval 为深扫专用间隔（比日常紧，约 9 小时跑完 1200 页）。pages<=0 = 禁用深扫。",
+      "pages": 1200,
+      "interval_days": 30,
+      "request_interval": [1.0, 1.5]
+    },
     "busy_handling": {
       "busy_max_retries": 20,
       "fail_streak_threshold": 10,
       "cooldown_minutes": [15, 30, 60]
     },
     "vehicle_types": {
-      "1": {"name": "私家车", "pages": 800},
+      "1": {"name": "私家车", "pages": 30},
       "2": {"name": "客货车", "pages": 0},
       "3": {"name": "货车", "pages": 0},
       "4": {"name": "电单车", "pages": 0},

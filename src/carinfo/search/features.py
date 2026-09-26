@@ -198,19 +198,25 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
     """拉全量在售车并归一。归一放 Python 做，因为词表在内存里（1110 条），
     塞进 SQL 反而要建临时表，21k 行不值得。
 
-    age_days 在 SQL 里算，**不要在 Python 里对 update_date 做减法**：
-    update_date 在 schema 里是 varchar(50)，psycopg2 交回来的是 str，
-    `datetime - str` 会抛 TypeError。上一版就是被 except 吞掉，导致 age_days
-    全表 NULL、"时效"维度静默失效（打分只剩匹配+性价比两维）。实测 update_date
-    100% 是 ISO 格式（21116/21116），SQL 里加正则守卫后转换是安全的。
+    age_days 在 SQL 里算，**不要在 Python 里对日期字符串做减法**（varchar 交回
+    来是 str，`datetime - str` 抛 TypeError；上一版被 except 吞掉导致时效维度
+    静默失效）。
+
+    时效的语义（2026-09-26 修正）：卖家真实更新时间 = extra_fields.list_date
+    （列表页灰字 DD/MM HH:MM，即站点的排序键；爬虫 2026-09-26 起落库，年份在
+    写入时推断）。此前用的 update_date 列实测是**抓取批次时间戳**（同一分钟
+    批量出现、节奏与限速器吻合，2026-09-25 复核实锤），拿它算时效等于量「我们
+    多久没爬它」——回填过的车全部显得刚挂牌、深处的车被无差别惩罚。
+    list_date 缺失（旧数据未重爬）时回退 created_at（首次发现时间）。
     """
     cur = conn.cursor()
     cur.execute("""
         SELECT vehicle_id, car_model, car_brand, year, current_price,
-               EXTRACT(EPOCH FROM (now() - COALESCE(
-                   CASE WHEN update_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
-                        THEN update_date::timestamptz END,
-                   created_at))) / 86400.0 AS age_days_raw,
+               CASE WHEN extra_fields->>'list_date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                    THEN EXTRACT(EPOCH FROM (now() -
+                         (substring(extra_fields->>'list_date' from 1 for 10))::timestamptz))
+                    / 86400.0 END AS age_from_list,
+               EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0 AS age_from_created,
                phone_number, contact_email,
                extra_fields
         FROM vehicles
@@ -218,9 +224,14 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
           AND current_price IS NOT NULL AND current_price > 0
     """)
     rows: list[RawRow] = []
-    for vid, car_model, car_brand, year, price, age_raw, phone, email, extra in cur.fetchall():
+    n_list_date = 0
+    for (vid, car_model, car_brand, year, price, age_from_list, age_from_created,
+         phone, email, extra) in cur.fetchall():
         base, brand_hint, _ = normalize_model(car_model, vocab)
         ef = extra if isinstance(extra, dict) else (json.loads(extra) if extra else {})
+        age_raw = age_from_list if age_from_list is not None else age_from_created
+        if age_from_list is not None:
+            n_list_date += 1
         rows.append(
             RawRow(
                 vehicle_id=vid,
@@ -239,6 +250,8 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
             )
         )
     cur.close()
+    if rows:
+        print(f"    时效来源: list_date(卖家真实更新) {n_list_date}/{len(rows)}，其余回退 created_at")
     return rows
 
 

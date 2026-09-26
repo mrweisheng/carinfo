@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 # 北京时间时区
@@ -216,8 +216,66 @@ class CarinfoService:
             pages = type_config.get("pages", 0)
             self.pages_by_type[int(type_id)] = pages
 
+        # 深扫（周期性全量）配置：scraping.deep_crawl，整段可选。
+        # 深扫 = 每 interval_days 天把每类爬到 pages 页（替代当天的日常小批量），
+        # 目的有二：补足日常覆盖不到的深处个人车源 + 刷新长期没验证的存量
+        # （僵尸清理：库里「在售」但实际已售的行只有重爬才能改状态）。
+        # 依据：2026-09-25 页数策略调研（1200 页覆盖约 90% 在售，之后边际收益骤降；
+        # 车行霸占前排持续刷新，个人车沉底，深处恰是个人车目标池）。
+        deep_cfg = config.get("scraping", {}).get("deep_crawl", {})
+        if not isinstance(deep_cfg, dict):
+            self._warn(
+                f"scraping.deep_crawl 不是对象（实际 {type(deep_cfg).__name__}），"
+                "深扫已禁用，只按日常 pages 调度"
+            )
+            deep_cfg = {}
+        self.deep_pages, pages_ok = self._coerce_positive(deep_cfg.get("pages"), 1200)
+        self.deep_interval_days, days_ok = self._coerce_positive(
+            deep_cfg.get("interval_days"), 30
+        )
+        self.deep_request_interval, interval_ok = self._coerce_interval(
+            deep_cfg.get("request_interval"), [1.0, 1.5]
+        )
+        # 配置不许静默失效：键存在但值非法时，用了默认值必须让人看见
+        if not pages_ok:
+            self._warn(f"scraping.deep_crawl.pages 非法（{deep_cfg.get('pages')!r}），"
+                       f"已用默认 {self.deep_pages}")
+        if not days_ok:
+            self._warn(f"scraping.deep_crawl.interval_days 非法"
+                       f"（{deep_cfg.get('interval_days')!r}），已用默认 {self.deep_interval_days}")
+        if not interval_ok:
+            self._warn(f"scraping.deep_crawl.request_interval 非法"
+                       f"（{deep_cfg.get('request_interval')!r}），已用默认 "
+                       f"{self.deep_request_interval}")
+        if self.deep_pages <= 0:
+            self._warn("scraping.deep_crawl.pages<=0，深扫已禁用，只按日常 pages 调度")
+
         # 加载调度配置
         self.windows = self._load_windows(config)
+
+    @staticmethod
+    def _coerce_positive(value, default: int) -> tuple:
+        """非负整数收敛：非法/负值退默认。返回 (值, 是否原值合法)——非法由调用方告警。"""
+        if value is None:
+            return default, True          # 键缺失 = 用默认，不算配置错误
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return default, False
+        return (n, True) if n >= 0 else (default, False)
+
+    @staticmethod
+    def _coerce_interval(value, default) -> tuple:
+        """发送间隔收敛：[min,max] 二元列表。返回 (值, 是否原值合法)。"""
+        if value is None:
+            return default, True
+        try:
+            lo, hi = float(value[0]), float(value[1])
+            if 0 < lo <= hi:
+                return [lo, hi], True
+        except (TypeError, ValueError, IndexError):
+            pass
+        return default, False
 
     # ------------------------------------------------------------------
     # 调度窗口解析
@@ -423,7 +481,8 @@ class CarinfoService:
             self._log(f"保存状态文件失败: {e}", level="WARNING")
 
     def _pick_random_time(
-        self, now: datetime, windows: Optional[Tuple[TimeWindow, ...]] = None
+        self, now: datetime, windows: Optional[Tuple[TimeWindow, ...]] = None,
+        start_day: Optional[datetime] = None,
     ) -> datetime:
         """挑一个「未来最近一次」的执行时刻。
 
@@ -431,14 +490,21 @@ class CarinfoService:
         再在该窗口内随机挑一个时刻**；若今天就只剩得下部分窗口可用，则只在可用的
         那几个里挑。今天所有窗口都已过 → 顺延到明天，在明天全部窗口里挑。
 
+        `start_day`：候选的**第一天**（默认 now 所在日）。「从明天起排」的调用方
+        （_plan_next_run(from_tomorrow=True)）传明天的时刻。⚠️ 不能靠把 `now`
+        抬一天来模拟「明天」——本函数把入参当**真实当前时间**做 `end <= now`
+        过滤，抬一天会把目标日的窗口全部过滤掉、顺延到后天：2026-09-25 22:45
+        重启把任务推到 09-27 的事故就是这个写法（22:00 后重启必触发）。
+
         ⚠️ 关键性质：**返回的时刻严格大于 `now`**。`_ensure_next_time()` 每轮都会
         调本函数、并把它写进 `next_run`，若可能返回过去时刻，`run_forever()` 就会
         拿到负的等待秒数 → `max(1, ...)` 兜成 1 秒 → **忙循环疯狂重排**。
         """
         wins = windows or self.windows
         now = self._ensure_beijing(now)
+        first_day = self._ensure_beijing(start_day) if start_day is not None else now
 
-        for base_day in (now, now + timedelta(days=1)):
+        for base_day in (first_day, first_day + timedelta(days=1)):
             candidates = []
             for w in wins:
                 start, end = w.bounds(base_day)
@@ -477,15 +543,16 @@ class CarinfoService:
     def _plan_next_run(self, now: datetime, from_tomorrow: bool = False) -> datetime:
         """计算下一个执行时刻并写进状态文件。
 
-        - `from_tomorrow=True`：今天已经跑过，直接在明天的窗口里随机
+        - `from_tomorrow=True`：今天已经跑过，在**明天的全部窗口**里随机
+          （不能只限「明天此刻之后」——22:00 后重启时明天的窗口会全被
+          `end <= now` 过滤掉，任务被推到后天，2026-09-25 事故）
         - `from_tomorrow=False`：今天还没跑，从「此刻之后」的剩余窗口里随机
         """
         now = self._ensure_beijing(now)
         state = self._load_state()
 
         if from_tomorrow:
-            target = now + timedelta(days=1)
-            next_run = self._pick_random_time(target)
+            next_run = self._pick_random_time(now, start_day=now + timedelta(days=1))
         else:
             next_run = self._pick_random_time(now)
 
@@ -548,6 +615,61 @@ class CarinfoService:
             self._log("今天尚未完成，跳过并顺延到今日剩余窗口", level="WARNING")
             self._plan_next_run(now, from_tomorrow=False)
 
+    def _resolve_job_mode(self, state: dict) -> dict:
+        """决定本轮是「深扫」还是「日常」，以及深扫的续跑状态。
+
+        优先级：**未完成的深扫续跑 > 到期的新深扫 > 日常**。续跑优先保证被
+        反爬/重启打断的深扫最终能完成，期间日常暂停——深扫从第 1 页开始爬，
+        天然覆盖日常 30 页的活跃区，不存在「深扫期间漏掉日常更新」。
+
+        到期判定：距上次深扫完成 >= deep_interval_days（从未跑过视为到期）。
+        状态结构（.carinfo_service_state.json 的 deep_crawl 键）：
+            {"last_completed": "YYYY-MM-DD",
+             "progress": {"1": {"target": 1200, "last_page": 447}}}
+        """
+        deep = state.get("deep_crawl") or {}
+        progress = deep.get("progress") or {}
+        if self.deep_pages <= 0:
+            return {"mode": "daily", "reason": "deep disabled"}
+
+        # 有未完成进度 → 续跑（哪怕间隔未到）
+        for type_id, prog in progress.items():
+            try:
+                if int(prog.get("last_page", 0)) < int(prog.get("target") or self.deep_pages):
+                    return {"mode": "deep", "resume": True}
+            except (TypeError, ValueError):
+                continue
+
+        last_completed = deep.get("last_completed") or ""
+        if not last_completed:
+            return {"mode": "deep", "resume": False, "reason": "从未深扫"}
+        try:
+            # 用北京时间算间隔：服务器 OS 时区若非 +8，date.today() 会有 8 小时偏差
+            elapsed = (now_beijing().date() - date.fromisoformat(last_completed)).days
+        except ValueError:
+            return {"mode": "deep", "resume": False, "reason": "last_completed 非法，视为到期"}
+        if elapsed >= self.deep_interval_days:
+            return {"mode": "deep", "resume": False, "reason": f"距上次深扫 {elapsed} 天"}
+        return {"mode": "daily", "reason": f"距上次深扫仅 {elapsed} 天"}
+
+    def _save_deep_progress(self, type_id: int, last_page: int) -> None:
+        """记录深扫进度（每页开始时由 page_hook 调用，last_page=本页之前已完成页）。"""
+        state = self._load_state()
+        deep = state.get("deep_crawl") or {}
+        progress = deep.get("progress") or {}
+        progress[str(type_id)] = {"target": self.deep_pages, "last_page": int(last_page)}
+        deep["progress"] = progress
+        state["deep_crawl"] = deep
+        self._save_state(state)
+
+    def _mark_deep_completed(self) -> None:
+        state = self._load_state()
+        state["deep_crawl"] = {
+            "last_completed": now_beijing().strftime("%Y-%m-%d"),
+            "progress": {},
+        }
+        self._save_state(state)
+
     def _run_one_job(self) -> None:
         if not self.lock.acquire():
             self._log(
@@ -556,7 +678,22 @@ class CarinfoService:
             return
 
         start = time.time()
-        self._log("=== 开始执行任务（爬取配置从 config.json 读取，逐页直接入库）===", level="INFO")
+        state = self._load_state()
+        plan = self._resolve_job_mode(state)
+        is_deep = plan["mode"] == "deep"
+
+        if is_deep:
+            if plan.get("resume"):
+                self._log("=== 本轮：深扫续跑（上次被中断，从进度页继续）===", level="INFO")
+            else:
+                self._log(
+                    f"=== 本轮：深扫启动（{plan.get('reason', '')}，"
+                    f"每类爬到第 {self.deep_pages} 页，间隔 "
+                    f"{self.deep_request_interval[0]}-{self.deep_request_interval[1]}s）===",
+                    level="INFO",
+                )
+        else:
+            self._log(f"=== 开始执行日常任务（{plan.get('reason', '')}）===", level="INFO")
 
         try:
             if os.getcwd() not in sys.path:
@@ -571,18 +708,45 @@ class CarinfoService:
             db_importer = FastCSVImporter()
             total = 0
             try:
-                for t, pages in sorted(self.pages_by_type.items()):
-                    if pages <= 0:
+                for t, daily_pages in sorted(self.pages_by_type.items()):
+                    if daily_pages <= 0:
                         self._log(f"跳过类型{t}（pages=0）", level="INFO")
                         continue
 
+                    if is_deep:
+                        prog = (state.get("deep_crawl") or {}).get("progress", {}).get(str(t)) or {}
+                        start_page = int(prog.get("last_page", 0)) + 1
+                        pages = int(prog.get("target") or self.deep_pages)
+                        if start_page > pages:
+                            self._log(f"类型{t} 深扫已完成（{pages} 页），跳过", level="INFO")
+                            continue
+                        interval = list(self.deep_request_interval)
+                        self._log(
+                            f"开始类型{t} 深扫：第 {start_page}-{pages} 页"
+                            f"（间隔 {interval[0]}-{interval[1]}s）",
+                            level="INFO",
+                        )
+                    else:
+                        start_page, pages, interval = 1, daily_pages, None
+                        self._log(f"开始类型{t}，页数={pages}", level="INFO")
+
                     csv = os.path.join(csv_dir, f"car_data_{t}.csv")
-                    self._log(f"开始类型{t}，页数={pages}", level="INFO")
+                    deep_track = {"last_started": 0}
+
+                    def page_hook(page: int, _t=t) -> None:
+                        # 每页刷新运行锁：单轮可达 12 小时 > 任何合理 stale 阈值，
+                        # 靠固定阈值会在中途失效（见 FileLock.touch 的说明）。
+                        self.lock.touch()
+                        # 深扫进度：page 开始 = page-1 页已完成。进程被杀时
+                        # 状态文件里始终是「最后整页」，续跑会重做被杀的半页。
+                        if is_deep:
+                            deep_track["last_started"] = page
+                            self._save_deep_progress(_t, page - 1)
+
                     stats = carinfo.scrape_vehicle_type(
-                        t, pages, csv, start_page=1, db_importer=db_importer,
-                        # 每页刷新运行锁：单轮 12 小时 > 任何合理 stale 阈值，
-                        # 靠固定阈值会在中途失效（见 FileLock.touch 的说明）
-                        page_hook=self.lock.touch,
+                        t, pages, csv, start_page=start_page, db_importer=db_importer,
+                        page_hook=page_hook,
+                        request_interval=tuple(interval) if interval else None,
                     )
                     total += stats['total_vehicles']
                     self._log(
@@ -591,11 +755,37 @@ class CarinfoService:
                         f"错误{stats['error_count']}，状态{stats['status']}",
                         level="INFO",
                     )
+
+                    if is_deep:
+                        # 成功跑完 → 按页码推算；被中断（partial/异常）→
+                        # 退回「最后开始的页之前」，续跑时重做半页，绝不跳页
+                        if stats['status'] == 'success':
+                            done_page = start_page + stats['pages_scraped'] - 1
+                        else:
+                            done_page = max(start_page - 1, deep_track["last_started"] - 1)
+                        self._save_deep_progress(t, done_page)
+                        self._log(f"类型{t} 深扫进度: 已完成到第 {done_page}/{pages} 页", level="INFO")
             finally:
                 db_importer.close()
 
             if total == 0:
                 self._log("没有需要爬取的车辆类型或未抓到数据", level="WARNING")
+
+            # 深扫全部类型到目标页 → 落完成标记、清进度；没到（被中断）→
+            # 保留进度，明天触发时自动续跑
+            if is_deep:
+                progress = (self._load_state().get("deep_crawl") or {}).get("progress") or {}
+                enabled = [t for t, p in self.pages_by_type.items() if p > 0]
+                if all(
+                    int((progress.get(str(t)) or {}).get("last_page", 0)) >= self.deep_pages
+                    for t in enabled
+                ):
+                    self._mark_deep_completed()
+                    self._log(
+                        f"=== 深扫完成：全部 {len(enabled)} 类到第 {self.deep_pages} 页，"
+                        f"下次深扫在 {self.deep_interval_days} 天后 ===",
+                        level="INFO",
+                    )
 
             cost = time.time() - start
             self._log(f"=== 任务完成，累计抓取 {total} 条，耗时 {cost / 60:.1f} 分钟 ===", level="INFO")

@@ -17,7 +17,7 @@ import pandas as pd
 import requests
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -102,6 +102,38 @@ def stringify_cell(value):
     return text
 
 
+def normalize_list_date(raw):
+    """把列表页灰色日期「DD/MM[ HH:MM]」规范成「YYYY-MM-DD[ HH:MM]」。
+
+    28car 是香港站，格式为**日/月**（2026-09 实测 '23/09'=9月23日；按 MM/DD
+    解会得到非法的 23 月）。页面上没有年份：按「超过明天即去年」推断——
+    12 月的帖子在 1 月被看到时落回上一年。解析失败返回 None（不影响入库）。
+
+    为什么存这个：详情页「更新日期」字段实测是抓取批次时间戳（同一分钟批量
+    出现，与限速节奏吻合），不是卖家的更新时间；而列表页这列灰字才是站点的
+    排序键 = 卖家的真实更新时间。时效打分（age_days）依赖它。
+    """
+    if not raw:
+        return None
+    m = re.fullmatch(r'(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}:\d{2}))?', str(raw).strip())
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    today = datetime.now().date()
+    try:
+        d = date(today.year, month, day)
+        if d > today + timedelta(days=1):
+            d = date(today.year - 1, month, day)
+    except ValueError:
+        return None
+    out = d.isoformat()
+    if m.group(3):
+        out += f' {m.group(3)}'
+    return out
+
+
 def load_config_from_file(config_file='config.json'):
     """从配置文件加载爬取配置"""
     if not os.path.exists(config_file):
@@ -170,11 +202,14 @@ class Car28Spider(BaseSpider):
     site_name = "28car"
     base_url = BASE_URL
 
-    def __init__(self, PAGE, vehicle_type=1):
+    def __init__(self, PAGE, vehicle_type=1, request_interval=None):
         self.PAGE = PAGE
         self.vehicle_type = vehicle_type
         self.car_data = []
         self.output_dir = "."
+        # 本轮列表页页码，由 scrape_vehicle_type 在每页开始时写入，
+        # build_rows 用它写真实 page_number（替代历史上的时间戳占位）
+        self.current_page = 0
 
         # 一次性加载配置（避免每次 HTTP 请求都重复读盘）
         scraping_cfg = self._load_scraping_config()
@@ -184,8 +219,10 @@ class Car28Spider(BaseSpider):
         self.request_timeout = scraping_cfg.get('request_timeout', 90)
 
         # 全局发送间隔（config.json: scraping.request_interval）：
-        # 数字=固定间隔，[min, max]=区间内随机；并发线程与重试共用
-        interval_cfg = scraping_cfg.get('request_interval', DEFAULT_REQUEST_INTERVAL)
+        # 数字=固定间隔，[min, max]=区间内随机；并发线程与重试共用。
+        # request_interval 显式传参（深扫提速用）优先于配置文件
+        interval_cfg = request_interval if request_interval is not None \
+            else scraping_cfg.get('request_interval', DEFAULT_REQUEST_INTERVAL)
         if isinstance(interval_cfg, (list, tuple)) and len(interval_cfg) == 2:
             self.interval_min = float(interval_cfg[0])
             self.interval_max = float(interval_cfg[1])
@@ -497,7 +534,9 @@ class Car28Spider(BaseSpider):
             date_value = None
             if date_cell:
                 date_text = date_cell.get_text(strip=True)
-                date_match = re.search(r'(\d{1,2}/\d{1,2})', date_text)
+                # 灰字格式「DD/MM HH:MM」= 卖家的真实更新时间（站点排序键）。
+                # 时间部分可缺，有则一并捕获（normalize_list_date 落库用）
+                date_match = re.search(r'(\d{1,2}/\d{1,2}(?:\s+\d{1,2}:\d{2})?)', date_text)
                 if date_match:
                     date_value = date_match.group(1)
 
@@ -745,6 +784,8 @@ class Car28Spider(BaseSpider):
             car_info['_list'] = {
                 'view_count': item.get('view_count'),
                 'comment_count': item.get('comment_count'),
+                # 列表页灰字日期 = 卖家真实更新时间（build_rows 规范化后进 extra_fields）
+                'list_date': item.get('date'),
             }
             return car_info
 
@@ -774,17 +815,21 @@ class Car28Spider(BaseSpider):
     def build_rows(self):
         """把爬取到的车辆数据转换为统一的行格式（CSV 备份与直接入库共用）。"""
         rows = []
-        current_timestamp = int(time.time())
 
-        for i, car in enumerate(self.car_data, 1):
+        for car in self.car_data:
             current_price = car.get('current_price')
             original_price = car.get('original_price')
-            # extra_fields = 描述提取特征 + 列表页浏览/留言数（合并写入 jsonb）
+            # extra_fields = 描述提取特征 + 列表页浏览/留言/更新时间（合并写入 jsonb）
             extra_fields = dict(car.get('extra_fields') or {})
             list_meta = car.get('_list') or {}
             for key in ('view_count', 'comment_count'):
                 if list_meta.get(key) is not None:
                     extra_fields[key] = list_meta[key]
+            list_date = normalize_list_date(list_meta.get('list_date'))
+            if list_date:
+                # 卖家真实更新时间。同车重爬时 importer 按「新值优先」合并 extra_fields，
+                # 卖家一刷新这里就是新值 —— 时效打分靠它，不是 update_date（那是抓取戳）
+                extra_fields['list_date'] = list_date
 
             # vehicle_id 优先取详情页「編號」；缺失时回退列表页 h_vid。
             # 不回退的话 importer 会因主键为空把整条记录静默丢掉（无日志无计数）。
@@ -798,7 +843,9 @@ class Car28Spider(BaseSpider):
 
             rows.append({
                 'vehicle_id': vehicle_id,
-                'page_number': current_timestamp + i,
+                # 真实列表页码（本轮爬到第几页）。历史上这里存的是 Unix 时间戳，
+                # 导致库里完全没有深度信息、页数策略只能靠开网页采样（2026-09-25 调研）。
+                'page_number': self.current_page or 0,
                 'car_number': car.get('編號', ''),
                 'car_url': car.get('網址', ''),
                 'car_category': car.get('車類', ''),
@@ -1050,18 +1097,22 @@ class Car28Spider(BaseSpider):
 
 
 def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1, db_importer=None,
-                        page_hook=None):
+                        page_hook=None, request_interval=None):
     """爬取指定类型的车辆，逐页直接入库（CSV 仅作备份，入库不依赖它）。
 
     Args:
         vehicle_type: 车辆类型ID
-        pages: 总共爬取多少页
+        pages: 总共爬到第几页（配合 start_page 即区间 [start_page, pages]）
         csv_filename: CSV备份文件名
-        start_page: 起始页码（默认为1）
+        start_page: 起始页码（默认为1；深扫续跑传上次进度+1）
         db_importer: 复用的 FastCSVImporter；为 None 时内部创建
-        page_hook: 每页开始时调用一次的可选回调（无参）。service 用它刷新运行锁的
-            时间戳 —— 单轮 12 小时远超任何合理的 stale 阈值，靠固定阈值扛不住，
-            必须在长跑过程中持续证明「我还活着」。回调异常不得影响爬取主流程。
+        page_hook: 每页开始时调用一次的可选回调，参数为即将爬取的页码。
+            service 用它刷新运行锁时间戳并记录深扫进度 —— 单轮 12 小时远超任何
+            合理的 stale 阈值，靠固定阈值扛不住，必须在长跑过程中持续证明
+            「我还活着」。回调异常不得影响爬取主流程。
+        request_interval: 覆盖 config.json 的全局发送间隔（[min,max] 秒）。
+            深扫用更紧的间隔提速（config: scraping.deep_crawl.request_interval）；
+            None = 用配置文件值。
 
     Returns:
         dict: 本类型的爬取与入库统计
@@ -1106,16 +1157,20 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1, db_impo
 
     # spider 实例在整轮循环外创建一次：反爬触发计数 / 动态延迟 / 请求计数
     # 必须跨页累积，否则三级退避永远停在第一档、"超过3次终止"永不触发
-    scraper = Car28Spider(pages, vehicle_type)
+    scraper = Car28Spider(pages, vehicle_type, request_interval=request_interval)
 
     for page in range(start_page, pages + 1):
         print(f'\n=== 正在处理第 {page} 页 ===')
 
-        # 刷新运行锁时间戳（service 传入）。单轮 12 小时，若不持续 touch，
-        # 锁会在中途被判 stale，次日调度就可能并发启动第二个进程。
+        # 本轮页码供 build_rows 写真实 page_number（必须在本页任何抓取前设置）
+        scraper.current_page = page
+
+        # 刷新运行锁时间戳/记录深扫进度（service 传入，参数为本页页码）。
+        # 单轮 12 小时，若不持续 touch，锁会在中途被判 stale，
+        # 次日调度就可能并发启动第二个进程。
         if page_hook is not None:
             try:
-                page_hook()
+                page_hook(page)
             except Exception as e:
                 logger.warning(f'page_hook 执行失败（不影响爬取）：{e}')
 
