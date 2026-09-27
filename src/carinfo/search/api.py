@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
@@ -358,38 +357,6 @@ def vehicle_detail(vehicle_id: str) -> JSONResponse:
 def list_models(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
     """库内车系榜（按在售台数）。给前端做下拉/热门入口。"""
     return {"models": fetch(lambda conn: _do_models(conn, limit))}
-
-
-@app.get("/api-test")
-def api_test_page() -> FileResponse:
-    """API 测试台（纯静态页）：浏览器直开调 /api/search 快速验证搜索，不经飞书。
-
-    页面从 data/ 读 —— 不用 openapi/docs 那套（要 key 才能看，且是原始 schema
-    不是人话）。放行这个路由 = 免 key 拿到一个静态 HTML，无数据泄露
-    （HTML 里没有配置，查询仍要 key）。
-    """
-    # 双路径解析：开发机从仓库根跑（cwd 下有 data/）；部署环境按包位置上溯
-    for path in (Path.cwd() / "data" / "api_test.html",
-                 Path(__file__).resolve().parent.parent.parent / "data" / "api_test.html"):
-        if path.exists():
-            return FileResponse(path, media_type="text/html; charset=utf-8")
-    raise HTTPException(status_code=404, detail="测试页文件缺失（data/api_test.html）")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="测试页文件缺失（data/api_test.html）")
-    return FileResponse(path, media_type="text/html; charset=utf-8")
-
-
-@app.get("/api/search")
-def api_search_proxy(q: str = Query(..., min_length=1),
-                     limit: int = Query(5, ge=1, le=50)) -> dict[str, Any]:
-    """测试台的检索端点：与 /search 完全同逻辑，但**免 key**。
-
-    为什么免 key：测试台是给开发/运维快速验证搜索质量的，key 由服务端持有
-    （.env 的 SEARCH_API_KEY 经 auth 校验后放行）。这个免 key 端点只暴露
-    检索本身 —— 无联系人等敏感字段之外的额外信息，且鉴权统一走中间件的
-    例外白名单，其余路由照旧要 key。
-    """
-    return _do_search_nl(q, limit, can_use=True)
 
 
 # ---------------------------------------------------------------------------

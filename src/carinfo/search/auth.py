@@ -87,24 +87,13 @@ class ApiKeyMiddleware:
 
     用中间件而不是 FastAPI 的 `Depends`：`Depends` 只盖住 path operation，
     `/docs`、`/openapi.json` 这类自动生成的路由会漏在外面；中间件一个不漏。
-
-    免 key 白名单 `EXEMPT_PREFIXES`：只放**非数据**端点（静态测试页）。
-    `/api/search` 虽是数据端点但与 /search 同一套节流与日志，测试台专用；
-    它不返回任何超越 /search 的信息（同结果结构），暴露面不变。
     """
-
-    #: 前缀命中即免 key（精确路由用尾斜杠收口，防止 /api-test-evil 类绕过）
-    EXEMPT_PREFIXES = ("/api-test", "/api/search")
 
     def __init__(self, app: Any) -> None:
         self.app = app
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":          # lifespan / websocket 原样放行
-            await self.app(scope, receive, send)
-            return
-        path = scope.get("path") or ""
-        if any(path == p or path.startswith(p + "/") for p in self.EXEMPT_PREFIXES):
             await self.app(scope, receive, send)
             return
         ok, status, detail = decide(header_value(scope.get("headers") or []))
