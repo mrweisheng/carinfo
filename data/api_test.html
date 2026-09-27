@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>搜车 API 测试台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f6f8; padding: 16px; color: #222; }
+  .bar { display: flex; gap: 8px; max-width: 860px; margin: 0 auto 12px; }
+  #q { flex: 1; font-size: 16px; padding: 10px 14px; border: 2px solid #2563eb; border-radius: 8px; outline: none; }
+  #q:focus { border-color: #1d4ed8; }
+  button { padding: 10px 22px; font-size: 15px; border: 0; border-radius: 8px; cursor: pointer; background: #2563eb; color: #fff; }
+  button:disabled { background: #93b4f0; cursor: wait; }
+  .meta { max-width: 860px; margin: 0 auto 10px; font-size: 13px; color: #555; display: flex; gap: 14px; flex-wrap: wrap; }
+  .meta b { color: #111; }
+  .card { max-width: 860px; margin: 0 auto 10px; background: #fff; border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .grouplabel { display: inline-block; background: #eef2ff; color: #3730a3; border-radius: 6px; padding: 2px 8px; font-size: 12px; margin-bottom: 6px; }
+  .car { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
+  .car:last-child { border-bottom: 0; }
+  .car img { width: 108px; height: 76px; object-fit: cover; border-radius: 6px; background: #eee; flex-shrink: 0; }
+  .info { flex: 1; min-width: 0; }
+  .t1 { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .t1 .name { font-size: 15px; font-weight: 700; }
+  .t1 .price { color: #dc2626; font-weight: 700; font-size: 15px; }
+  .t1 .ratio { font-size: 12px; color: #059669; }
+  .t1 .ratio.high { color: #d97706; }
+  .tags { margin: 4px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 4px; background: #f1f5f9; color: #475569; }
+  .tag.warn { background: #fef3c7; color: #92400e; }
+  .tag.bad { background: #fee2e2; color: #b91c1c; }
+  .contact { font-size: 13px; color: #1d4ed8; font-weight: 600; }
+  .why { font-size: 12px; color: #777; margin-top: 3px; }
+  .err { max-width: 860px; margin: 0 auto; background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; border-radius: 10px; padding: 14px 16px; font-size: 14px; white-space: pre-wrap; }
+  .raw { max-width: 860px; margin: 10px auto 40px; }
+  .raw summary { cursor: pointer; color: #666; font-size: 13px; }
+  .raw pre { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 8px; font-size: 12px; overflow: auto; max-height: 420px; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <input id="q" placeholder="像对人说一样搜：宝马7系 / 14年的威尔法，再一台埃尔法 / 五十万以内七座个人车" autofocus>
+    <button id="go">搜索</button>
+  </div>
+  <div class="meta">
+    <span>耗时 <b id="ms">-</b></span>
+    <span>解析来源 <b id="src">-</b></span>
+    <span>命中 <b id="total">-</b></span>
+    <span id="groups"></span>
+  </div>
+  <div id="out"></div>
+  <details class="raw"><summary>原始 JSON</summary><pre id="raw"></pre></details>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function run() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("go").disabled = true; $("go").textContent = "搜索中…";
+  $("out").innerHTML = ""; $("raw").textContent = "";
+  $("ms").textContent = "-"; $("src").textContent = "-"; $("total").textContent = "-"; $("groups").textContent = "";
+  const t0 = performance.now();
+  try {
+    const rsp = await fetch("/api/search?q=" + encodeURIComponent(q) + "&limit=5");
+    const data = await rsp.json();
+    if (!rsp.ok) throw new Error(data.detail || ("HTTP " + rsp.status));
+    render(data, performance.now() - t0);
+  } catch (e) {
+    $("out").innerHTML = `<div class="err">查询失败：${esc(e.message)}\n\n排查：① nginx 是否把 /api/ 转发到 8088；② key 是否正确；③ journalctl -u carinfo-api -f 看过程日志</div>`;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "搜索";
+  }
+}
+
+function render(d, ms) {
+  $("ms").textContent = Math.round(ms) + "ms";
+  $("src").textContent = d.parse_source || "-";
+  $("total").textContent = d.total_matched ?? "-";
+  if (d.query_groups) $("groups").textContent =
+    "分组: " + d.query_groups.map(g => `${g.label || "?"}(${g.total_matched})`).join(" / ");
+  $("raw").textContent = JSON.stringify(d, null, 2);
+
+  const box = $("out");
+  if (!d.items || !d.items.length) {
+    box.innerHTML = `<div class="card">没有找到车。系统理解的条件见「原始 JSON」里的 spec —— 多半是条件太严（某车系存量少还要求一手之类）。</div>`;
+    return;
+  }
+  let html = "";
+  for (const it of d.items) {
+    const ratio = it.price_ratio != null
+      ? (it.price_ratio < 1 ? `<span class="ratio">比行情低 ${Math.round((1 - it.price_ratio) * 100)}%</span>`
+                            : `<span class="ratio high">比行情高 ${Math.round((it.price_ratio - 1) * 100)}%</span>`)
+      : "";
+    const tags = (it.labels || []).map(t =>
+      `<span class="tag ${/久未核实|异常/.test(t) ? "warn" : /需核实/.test(t) ? "bad" : ""}">${esc(t)}</span>`).join("");
+    html += `<div class="car">
+      ${it.image_url ? `<img src="${esc(it.image_url)}" loading="lazy" onerror="this.style.visibility='hidden'">` : `<img>`}
+      <div class="info">
+        <div class="t1">
+          ${it.query_label ? `<span class="grouplabel">${esc(it.query_label)}</span>` : ""}
+          <span class="name">${esc([it.car_brand, it.car_model].filter(Boolean).join(" "))}${it.year ? " · " + esc(it.year) + "年" : ""}</span>
+          <span class="price">${esc(it.price_text || (it.price != null ? "$" + it.price : "?"))}</span>
+          ${ratio}
+        </div>
+        <div class="tags">${tags}</div>
+        <div class="contact">☎ ${esc(it.contact_display || "（无联系方式）")}</div>
+        <div class="why">${esc(it.explain || "")}${it.url ? ` · <a target="_blank" href="${esc(it.url)}">原帖</a>` : ""}</div>
+      </div>
+    </div>`;
+  }
+  box.innerHTML = `<div class="card">${html}</div>`;
+}
+
+$("go").onclick = run;
+$("q").addEventListener("keydown", e => { if (e.key === "Enter") run(); });
+</script>
+</body>
+</html>
