@@ -122,17 +122,21 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
 
     ctx = fetch(_load_ctx)                                    # ① 短借：读上下文
     parsed = parse_query(query, ctx, llm=llm)                 # ② 无连接：LLM 解析
-    parsed.spec.limit = max(1, min(_coerce_limit(limit), MAX_LIMIT))
-    result = fetch(lambda conn: search(conn, parsed.spec))    # ③ 短借：检索
-    out = explain(result, llm=llm, use_llm=False)             # ④ 无连接：解释
-    return {
-        "summary": out.summary,
-        "parse_source": parsed.source,
-        "spec": out.spec,
-        "total_matched": out.total_matched,
-        "notes": list(parsed.notes) + list(out.notes),
-        "items": [
-            {
+    n = max(1, min(_coerce_limit(limit), MAX_LIMIT))
+    for s in parsed.specs:
+        s.limit = n
+
+    def _run_all(conn):                                       # ③ 短借：检索（每组一次）
+        return [(label, search(conn, s)) for label, s in zip(parsed.labels, parsed.specs)]
+
+    results = fetch(_run_all)
+    outs = [(label, explain(r, llm=llm, use_llm=False)) for label, r in results]
+
+    # 多车混输（2026-09-27）：items 扁平合并、每条 query 标注来源组；单组时行为不变
+    items = []
+    for label, out in outs:
+        for it in out.items:
+            items.append({
                 "vehicle_id": it["vehicle_id"],
                 "car_model": it["car_model"],
                 "brand": it["car_brand"],
@@ -146,10 +150,27 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "url": it["car_url"],
                 "image_url": it["image_url"],
                 "contact": it["contact_display"],
-            }
-            for it in out.items
-        ],
+                "query": label or None,
+            })
+    first = outs[0][1]
+    payload = {
+        "summary": first.summary,
+        "parse_source": parsed.source,
+        "spec": first.spec,
+        "total_matched": first.total_matched,
+        "notes": list(parsed.notes) + list(first.notes),
+        "items": items,
     }
+    if len(outs) > 1:
+        payload["summary"] = " ｜ ".join(
+            (f"【{label}】" if label else "") + out.summary for label, out in outs
+        )
+        payload["total_matched"] = sum(out.total_matched for _l, out in outs)
+        payload["query_groups"] = [
+            {"label": label or f"条件{i + 1}", "total_matched": out.total_matched}
+            for i, (label, out) in enumerate(outs)
+        ]
+    return payload
 
 
 _DETAIL_SQL = """
@@ -258,8 +279,11 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
         "含比价依据（与同款同年段中位价的比值）与首图 image_url。"
         "每条结果带 contact 字段（车主联系方式，电话优先展示），可直接联系车主，"
         "无需再查详情；仅留邮箱的卖家排在有电话的车源之后。"
+        "一句话可以同时找多台车（'找台14年威尔法，再找台14年埃尔法'、'阿尔法或者威尔法'），"
+        "结果每条带 query 字段标注对应哪台车。口语车系名（'宝马7系/奔驰S级/Model 3'）"
+        "也能理解，按整个车系家族检索。"
         "查询里可以说「不要车行/只要私人车主」筛掉车行卖家（挂车 ≥4 台判车行，结果带「车行」标签）。"
-        "例：'五十萬以內的阿尔法'、'2015年打後的一手威尔法'、'不要车行的七座MPV'。"
+        "例：'五十萬以內的阿尔法'、'宝马7系'、'不要车行的七座MPV'。"
         "价格均为港币。"
     ),
 )

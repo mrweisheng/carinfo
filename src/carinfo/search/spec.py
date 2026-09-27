@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -114,6 +115,13 @@ class SearchSpec:
     import_type: str | None = None     # '行貨' / '水貨'
     hand_max: int | None = None        # 手数上限（找「一手车」就是 hand_max=1）
     mileage_max: int | None = None     # 里程上限（公里）
+    #: 车系家族前缀（2026-09-27 粒度分层）：口语车系名「宝马7系/奔驰S级/Model 3」
+    #: 指的是一个**车型家族**而非库里的某个精确车系键——库里 7 系分散成
+    #: 730LI/740LIA/750LI 等排量变体，词表没有也不该逐个手配上位词。
+    #: family 存家族前缀（'7' / 'S' / 'MODEL 3'），engine 用
+    #: `car_model ~ '^family[0-9 ]'` 前缀匹配（后跟数字/空格排除 SL 混入 S 级），
+    #: 通常与 brand 联用。具体型号（「730」）不走这里，走 model_keyword 模糊。
+    family: str | None = None
     #: 中港牌(兩地牌)。None=不筛;True=只要中港牌;False=排除。
     #: 数据来自描述提取(覆盖约 2%),筛 True 的结果天然偏少,属正常。
     china_plate: bool | None = None
@@ -183,6 +191,16 @@ class SearchSpec:
             val = getattr(self, fname)
             if val is not None and not isinstance(val, str):
                 setattr(self, fname, None)
+
+        # family（车系家族前缀）比普通字符串严一档：它的值会拼进 `car_model ~`
+        # 的正则，只放行 [A-Z0-9 -]（大写化后），长度 <= 20。任何其它字符（含
+        # 正则元字符）= 脏值，置 None 退回无家族条件 —— 宁可查宽不可带毒。
+        if self.family is not None:
+            if not isinstance(self.family, str):
+                self.family = None
+            else:
+                fam = self.family.strip().upper()
+                self.family = fam if fam and len(fam) <= 20 and re.fullmatch(r"[A-Z0-9 -]+", fam) else None
 
         # exclude_anomaly 只接受真布尔/可判真假的标量
         self.exclude_anomaly = bool(self.exclude_anomaly)

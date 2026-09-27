@@ -38,28 +38,36 @@ from carinfo.search.spec import DEFAULT_LIMIT, SearchSpec
 #: 之所以必须有它们：把"五十万左右"写成 price_max=500000 会把 39 万、62 万的好车
 #: 直接从结果里删掉，而用户的本意只是"离 50 万近的排前面"。
 ALLOWED_LLM_FIELDS = {
-    "base_model", "brand", "model_keyword", "displacement",
+    "base_model", "brand", "model_keyword", "family", "displacement",
     "year_min", "year_max", "year_near",
     "price_min", "price_max", "price_near",
     "seats", "vehicle_type", "transmission", "fuel_type",
     "import_type", "hand_max", "mileage_max", "china_plate",
     "dealer", "max_price_ratio", "exclude_anomaly",
-    "sort", "limit",
+    "sort", "limit", "label",
 }
 #: swap(换车帖)**刻意不给 NL**:「换车」歧义太大(「我想换辆车」≠「找换车帖」),
 #: 只给 spec/API/MCP 的程序化调用。
 
-SYSTEM_PROMPT = """你是香港二手车平台的查询解析器。把用户的话翻译成一个检索 JSON 对象。
+SYSTEM_PROMPT = """你是香港二手车平台的查询解析器。把用户的话翻译成检索 JSON。
 
 【输出格式 —— 最容易出错，务必遵守】
-只输出一个 JSON 对象。不要解释文字、不要 markdown 代码块。
-**键名必须逐字用下面「字段清单」里的英文名**。自己换个名字（model / car_model /
-brand_name 之类）等于这个条件没写 —— 系统会直接丢掉它。
+输出一个 JSON 对象：{"queries": [组1, 组2, ...]}。不要解释文字、不要 markdown 代码块。
+**每组是下面「字段清单」里的一个对象**；只有一句话且只提到一台车 → queries 里只有一个组。
+用户一次提到**多台车**（"找台14年威尔法，再找台14年埃尔法"、"阿尔法或者威尔法"）→
+**每组一台车**，各写一个组对象，别合并、别丢掉任何一台。
+每组里**键名必须逐字用字段清单的英文名**。自己换名字（model / car_model / brand_name
+之类）等于这个条件没写 —— 系统会直接丢掉它。
 
 【字段清单】未提到的条件一律不输出该键；不要给 null，也不要猜。
-base_model      车型，英文大写正式名
+label           这组的人话短标签（≤12字，如"14年威尔法"），给结果分组展示用
+base_model      车型，英文大写正式名（库里有的精确车系，如 ALPHARD / VELLFIRE）
+family          **车系家族前缀**：口语车系名（"宝马7系"→"7"、"奔驰S级"→"S"、
+                "Model 3"→"MODEL 3"、"A6"→"A6"）。用户说的不是某个精确车型而是一
+                个系列时用这个，通常配 brand。用户说了具体型号（"730"）则不用 family，
+                用 model_keyword
 brand           品牌，英文大写
-model_keyword   车型名拿不准英文正式名时，填用户原文
+model_keyword   型号拿不准或用户说了具体子型号（如 "730"、"2.0T"）时，填该子型号原文
 displacement    排量字符串，如 "3.5"
 year_min        年份下限，整数
 year_max        年份上限，整数
@@ -67,7 +75,7 @@ year_near       年份**模糊锚点**（"2015年左右"）→ 2015。只影响�
 price_min       价格下限，港币整数
 price_max       价格上限，港币整数
 price_near      价格**模糊锚点**（"五十万左右"）→ 500000。只影响排序，不是筛选
-seats           座位数，整数
+seats           座位数，整数（"七人车/七座" → 7）
 hand_max        手数上限，整数
 mileage_max     里程上限（公里），整数
 import_type     "行貨" 或 "水貨"
@@ -106,18 +114,26 @@ limit           整数，返回条数
 - limit：没说就不填（系统默认返回 5 条）
 
 【完整示例】
-"阿尔法"                 → {"base_model": "ALPHARD"}
-"五十萬以內的阿尔法"       → {"base_model": "ALPHARD", "price_max": 500000}
-"五十万左右的阿尔法"       → {"base_model": "ALPHARD", "price_near": 500000}
-"2015年打後的一手威尔法"   → {"base_model": "VELLFIRE", "year_min": 2015, "hand_max": 1}
-"2015年左右的威尔法"       → {"base_model": "VELLFIRE", "year_near": 2015}
-"三十万以下的七座车"       → {"price_max": 300000, "seats": 7}
-"最便宜的平治"            → {"brand": "MERCEDES-BENZ", "sort": "price_asc"}
-"捡漏阿尔法"              → {"base_model": "ALPHARD", "max_price_ratio": 0.8}
+"阿尔法"                 → {"queries":[{"base_model": "ALPHARD"}]}
+"五十萬以內的阿尔法"       → {"queries":[{"base_model": "ALPHARD", "price_max": 500000}]}
+"五十万左右的阿尔法"       → {"queries":[{"base_model": "ALPHARD", "price_near": 500000}]}
+"我找一台宝马7系"         → {"queries":[{"brand": "BMW", "family": "7"}]}
+"宝马730"               → {"queries":[{"brand": "BMW", "model_keyword": "730"}]}
+"特斯拉 Model 3"         → {"queries":[{"brand": "TESLA", "family": "MODEL 3"}]}
+"奔驰S级或者E级"          → {"queries":[{"brand":"MERCEDES-BENZ","family":"S"},
+                                        {"brand":"MERCEDES-BENZ","family":"E"}]}
+"找台14年威尔法，再找台14年埃尔法"
+                       → {"queries":[{"label":"14年威尔法","base_model":"VELLFIRE","year_min":2014,"year_max":2014},
+                                        {"label":"14年埃尔法","base_model":"ALPHARD","year_min":2014,"year_max":2014}]}
+"三十万以下的七座车"       → {"queries":[{"price_max": 300000, "seats": 7}]}
+"最便宜的平治"            → {"queries":[{"brand": "MERCEDES-BENZ", "sort": "price_asc"}]}
+"捡漏阿尔法"              → {"queries":[{"base_model": "ALPHARD", "max_price_ratio": 0.8}]}
 
 【铁律】
 用户没提的条件，绝对不要加。不要替他决定预算、年份、座位数。
 说了"左右"就**只填 *_near** —— 那是排序偏好，不是筛选条件。
+口语车系名（X系/X级/Model N）用 family + brand，**不要**硬编成 base_model ——
+库里的精确车系键不含这些家族名，写进去会查不到。
 """
 
 #: 模型可能用的同义键名 → 本系统的规范键名。
@@ -214,6 +230,17 @@ class ParseResult:
     source: str                      # 'llm' | 'fallback' | 'mixed'
     notes: list[str] = field(default_factory=list)
     raw_llm: dict | None = None      # 保留模型原始输出，便于排查
+    #: 多组条件（2026-09-27 多车混输支持）：「威尔法+埃尔法」/「A或B」拆成多组，
+    #: 上层（API/MCP）对每组各查一次、结果带组标签合并。单查询时长度为 1。
+    specs: list[SearchSpec] = field(default_factory=list)
+    #: 每组的人话标签（如「14年威尔法」），与 specs 一一对应
+    labels: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.specs:
+            self.specs = [self.spec]
+        if len(self.labels) < len(self.specs):
+            self.labels += [""] * (len(self.specs) - len(self.labels))
 
 
 # ---------------------------------------------------------------------------
@@ -320,20 +347,26 @@ def parse_query(
     llm: LLMClient | None = None,
 ) -> ParseResult:
     notes: list[str] = []
-    data: dict | None = None
     raw_llm: dict | None = None      # 模型**原生**输出，筛过白名单前的，只给排查用
+    groups: list[dict] = []          # 每组的白名单后数据
 
     if llm is not None and llm.configured:
         try:
             raw_llm = llm.chat_json(SYSTEM_PROMPT, f"用户查询：{query}\n{SOFT_HINT}")
-            # ① 键别名归一：model / car_model → base_model。
-            #    不能只靠 prompt —— 实测 M3 约 4/5 的次数把车型写成 `model`，光靠
-            #    prompt 拦不住，必须在这里硬兜底（否则「搜阿尔法」退化成全库扫描）。
-            data = normalize_llm_keys(raw_llm)
-            # ② 白名单过滤：模型多给的字段一律丢掉，防止幻觉字段穿透到 SQL
-            data = {k: v for k, v in data.items() if k in ALLOWED_LLM_FIELDS and v is not None}
-            if not data:
-                stranger = sorted(set(raw_llm) - ALLOWED_LLM_FIELDS)
+            # 批量协议：{"queries": [组1, 组2...]}；兼容旧单对象格式（裸 dict）。
+            raw_groups = raw_llm.get("queries") if isinstance(raw_llm, dict) else None
+            if not (isinstance(raw_groups, list) and raw_groups
+                    and all(isinstance(g, dict) for g in raw_groups)):
+                raw_groups = [raw_llm if isinstance(raw_llm, dict) else {}]
+            # ① 键别名归一（每组都过；实测 M3 约 4/5 次把车型写成 model，必须硬兜底）
+            # ② 白名单过滤：幻觉字段一律丢掉
+            for g in raw_groups:
+                norm = normalize_llm_keys(g)
+                norm = {k: v for k, v in norm.items()
+                        if k in ALLOWED_LLM_FIELDS and v is not None}
+                groups.append(norm)
+            if not any(groups):
+                stranger = sorted(set(raw_llm) - ALLOWED_LLM_FIELDS) if isinstance(raw_llm, dict) else []
                 notes.append(
                     "模型没给出可用字段"
                     + (f"（不认识的键 {stranger}）" if stranger else "（返回了空 JSON）")
@@ -341,13 +374,35 @@ def parse_query(
                 )
         except LLMError as e:
             notes.append(f"模型解析失败，已降级为规则解析：{e}")
-            data = None
+            groups = []
     else:
         notes.append("未配置模型，用规则解析（复杂语义会解不准）")
 
-    if not data:
+    if not groups:
         return ParseResult(spec=rule_based_parse(query, ctx), source="fallback",
                            notes=notes, raw_llm=raw_llm)
+
+    specs: list[SearchSpec] = []
+    labels: list[str] = []
+    for data in groups:
+        label = str(data.get("label") or "").strip()[:16]
+        spec = _group_to_spec(data, query, ctx, notes)
+        if spec is not None:
+            specs.append(spec)
+            labels.append(label)
+
+    if not specs:                     # 每组都空 → 与历史行为一致：降级规则
+        return ParseResult(spec=rule_based_parse(query, ctx), source="fallback",
+                           notes=notes, raw_llm=raw_llm)
+    return ParseResult(spec=specs[0], specs=specs, labels=labels,
+                       source="llm", notes=notes, raw_llm=raw_llm)
+
+
+def _group_to_spec(data: dict, query: str, ctx: SearchContext,
+                   notes: list[str]) -> SearchSpec | None:
+    """把模型输出的一组条件（已过白名单）转成 SearchSpec。空组返回 None。"""
+    if not data:
+        return None
 
     base_model, brand, keyword, displacement = resolve_model_target(
         data.get("base_model") or data.get("model_keyword"),
@@ -361,9 +416,9 @@ def parse_query(
         notes.append(f"模型给的车型 {data['base_model']!r} 在库里找不到，已退化为模糊匹配")
         keyword = str(data["base_model"])
 
-    # ③ 模糊量守卫：原文说"左右"时，不许让区间溜进来，也不许让偏好丢掉。
-    #    以**原文**为准而不是模型 —— 模型把"五十万左右"写成 price_max=500000 的话，
-    #    硬过滤会静默删掉 60 万的车，而用户只是想让他们排后面。
+    # 模糊量守卫：原文说"左右"时，不许让区间溜进来，也不许让偏好丢掉。
+    # 以**原文**为准而不是模型 —— 模型把"五十万左右"写成 price_max=500000 的话，
+    # 硬过滤会静默删掉 60 万的车，而用户只是想让他们排后面。
     for near_key, hard_keys, kind in (
         ("price_near", ("price_min", "price_max"), "price"),
         ("year_near", ("year_min", "year_max"), "year"),
@@ -394,6 +449,10 @@ def parse_query(
         # 统一交给 SearchSpec.__post_init__ 收敛：转不了退回 DEFAULT_LIMIT。
         "limit": data.get("limit") if data.get("limit") is not None else DEFAULT_LIMIT,
     }
+    # family 透传（spec.__post_init__ 做白名单收敛）。base_model 命中时不用 family：
+    # 精确车系与家族前缀同时 AND 会出现「ALPHARD 且以 7 开头」的空集
+    if data.get("family") and not base_model:
+        payload["family"] = data["family"]
     for k in (
         "year_min", "year_max", "year_near", "price_min", "price_max", "price_near",
         "seats", "vehicle_type", "transmission", "fuel_type", "import_type",
@@ -404,8 +463,7 @@ def parse_query(
     if data.get("exclude_anomaly") is not None:
         payload["exclude_anomaly"] = bool(data["exclude_anomaly"])
 
-    spec = SearchSpec.from_dict(payload)
-    return ParseResult(spec=spec, source="llm", notes=notes, raw_llm=raw_llm)
+    return SearchSpec.from_dict(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -613,12 +671,24 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         elif any(w in around for w in _AROUND_WORDS):
             payload.setdefault("year_near", y)   # "2015年左右" → 软锚点，不是 year_min
 
-    # --- 座位数 ---
-    seat = re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*[座坐]", query)
+    # --- 座位数 ---（"七座"与"七人车"同义：粤语口语常说 N 人车）
+    seat = re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*[座坐]", query) \
+        or re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*人\s*車?车?", query)
     if seat:
         n = _cn_to_int(seat.group(1))
         if n and 2 <= n <= 30:
             payload["seats"] = n
+
+    # --- 车系家族（「宝马7系/奔驰S级/A6」的口语说法）---
+    # 捕获家族前缀（单字符或字母数字串），与 brand 组合成前缀匹配。只认
+    # ASCII 家族符（数字/字母）：「车系」的「车」是汉字天然不匹配，「一系列」同理。
+    fam = re.search(r"(?<![0-9A-Za-z])([0-9]|[一二三四五六七八])\s*-?\s*(?:系|級|级|series|SERIES)", query) \
+        or re.search(r"(?<![0-9A-Za-z])([A-Za-z]{1,3})\s*-?\s*(?:級|级)", query)
+    if fam and not payload.get("base_model"):
+        candidate = str(_cn_to_int(fam.group(1)) or fam.group(1)).upper() \
+            if fam.group(1) in "一二三四五六七八" else fam.group(1).upper()
+        if re.fullmatch(r"[A-Z0-9 -]+", candidate):
+            payload["family"] = candidate
 
     # --- 手数 ---
     # ⚠️ 先把「二手」整体剔掉，再匹配手数。

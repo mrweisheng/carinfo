@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -94,6 +95,13 @@ async def _scan_too_wide(_request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse({"detail": str(exc)}, status_code=400)
 
 
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """兜底：未预期异常必须留全栈日志 —— 否则 500 变成无声黑洞，线上没法查。"""
+    log.exception("未处理异常 %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse({"detail": f"服务器内部错误：{exc}"}, status_code=500)
+
+
 def get_llm(use_llm: bool) -> LLMClient | None:
     global _llm
     if not use_llm:
@@ -128,8 +136,13 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
     十个并发慢查询就能把池占满，后续请求全部 PoolBusy→503，
     而真正需要 SQL 的部分（检索 + 解释取数）加起来不到 1 秒。
     原则：**连接只包住 SQL，不包住网络调用。**
+
+    多车混输（2026-09-27）：一句话多台车/或关系 → parser 拆成多组 spec，
+    每组各查一次，items 扁平合并、每条带 query_label 标注来源组；单查询时
+    行为与旧版完全一致（一组）。
     """
     cfg = load_search_config()
+    t0 = time.perf_counter()
 
     # ① 取上下文（短借）
     ctx = fetch(_load_ctx)
@@ -137,16 +150,57 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
     # ② LLM 解析（无连接）
     parsed = parse_query(q, ctx, llm=get_llm(can_use))
     if limit is not None:
-        parsed.spec.limit = limit
+        for s in parsed.specs:
+            s.limit = limit
+    # 结构化过程日志：一条查询解析成了什么条件（黑箱排障的核心）。
+    # 条件只打非默认值，多车混输每组一行。
+    log.info("[search] q=%r source=%s 组数=%d", q, parsed.source, len(parsed.specs))
+    for label, s in zip(parsed.labels, parsed.specs):
+        conds = {k: v for k, v in s.to_dict().items()
+                 if v not in (None, 1, "score", 5) and k != "raw_query"}
+        log.info("[search]   组[%s] 条件=%s", label or "-", conds)
+    if parsed.notes:
+        log.warning("[search]   解析提示=%s", parsed.notes)
 
-    # ③ 检索（短借；fetch 内已含连接级错误重试）
-    result = fetch(lambda conn: search(conn, parsed.spec))
+    # ③ 检索（短借；fetch 内已含连接级错误重试）—— 每组一次
+    def _run_all(conn):
+        return [(label, search(conn, s)) for label, s in zip(parsed.labels, parsed.specs)]
+
+    results = fetch(_run_all)
+
+    matched = ", ".join(f"{label or '组' + str(i + 1)}:{r.total_matched}"
+                        for i, (label, r) in enumerate(results))
+    log.info("[search]   命中 %s（%.0fms）", matched,
+             (time.perf_counter() - t0) * 1000)
 
     # ④ 解释（模板确定性 + 可选 LLM 润色；无连接）
-    out = explain(result, llm=get_llm(can_use), use_llm=cfg["polish_summary"])
-    payload = out.__dict__.copy()
+    outs = [(label, explain(r, llm=get_llm(can_use), use_llm=cfg["polish_summary"]))
+            for label, r in results]
+
+    first = outs[0][1]
+    payload = first.__dict__.copy()
     payload["parse_source"] = parsed.source
-    payload["notes"] = list(parsed.notes) + list(out.notes)
+    payload["notes"] = list(parsed.notes) + list(first.notes)
+
+    if len(outs) > 1:
+        # 多组：items 扁平合并（每条标注组）+ 各组元信息；summary 逐组拼接。
+        # spec/total_matched 等顶层字段保持第一组（旧消费方兼容），多组信息在 query_groups
+        items = []
+        for label, out in outs:
+            for it in out.items:
+                it = dict(it)
+                it["query_label"] = label
+                items.append(it)
+        payload["items"] = items
+        payload["query_groups"] = [
+            {"label": label or f"条件{i + 1}", "total_matched": out.total_matched,
+             "spec": out.spec}
+            for i, (label, out) in enumerate(outs)
+        ]
+        payload["total_matched"] = sum(out.total_matched for _l, out in outs)
+        payload["summary"] = " ｜ ".join(
+            (f"【{label}】" if label else "") + out.summary for label, out in outs
+        )
     return payload
 
 
@@ -335,7 +389,16 @@ def main(argv: list[str] | None = None) -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    # 业务日志落 stdout（systemd 收进 journalctl）：uvicorn 只管自己的访问日志，
+    # 不配这句的话本 logger 的 INFO 全被吞 —— 线上黑箱（2026-09-27 用户的原话
+    # "操作了什么/找到没有/成功失败都不知道"）就是这么来的。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

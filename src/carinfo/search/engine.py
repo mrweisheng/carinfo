@@ -338,6 +338,17 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
         # 必须转义 LIKE 元字符（见 _like_escape）。
         sql += " AND v.car_model ILIKE %s ESCAPE '\\'"
         params.append(f"%{_like_escape(spec.model_keyword)}%")
+    if spec.family:
+        # 车系家族前缀（「宝马7系/奔驰S级/Model 3」）：库里这类车按排量变体
+        # 分散（730LI/740LIA/750LI...），共同点是 car_model 以家族前缀开头。
+        # 尾部 [0-9 ] 是排他键：S 级（S500/S580）不会被 SL350 混入（S 后是 L）、
+        # 7 系不会被 X7 混入（X 开头）。M760 这类 M 前缀高性能版用 OR 兜住。
+        # family 已在 spec.__post_init__ 收敛为 [A-Z0-9 -] 白名单，参数化安全。
+        fam = spec.family
+        pat = f"^(M-?)?{fam}[0-9 ]"
+        sql += " AND (v.car_model ~* %s OR v.car_model ~* %s)"
+        params.append(pat)
+        params.append(f"^M{fam}")
 
     if spec.year_min is not None:
         # year 是 varchar，但库内全是 4 位标准年，字典序等值于数值序，能用上索引
