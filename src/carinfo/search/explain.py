@@ -109,6 +109,13 @@ def item_labels(item: ScoredVehicle) -> list[str]:
     # 买家看到「车行」标签能调整谈价预期;不加价转卖的车行也是正常渠道)
     if item.is_dealer:
         tags.append(f"车行(挂{item.dealer_listings or '?'}台)")
+    # 「久未核实」:深扫/复核窗口内没见过它 = 可能已售/已下架。
+    # 只标注不隐藏 —— 车仍完整参与排序，由调用方决定是否提示"先电话确认"。
+    if item.is_unverified:
+        if item.verify_age_days is None:
+            tags.append("久未核实")
+        else:
+            tags.append(f"久未核实(距上次核实 {item.verify_age_days} 天)")
     # 仅邮箱联系:联系慢、优先级被排后,如实标注让调用方知道为什么靠后
     if not item.has_phone:
         tags.append("仅邮箱联系")

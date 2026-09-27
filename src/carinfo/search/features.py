@@ -37,10 +37,12 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
 
 import psycopg2
 from psycopg2.extras import execute_values
 
+from carinfo.core.revalidator import VERIFY_WINDOW_DAYS
 from carinfo.search.normalize import Vocabulary, clean_text, normalize_brand, normalize_model
 
 # ---------------------------------------------------------------------------
@@ -114,12 +116,16 @@ CREATE TABLE IF NOT EXISTS vehicle_features (
   is_anomaly      boolean NOT NULL DEFAULT FALSE,
   dealer_listings integer,
   is_dealer       boolean NOT NULL DEFAULT FALSE,
+  last_verified   date,
+  verify_age_days integer,
+  is_unverified   boolean NOT NULL DEFAULT FALSE,
   updated_at      timestamptz DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vf_base_model ON vehicle_features (base_model);
 CREATE INDEX IF NOT EXISTS idx_vf_base_bucket ON vehicle_features (base_model, year_bucket);
 CREATE INDEX IF NOT EXISTS idx_vf_ratio ON vehicle_features (price_ratio);
 CREATE INDEX IF NOT EXISTS idx_vf_is_dealer ON vehicle_features (is_dealer);
+CREATE INDEX IF NOT EXISTS idx_vf_is_unverified ON vehicle_features (is_unverified);
 """
 
 
@@ -152,6 +158,11 @@ class RawRow:
     import_type: str | None
     phone_number: str | None
     contact_email: str | None
+    #: 复核事实（2026-09-27「久未核实」治理）：
+    #: last_verified = 最后一次被证实**仍在售**的日期（写库口径见 core/revalidator）；
+    #: verify_age_days = 距今多少天，None = 从未核实过（老数据）。
+    last_verified: date | None = None
+    verify_age_days: int | None = None
 
     @property
     def seller_key(self) -> str | None:
@@ -217,6 +228,13 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
                          (substring(extra_fields->>'list_date' from 1 for 10))::timestamptz))
                     / 86400.0 END AS age_from_list,
                EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0 AS age_from_created,
+               CASE WHEN extra_fields->>'last_verified' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                    THEN (substring(extra_fields->>'last_verified' from 1 for 10))::date
+               END AS last_verified,
+               CASE WHEN extra_fields->>'last_verified' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                    THEN GREATEST(0, (now() AT TIME ZONE 'Asia/Hong_Kong')::date
+                         - (substring(extra_fields->>'last_verified' from 1 for 10))::date)
+               END AS verify_age_days,
                phone_number, contact_email,
                extra_fields
         FROM vehicles
@@ -225,13 +243,16 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
     """)
     rows: list[RawRow] = []
     n_list_date = 0
+    n_verified = 0
     for (vid, car_model, car_brand, year, price, age_from_list, age_from_created,
-         phone, email, extra) in cur.fetchall():
+         lv_date, verify_age, phone, email, extra) in cur.fetchall():
         base, brand_hint, _ = normalize_model(car_model, vocab)
         ef = extra if isinstance(extra, dict) else (json.loads(extra) if extra else {})
         age_raw = age_from_list if age_from_list is not None else age_from_created
         if age_from_list is not None:
             n_list_date += 1
+        if verify_age is not None:
+            n_verified += 1
         rows.append(
             RawRow(
                 vehicle_id=vid,
@@ -247,11 +268,15 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
                 import_type=(clean_text(ef.get("import_type")) or None),
                 phone_number=(phone or "").strip() or None,
                 contact_email=(email or "").strip() or None,
+                last_verified=lv_date,
+                verify_age_days=int(verify_age) if verify_age is not None else None,
             )
         )
     cur.close()
     if rows:
         print(f"    时效来源: list_date(卖家真实更新) {n_list_date}/{len(rows)}，其余回退 created_at")
+        print(f"    核实来源: 有 last_verified 的 {n_verified}/{len(rows)}"
+              f"（未核实 {len(rows) - n_verified} 台按「久未核实」处理）")
     return rows
 
 
@@ -452,6 +477,7 @@ def build_features(
     out: list[tuple] = []
     lvl_counter: dict[str, int] = defaultdict(int)
     n_dealer = 0
+    n_unverified = 0
     for r in rows:
         ref = pick_reference(stats, r.base_model, r.year)
         ratio = level = None
@@ -466,6 +492,14 @@ def build_features(
         dealer_n = seller_n.get(r.seller_key, 0) if r.seller_key else 0
         is_dealer = dealer_n >= DEALER_THRESHOLD
         n_dealer += is_dealer
+        # 「久未核实」：从未核实过（老数据）或距今**超过**窗口（严格大于，
+        # 与 revalidator 的候选条件 `lvd < today - window` 同口径）。
+        # 只做标签：不参与打分、不做过滤 —— 过滤会把上万台一次藏掉，
+        # 用户连"要不要冒险看看"的选择权都没有。
+        is_unverified = (r.verify_age_days is None
+                         or r.verify_age_days > VERIFY_WINDOW_DAYS)
+        if is_unverified:
+            n_unverified += 1
         lvl_counter[level or "none"] += 1
         out.append(
             (
@@ -487,9 +521,15 @@ def build_features(
                 is_anomaly,
                 dealer_n or None,
                 is_dealer,
+                r.last_verified,
+                r.verify_age_days,
+                is_unverified,
             )
         )
     print(f"    行情降级分布: {dict(lvl_counter)}")
+    print(f"    久未核实标识: {n_unverified} 台 "
+          f"({100.0 * n_unverified / max(len(rows), 1):.1f}%)"
+          f"（从未核实或距今 > {VERIFY_WINDOW_DAYS} 天，仅作标签、不过滤）")
     print(f"    车行判定(挂>={DEALER_THRESHOLD}台): {n_dealer} 台 "
           f"({100.0 * n_dealer / max(len(rows), 1):.1f}%)，去重卖家 {len(seller_n)} 个")
     return out
@@ -543,6 +583,7 @@ def _shadow_ddl() -> str:
         "idx_vf_base_bucket": "idx_vf_base_bucket_new",
         "idx_vf_ratio": "idx_vf_ratio_new",
         "idx_vf_is_dealer": "idx_vf_is_dealer_new",
+        "idx_vf_is_unverified": "idx_vf_is_unverified_new",
     }
     mapping = {**index_map, **table_map}   # 索引名较长，优先命中（regex alternation 顺序）
 
@@ -583,7 +624,8 @@ def write_all(conn, stats: dict, feats: list[tuple]) -> None:
            (vehicle_id, base_model, brand_norm, year_bucket, price_ratio,
             market_median, market_p25, market_p75, market_bucket, market_ref_n,
             market_level, condition_score, has_condition, age_days, heat_score,
-            is_anomaly, dealer_listings, is_dealer, updated_at)
+            is_anomaly, dealer_listings, is_dealer, last_verified, verify_age_days,
+            is_unverified, updated_at)
            VALUES %s""",
         [f + (_now(conn),) for f in feats],
         page_size=2000,
@@ -687,6 +729,34 @@ def _rename_shadow_indexes(cur) -> None:
             cur.execute(f'ALTER TABLE "{tbl}" RENAME CONSTRAINT "{conname}" TO "{new_name}"')
 
 
+def rebuild_default() -> tuple[bool, str]:
+    """「静默重算」入口：给会改 `vehicles` 的长跑任务调用（爬取 / 车源复核）。
+
+    为什么要有这一层：`market_stats` / `vehicle_features` 都是从 `vehicles` 派生
+    出来的，**任何改了 vehicles 的路径都必须重算**，否则行情基准里会混进已售/已删车、
+    `is_unverified` 标签也会停在旧值。此前只有爬取路径挂了这个动作，核实路径漏了
+    （已知问题 21）。两处各写一套 try/except 必然漂移，所以收成这一个函数。
+
+    独立建连（不碰调用方的连接），吞掉所有异常（派生数据失败不该让长跑判失败），
+    返回 ``(ok, 人话描述)`` 供调用方记日志。
+
+    ⚠️ 判定口径：``rc == 0`` 才算成功。``rc == 3`` 是「库里没有在售车可算，
+    ``main()`` 特意跳过写入以免把派生表清空」—— 那是一个**异常状态**，返回 False
+    让它浮出水面，不要当成"没有变化"悄悄放过。
+    """
+    t0 = time.time()
+    try:
+        rc = main(argv=[])
+    except SystemExit as e:                       # main() 的防御性退出路径
+        return False, f"特征表重算异常退出 code={e.code}（耗时 {time.time()-t0:.1f}s）"
+    except Exception as e:                        # noqa: BLE001
+        return False, f"特征表重算失败: {e}（耗时 {time.time()-t0:.1f}s）"
+    dt = time.time() - t0
+    if rc == 0:
+        return True, f"特征表已重算并原子切换（耗时 {dt:.1f}s）"
+    return False, f"特征表重算未完成 rc={rc}（耗时 {dt:.1f}s）"
+
+
 def main(argv: list[str] | None = None) -> int:
     """重算派生表。
 
@@ -694,6 +764,8 @@ def main(argv: list[str] | None = None) -> int:
         argv: 命令行参数（默认取 sys.argv）；被爬虫调用时传 [] 走默认路径。
             调用方只关心成功/失败，**不要**在成功路径上抛异常 —— 特征表是派生
             数据，重算失败不应该让爬虫整轮判为失败。
+
+    程序化调用请走 :func:`rebuild_default`（会吞异常并给出人话结果）。
     """
     ap = argparse.ArgumentParser(description="重算行情基准与单车特征")
     ap.add_argument("--dry-run", action="store_true", help="只计算并打印分布，不写库")

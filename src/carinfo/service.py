@@ -250,6 +250,41 @@ class CarinfoService:
         if self.deep_pages <= 0:
             self._warn("scraping.deep_crawl.pages<=0，深扫已禁用，只按日常 pages 调度")
 
+        # 车源复核配置：scraping.revalidation，**整段可选，缺省=关闭**。
+        # 为什么默认关闭：复核不是只读操作 —— 它会把「久未核实且已售/已删」的车
+        # 移出检索（status 2/3）。能一键停掉是运维底线。
+        # 「多久算久未核实」刻意**不在这里配**：检索侧的标签用的是
+        # revalidator.VERIFY_WINDOW_DAYS，两处各配一个值必然漂移
+        # （标签说久未核实、复核却不来查它）。单点定义，见 core/revalidator.py。
+        reval_cfg = config.get("scraping", {}).get("revalidation", {})
+        if not isinstance(reval_cfg, dict):
+            self._warn(
+                f"scraping.revalidation 不是对象（实际 {type(reval_cfg).__name__}），"
+                "车源复核已关闭"
+            )
+            reval_cfg = {}
+        self.reval_enabled = bool(reval_cfg.get("enabled", False))
+        self.reval_interval_days, rd_ok = self._coerce_positive(
+            reval_cfg.get("interval_days"), 7)
+        self.reval_batch_size, rb_ok = self._coerce_positive(
+            reval_cfg.get("batch_size"), 3000)
+        self.reval_concurrency, rc_ok = self._coerce_positive(
+            reval_cfg.get("concurrency"), 4)
+        self.reval_vehicle_type, rv_ok = self._coerce_positive(
+            reval_cfg.get("vehicle_type"), 1)
+        self.reval_request_interval, ri_ok = self._coerce_interval(
+            reval_cfg.get("request_interval"), [1.0, 1.5])
+        if self.reval_enabled:
+            for ok, name, val in (
+                (rd_ok, "interval_days", self.reval_interval_days),
+                (rb_ok, "batch_size", self.reval_batch_size),
+                (rc_ok, "concurrency", self.reval_concurrency),
+                (rv_ok, "vehicle_type", self.reval_vehicle_type),
+                (ri_ok, "request_interval", self.reval_request_interval),
+            ):
+                if not ok:
+                    self._warn(f"scraping.revalidation.{name} 非法，已用默认 {val!r}")
+
         # 加载调度配置
         self.windows = self._load_windows(config)
 
@@ -616,41 +651,62 @@ class CarinfoService:
             self._plan_next_run(now, from_tomorrow=False)
 
     def _resolve_job_mode(self, state: dict) -> dict:
-        """决定本轮是「深扫」还是「日常」，以及深扫的续跑状态。
+        """决定本轮跑「深扫」/「车源复核」/「日常」中的哪一种，以及深扫的续跑状态。
 
-        优先级：**未完成的深扫续跑 > 到期的新深扫 > 日常**。续跑优先保证被
-        反爬/重启打断的深扫最终能完成，期间日常暂停——深扫从第 1 页开始爬，
-        天然覆盖日常 30 页的活跃区，不存在「深扫期间漏掉日常更新」。
+        优先级：**未完成的深扫续跑 > 到期的新深扫 > 到期/首次的车源复核 > 日常**。
+        续跑优先保证被反爬/重启打断的深扫最终能完成，期间其它模式暂停——深扫从
+        第 1 页开始爬，天然覆盖日常 30 页的活跃区，不存在「深扫期间漏掉日常更新」。
 
-        到期判定：距上次深扫完成 >= deep_interval_days（从未跑过视为到期）。
-        状态结构（.carinfo_service_state.json 的 deep_crawl 键）：
-            {"last_completed": "YYYY-MM-DD",
-             "progress": {"1": {"target": 1200, "last_page": 447}}}
+        复核为什么排在日常之前：日常只是刷新前排 30 页，复核是**把已经死掉的车
+        从检索里摘掉**（客户白跑一趟的代价比"少刷新一天"大得多）。
+        复核为什么排在深扫之后：深扫把 1200 页全刷一遍 ≈ 顺带做了一轮大范围核实，
+        先做它更划算，也不必再花一次请求去复查那些刚被刷到的车。
+
+        到期判定：距上次完成 >= 各自 interval_days（从未跑过视为到期）。
+        状态结构（.carinfo_service_state.json）：
+            {"deep_crawl":   {"last_completed": "YYYY-MM-DD",
+                              "progress": {"1": {"target": 1200, "last_page": 447}}},
+             "revalidation": {"last_completed": "YYYY-MM-DD"}}
         """
         deep = state.get("deep_crawl") or {}
         progress = deep.get("progress") or {}
-        if self.deep_pages <= 0:
-            return {"mode": "daily", "reason": "deep disabled"}
+        deep_reason = "深扫已禁用"
 
-        # 有未完成进度 → 续跑（哪怕间隔未到）
-        for type_id, prog in progress.items():
+        if self.deep_pages > 0:
+            # 有未完成进度 → 续跑（哪怕间隔未到）
+            for type_id, prog in progress.items():
+                try:
+                    if int(prog.get("last_page", 0)) < int(prog.get("target") or self.deep_pages):
+                        return {"mode": "deep", "resume": True}
+                except (TypeError, ValueError):
+                    continue
+
+            last_completed = deep.get("last_completed") or ""
+            if not last_completed:
+                return {"mode": "deep", "resume": False, "reason": "从未深扫"}
             try:
-                if int(prog.get("last_page", 0)) < int(prog.get("target") or self.deep_pages):
-                    return {"mode": "deep", "resume": True}
-            except (TypeError, ValueError):
-                continue
+                # 用北京时间算间隔：服务器 OS 时区若非 +8，date.today() 会有 8 小时偏差
+                elapsed = (now_beijing().date() - date.fromisoformat(last_completed)).days
+            except ValueError:
+                return {"mode": "deep", "resume": False, "reason": "last_completed 非法，视为到期"}
+            if elapsed >= self.deep_interval_days:
+                return {"mode": "deep", "resume": False, "reason": f"距上次深扫 {elapsed} 天"}
+            deep_reason = f"距上次深扫仅 {elapsed} 天"
 
-        last_completed = deep.get("last_completed") or ""
-        if not last_completed:
-            return {"mode": "deep", "resume": False, "reason": "从未深扫"}
-        try:
-            # 用北京时间算间隔：服务器 OS 时区若非 +8，date.today() 会有 8 小时偏差
-            elapsed = (now_beijing().date() - date.fromisoformat(last_completed)).days
-        except ValueError:
-            return {"mode": "deep", "resume": False, "reason": "last_completed 非法，视为到期"}
-        if elapsed >= self.deep_interval_days:
-            return {"mode": "deep", "resume": False, "reason": f"距上次深扫 {elapsed} 天"}
-        return {"mode": "daily", "reason": f"距上次深扫仅 {elapsed} 天"}
+        # 深扫本轮不需要跑，才轮到车源复核（开关关闭时整段跳过）
+        if self.reval_enabled:
+            reval = state.get("revalidation") or {}
+            last_reval = reval.get("last_completed") or ""
+            if not last_reval:
+                return {"mode": "revalidate", "reason": "从未复核"}
+            try:
+                r_days = (now_beijing().date() - date.fromisoformat(last_reval)).days
+            except ValueError:
+                return {"mode": "revalidate", "reason": "复核 last_completed 非法，视为到期"}
+            if r_days >= self.reval_interval_days:
+                return {"mode": "revalidate", "reason": f"距上次复核 {r_days} 天"}
+
+        return {"mode": "daily", "reason": deep_reason}
 
     def _save_deep_progress(self, type_id: int, last_page: int) -> None:
         """记录深扫进度（每页开始时由 page_hook 调用，last_page=本页之前已完成页）。"""
@@ -670,6 +726,168 @@ class CarinfoService:
         }
         self._save_state(state)
 
+    def _mark_reval_completed(self) -> None:
+        """记录复核完成日期（决定下次复核何时触发）。"""
+        state = self._load_state()
+        state["revalidation"] = {
+            "last_completed": now_beijing().strftime("%Y-%m-%d"),
+        }
+        self._save_state(state)
+
+    def _run_revalidation_job(self) -> str:
+        """车源复核：按 h_vid 复查「久未核实」的在售车，判三态并落库。
+
+        与爬取的三点不同：
+        1. **不按车辆类型循环** —— 候选是一条跨类型、按「最久没核实」排序的查询。
+        2. **没有进度文件** —— 候选查询天然幂等：已处理的被写成今天，下一轮自动
+           落在队尾。所以被中断/被 batch_size 截断都只是"下次接着跑"，不需要续跑状态。
+           （这正是它比深扫省事的地方：深扫必须记 last_page，因为页码会漂。）
+        3. **必须持续 touch 锁** —— 一批 3000 台约 1 小时，远超 stale_after(2h) 的
+           安全余量；不 touch 就会踩已知问题 10（锁被判过期 → 并发起第二个进程）。
+
+        ⚠️ 返回**状态**而不是计数（P0-1 修正）。此前返回
+        ``alive + sold + deleted``，调用方只能看到"非零 = 成功"，于是
+        「被反爬中止、一台都没处理」与「正常跑完」在调用方眼里完全一样 ——
+        中止也会去写 ``last_completed``，**下一轮要等整整 interval_days(7 天)**
+        才重来，而这恰恰是最该立刻重试的情况。计数照旧进日志与 crawl_logs。
+
+        Returns:
+            "success"  本轮正常结束（含「没有候选」）→ 可标记 last_completed
+            "aborted"  连续 busy 触发保护性中止 → **不可**标记，下一轮继续
+            "error"    连不上库等入口故障 → 不可标记
+        """
+        from carinfo.core import revalidator
+        from carinfo.core.importer import FastCSVImporter, record_crawl_log
+
+        importer = FastCSVImporter()
+        if not importer.connect():
+            self._log("复核：数据库连接失败，本轮跳过", level="ERROR")
+            return "error"
+
+        conn = importer.connection
+        try:
+            window = revalidator.VERIFY_WINDOW_DAYS
+            cands = revalidator.fetch_candidates(
+                conn, window_days=window,
+                vehicle_type=self.reval_vehicle_type,
+                limit=self.reval_batch_size,
+            )
+            if not cands:
+                # 没有候选 = 全库都在窗口内核实过 = 本轮目的已达成 → 算成功
+                self._log(f"复核：没有需要复核的车（{window} 天内都核实过）", level="INFO")
+                return "success"
+
+            interval = self.reval_request_interval
+            self._log(
+                f"复核候选 {len(cands)} 台（窗口 {window} 天，类型 "
+                f"{self.reval_vehicle_type}，并发 {self.reval_concurrency}，"
+                f"间隔 {interval[0]}-{interval[1]}s）",
+                level="INFO",
+            )
+
+            vid_by_hvid = {h: vid for vid, h in cands}
+            fetch = revalidator.make_spider_fetcher(
+                self.reval_vehicle_type, tuple(interval), self.reval_concurrency,
+            )
+
+            # ── 判据漂移探针（只读，抽查 3+3 台）──
+            # 三态判据是从线上抓样反推的：站点一改版，classify_detail 会**静默
+            # 退化成「全判 UNKNOWN」**，复核从此一台不动，而报告只显示"判不出来"。
+            # 离线单测只能证明代码没被改坏，证不了线上页面没变 —— 这是唯一的补位。
+            # 放在候选非空之后：没车要复核时没必要花这 6 个请求。
+            # 只告警、**不中止**：实测过的失效模式是"什么都不写"或"标签写错"，
+            # 没有一条会导致误删（判不准一律 UNKNOWN）。真正危险的是没人知道它不准了。
+            try:
+                probe = revalidator.probe_drift(conn, fetch)
+                msg = (f"判据探针：抽查 {probe['checked']} 台，漂移 {probe['drift']}，"
+                       f"取不到页 {probe['unreachable']}")
+                if probe["drift"]:
+                    self._log(f"⚠ {msg} —— 三态判据可能已失效，复核结果可疑！",
+                              level="ERROR")
+                    for d in probe["details"]:
+                        self._log(f"  ⚠ {d}", level="ERROR")
+                else:
+                    self._log(msg, level="INFO")
+            except Exception as e:  # noqa: BLE001
+                # 探针本身出问题绝不能挡住复核（它只是观测手段）
+                self._log(f"判据探针异常（不影响复核）: {e}", level="WARNING")
+
+            writer = revalidator.make_db_writer(conn, lambda h: vid_by_hvid.get(h))
+
+            last_touch = {"t": time.time()}
+
+            def progress(done: int, total: int) -> None:
+                now = time.time()
+                if done % 50 == 0 or now - last_touch["t"] > 120:
+                    self.lock.touch()
+                    last_touch["t"] = now
+                    self._log(f"复核进度 {done}/{total}", level="INFO")
+
+            report = revalidator.revalidate_ids(
+                [h for _vid, h in cands], fetch,
+                writer=writer, concurrency=self.reval_concurrency,
+                on_progress=progress, dry_run=False,
+            )
+            self._log(report.summary(),
+                      level="WARNING" if report.aborted else "INFO")
+
+            # ── 写 crawl_logs（复核此前完全不在审计链里）──
+            # 不写的话：复核改了上万台的 vehicle_status，而 crawl_logs 只有"爬取"的
+            # 记录 —— 事后对账时这批变更**没有任何出处**，也会把「台/页」基线算歪
+            # （pages_scraped=0 却带着几万台）。vehicle_type 用独立值，便于与爬取区分。
+            record_crawl_log(importer, {
+                "vehicle_type_name": "复核",
+                "pages_scraped": 0,
+                "total_vehicles": report.considered,
+                "new_vehicles": 0,
+                # 实际落库行数（含"仍在售→刷新 last_verified"），不是判定台数
+                "updated_vehicles": report.wrote,
+                "error_count": report.write_failed,
+                "proxy_used_count": 0,
+                "proxy_fail_count": 0,
+                # 连续 busy 中止 = 站点反爬起效，落到这一列才看得见
+                "anti_crawler_triggered": 1 if report.aborted else 0,
+                "crawl_duration": round(report.elapsed_s, 2),
+                "import_duration": 0.0,
+                "status": "aborted" if report.aborted else "success",
+                "error_details": (report.summary() if report.write_failed
+                                  else None),
+            })
+
+            # ── 重算派生表（P1-3）──
+            # market_stats / vehicle_features 都是从 vehicles 派生的：复核把车
+            # 写成已售/已删之后，不重算的话行情基准里还混着死车、`is_unverified`
+            # 标签也停在旧值（刚核实过的车当天仍显示「久未核实」）。
+            # 爬取路径有 _rebuild_features_after_crawl，复核路径此前**完全没有**
+            # 任何重算触发点 —— 而 extract.py 里写明了那是"全链路唯一一处"。
+            # 条件用 wrote > 0：没写进任何行就是什么都没变，不必白跑 8 秒。
+            # 位置放在 mark_completed 之前：重算途中挂掉 → last_completed 没写 →
+            # 下次启动会重跑（复核是幂等的，成本只是再扫一遍候选）。
+            if report.wrote > 0:
+                self._rebuild_features(f"复核写入 {report.wrote} 行")
+
+            if report.aborted:
+                self._log(
+                    "复核被反爬中止，**不**写 last_completed —— 下一轮会继续复核",
+                    level="WARNING",
+                )
+                return "aborted"
+            return "success"
+        finally:
+            importer.close()
+
+    def _rebuild_features(self, reason: str) -> None:
+        """重算 market_stats / vehicle_features（失败只告警，绝不影响主流程）。"""
+        try:
+            from carinfo.search.features import rebuild_default
+        except Exception as e:  # noqa: BLE001
+            self._log(f"派生表重算不可用（import 失败）: {e}", level="WARNING")
+            return
+        self._log(f"开始重算派生表（{reason}）...", level="INFO")
+        ok, msg = rebuild_default()
+        self._log(msg, level="INFO" if ok else "WARNING")
+
+
     def _run_one_job(self) -> None:
         if not self.lock.acquire():
             self._log(
@@ -681,6 +899,7 @@ class CarinfoService:
         state = self._load_state()
         plan = self._resolve_job_mode(state)
         is_deep = plan["mode"] == "deep"
+        is_reval = plan["mode"] == "revalidate"
 
         if is_deep:
             if plan.get("resume"):
@@ -692,12 +911,44 @@ class CarinfoService:
                     f"{self.deep_request_interval[0]}-{self.deep_request_interval[1]}s）===",
                     level="INFO",
                 )
+        elif is_reval:
+            self._log(f"=== 本轮：车源复核（{plan.get('reason', '')}）===", level="INFO")
         else:
             self._log(f"=== 开始执行日常任务（{plan.get('reason', '')}）===", level="INFO")
 
         try:
             if os.getcwd() not in sys.path:
                 sys.path.insert(0, os.getcwd())
+
+            # ── 车源复核：不爬列表页，只按 h_vid 复查久未核实的在售车 ──
+            # 与爬取共用「今天已完成」标记（last_run_date），但不跑最后的
+            # LLM 增量提取 —— 复核不产生新车，没有新描述要提取。
+            # （派生表重算在 _run_revalidation_job 内部按「真有写入」触发。）
+            if is_reval:
+                result = self._run_revalidation_job()
+                # P0-1：只有**正常结束**才记「复核已完成」。中止/故障时不记，
+                # 否则下一轮复核要等整整 interval_days 天 —— 而中止恰恰意味着
+                # 还有一大批车没查，是最该尽快重来的情形。
+                # last_run_date 照写：它是「今天不再跑第二次」的开关，与「这一轮
+                # 复核完成了没」是两件事 —— 今天不重跑，明天照常触发。
+                if result == "success":
+                    self._mark_reval_completed()
+                else:
+                    self._log(
+                        f"复核本轮未完成（{result}）→ **不**写 revalidation.last_completed，"
+                        f"下一轮触发时继续复核（不会等满 {self.reval_interval_days} 天）",
+                        level="WARNING",
+                    )
+                state = self._load_state()
+                state["last_run_date"] = now_beijing().strftime("%Y-%m-%d")
+                state["last_run_at"] = now_beijing().isoformat(timespec="seconds")
+                self._save_state(state)
+                self._log(
+                    f"已在 {self.state_file} 标记今天({state['last_run_date']})已完成，"
+                    f"后续重启不会再执行本日任务",
+                    level="INFO",
+                )
+                return
 
             from carinfo.sites import car28 as carinfo
             from carinfo.core.importer import FastCSVImporter

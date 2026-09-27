@@ -24,6 +24,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from carinfo.core.proxy import get_proxy_manager
 from carinfo.core.base_spider import BaseSpider
 from carinfo.utils import parse_price, parse_contact_info
+# 「今天」（北京时间）单点定义在 revalidator（顶层只依赖 stdlib，不会拉起代理池）。
+# 不再在本文件另写一份：`last_verified` 的写入日与「久未核实」标签的判定日
+# 一旦有两个来源，就会错开一天。
+from carinfo.core.revalidator import today_beijing
 
 # 设置日志时区为北京时间
 class BeijingTimeFormatter(logging.Formatter):
@@ -34,11 +38,26 @@ class BeijingTimeFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-handler = logging.StreamHandler()
-handler.setFormatter(BeijingTimeFormatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-root_logger.addHandler(handler)
+def _install_root_handler_once() -> None:
+    """幂等地给 root logger 装一个北京时间格式的 StreamHandler。
+
+    ⚠️ 这里**必须幂等**：模块导入时会执行一次，而入口脚本（`run_service.py` /
+    `python -m carinfo.core.revalidator` / `_migration/*`）也会调
+    `logging.basicConfig()`。`basicConfig` 只在 root **没有** handler 时才装，
+    所以「先 basicConfig 后 import car28」= 2 个 handler = **每条日志打两遍**。
+    无条件 addHandler 就会踩这个坑（曾实测出现双行日志）。
+    """
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if root_logger.handlers:
+        return                      # 已被别处配置过（basicConfig 或再次 import）
+    handler = logging.StreamHandler()
+    handler.setFormatter(BeijingTimeFormatter(
+        '%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    root_logger.addHandler(handler)
+
+
+_install_root_handler_once()
 logger = logging.getLogger(__name__)
 
 # 并发配置
@@ -646,6 +665,47 @@ class Car28Spider(BaseSpider):
         logger.info(f"请求详情页面URL: {url}")
         return self._make_request_with_retry(url, headers, 'detail')
 
+    def fetch_detail_raw(self, native_id):
+        """详情页「轻量取回」：**单次**请求，不重试、不标记代理失败、不触发反爬冷却。
+
+        为什么不能复用 `_make_request_with_retry`（专门为车源复核写的）：
+        复核会把「已删」当成**正常结果**——站点对删帖返回 HTTP 200 的 msg_noid 页，
+        不是 404。若走重试路径，一个删帖 = 4 次请求 + 4 次 `mark_proxy_failed`
+        （删帖多时既浪费请求，又把好代理误拉黑）。复核关心的是「页面长什么样」，
+        不是「内容解析成不成功」，所以这里只负责**如实取回**。
+
+        与主路径共用的三件事：随机 UA 头、代理池、**全局限速器**（rate_limiter
+        线程安全，复核并发也受同一条节流时间轴约束，不会突破站点发送速率上限）。
+
+        Returns:
+            (status_code | None, body | None)：网络异常时返回 (None, None)，
+            由调用方判为 UNKNOWN（跳过，绝不删）。
+        """
+        url = self.detail_url(native_id)
+
+        # 模拟从列表页进入详情页
+        vehicle_config = self.vehicle_types.get(self.vehicle_type, self.vehicle_types[1])
+        list_url = f"{BASE_URL}/sell_lst.php?{vehicle_config['param']}"
+        headers = self._build_headers(referer=list_url)
+
+        proxy_info = self.proxy_manager.get_random_proxy()
+        proxies = {
+            'http': proxy_info.get('http'),
+            'https': proxy_info.get('https'),
+        } if proxy_info else None
+
+        try:
+            self.rate_limiter.wait()
+            response = curl_requests.get(
+                url, headers=headers, proxies=proxies,
+                timeout=self.request_timeout, allow_redirects=True,
+                impersonate="chrome",
+            )
+            return response.status_code, self._decode_response(response)
+        except Exception as e:
+            logger.warning(f"复核请求失败（按 UNKNOWN 跳过，不改库）h_vid={native_id}: {e}")
+            return None, None
+
     def extract_car_info(self, html_content, h_vid, initial_sale_status=None):
         """从详情页中提取车辆信息"""
         if html_content is None:
@@ -761,11 +821,32 @@ class Car28Spider(BaseSpider):
 
         logger.info(f"爬取完成，共获取 {len(self.car_data)}/{len(items)} 个车辆信息")
 
+    @staticmethod
+    def _list_meta(item):
+        """列表行携带的元信息（浏览/留言/卖家更新日），供 build_rows 合进 extra_fields。"""
+        return {
+            'view_count': item.get('view_count'),
+            'comment_count': item.get('comment_count'),
+            # 列表页灰字日期 = 卖家真实更新时间（build_rows 规范化后进 extra_fields）
+            'list_date': item.get('date'),
+        }
+
     def _scrape_single_car(self, item):
         """爬取单个车辆详情（供并发调用）。详情解析失败时用列表页字段兜底，不丢记录。"""
         h_vid = item.get('code')
         sale_status = item.get('sale_status')
         logger.info(f"正在处理车辆，h_vid: {h_vid}, 状态: {sale_status}")
+
+        # ── 列表行已带「已售」标记 → 不必再取详情 ──
+        # 实测（2026-09-27，全库）：status=2 且 page_number>0 的 9,128 台里，
+        # **9,126 台（99.98%）**的 contact_info 含「資料亦被保護中」，即详情页只剩
+        # 保护页、拿不到任何新字段。深扫 1200 页里有 39.6% 的行是这种，
+        # 跳过它们省下约 1 万次详情请求（深扫 16h → ~10h），且不会丢任何
+        # 列表页已有的字段（下面兜底路径本来就只写列表页字段）。
+        # 注意：这里**只跳详情请求**，记录照旧入库（vehicle_status=2），
+        # 因为「已售车的价格/浏览量」仍是行情与历史分析的样本。
+        if sale_status == '已售':
+            return self._build_fallback_car(item)
 
         try:
             html_content = self.get_detail_content(h_vid)
@@ -781,12 +862,7 @@ class Car28Spider(BaseSpider):
                 logger.warning(f"车辆 {h_vid} 详情解析失败，使用列表页字段兜底")
                 car_info = self._build_fallback_car(item)
 
-            car_info['_list'] = {
-                'view_count': item.get('view_count'),
-                'comment_count': item.get('comment_count'),
-                # 列表页灰字日期 = 卖家真实更新时间（build_rows 规范化后进 extra_fields）
-                'list_date': item.get('date'),
-            }
+            car_info['_list'] = self._list_meta(item)
             return car_info
 
         except Exception as e:
@@ -794,7 +870,11 @@ class Car28Spider(BaseSpider):
             return None
 
     def _build_fallback_car(self, item):
-        """详情页解析失败时，用列表页结构化字段构造最小 car_data（缺簡評/图片/聯絡人）。"""
+        """用列表页结构化字段构造最小 car_data（缺簡評/图片/聯絡人，extra_fields.list_only=True）。
+
+        两条调用路径：详情页解析失败兜底，以及列表行**已标已售**时的直接短路
+        （不取详情）。后者不再额外打 ERROR 日志 —— 已售不是错误。
+        """
         h_vid = str(item.get('code', ''))
         list_price = item.get('list_price', '')
         current_price, original_price = parse_price(list_price)
@@ -809,6 +889,9 @@ class Car28Spider(BaseSpider):
             '图片URLs': [], 'sale_status': item.get('sale_status'),
         }
         car_data['extra_fields'] = {'list_only': True}
+        # `_list` 必须在这里也挂上：已售短路路径直接 return 本函数，不会再经过
+        # _scrape_single_car 里那段赋值 —— 漏了就会丢掉 list_date（卖家更新时间）。
+        car_data['_list'] = self._list_meta(item)
         car_data['h_vid'] = h_vid
         return car_data
 
@@ -830,6 +913,14 @@ class Car28Spider(BaseSpider):
                 # 卖家真实更新时间。同车重爬时 importer 按「新值优先」合并 extra_fields，
                 # 卖家一刷新这里就是新值 —— 时效打分靠它，不是 update_date（那是抓取戳）
                 extra_fields['list_date'] = list_date
+
+            # 复核标记（「久未核实」标签的**唯一数据来源**）：本页列表页见到它、
+            # 且列表行**没带已售标记** = 此刻被证实仍在售。
+            # 用时间量而不是页码哨兵：掉出深扫范围的车 last_verified 自然变旧、
+            # 标签随之出现 —— 自维护，不需要任何额外的清理动作（page_number 只留展示）。
+            # 已售车不写：它已不是在售，写进去会让标签永远不生效。
+            if car.get('sale_status') != '已售':
+                extra_fields['last_verified'] = today_beijing()
 
             # vehicle_id 优先取详情页「編號」；缺失时回退列表页 h_vid。
             # 不回退的话 importer 会因主键为空把整条记录静默丢掉（无日志无计数）。
@@ -1319,27 +1410,21 @@ def scrape_vehicle_type(vehicle_type, pages, csv_filename, start_page=1, db_impo
 
 
 def _rebuild_features_after_crawl(new_total: int, updated_total: int) -> None:
-    """爬完一类后重算 market_stats / vehicle_features（独立连接，失败不致命）。"""
-    t0 = time.time()
-    try:
-        import psycopg2
+    """爬完一类后重算 market_stats / vehicle_features（独立连接，失败不致命）。
 
-        from carinfo.search.features import main as rebuild_features
+    实际动作委托给 ``features.rebuild_default()`` —— 复核路径调的是同一个函数，
+    两处不再各写一套 try/except（曾经两处的成功判定还不一致）。
+    """
+    print(f'[特征重算] 本类新增 {new_total} / 更新 {updated_total}，开始重算派生表...')
+    try:
+        from carinfo.search.features import rebuild_default
     except Exception as e:  # noqa: BLE001
         logger.warning(f"特征表重算不可用（import 失败），跳过: {e}")
         return
 
-    print(f'[特征重算] 本类新增 {new_total} / 更新 {updated_total}，开始重算派生表...')
-    try:
-        # features.main() 自己读环境变量建连、自己打印，返回值 0 表示成功。
-        # 这里用 argparse 之外的直接调用：main() 的 --dry-run 开关默认关闭。
-        rc = rebuild_features(argv=[])
-        logger.info(f"特征表重算完成 rc={rc}，耗时 {time.time() - t0:.1f}s")
-        print(f'[特征重算] 完成，耗时 {time.time() - t0:.1f}s')
-    except SystemExit as e:  # main() 内部用 raise SystemExit 退出
-        logger.warning(f"特征表重算异常退出 code={e.code}，耗时 {time.time() - t0:.1f}s")
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"特征表重算失败（不影响本次爬取结果）: {e}")
+    ok, msg = rebuild_default()
+    (logger.info if ok else logger.warning)(f"特征重算：{msg}")
+    print(f'[特征重算] {msg}')
 
 
 def main():

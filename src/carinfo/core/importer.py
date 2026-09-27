@@ -326,6 +326,7 @@ def record_crawl_log(db_importer, stats: dict) -> bool:
     stats 键：vehicle_type_name / pages_scraped / total_vehicles / new_vehicles /
     updated_vehicles / error_count / proxy_used_count / proxy_fail_count /
     anti_crawler_triggered / crawl_duration / import_duration / status
+    可选键：error_details（复核路径用它落失败摘要；缺省 NULL）
     """
     if getattr(db_importer, 'connection', None) is None:
         print("[WARN] 无数据库连接，跳过爬取日志记录")
@@ -347,6 +348,7 @@ def record_crawl_log(db_importer, stats: dict) -> bool:
             crawl_duration=stats['crawl_duration'],
             import_duration=stats['import_duration'],
             status=stats.get('status', 'success'),
+            error_details=stats.get('error_details'),
         )
     except Exception as e:
         print(f"[WARN] 记录爬取日志失败: {e}")
@@ -621,6 +623,13 @@ class FastCSVImporter:
                         # 老车 + 兜底行：只更新列表页可靠的字段（价格/状态/页码/网址）。
                         # 详情专属字段（description/联系人/电话/extra_fields/车类）一律不动，
                         # 保住库里已有的优质数据。
+                        # 兜底行也必须记录「何时被证实仍在售」：列表页确实见到了它，
+                        # 不记的话 30 天后会被误标「久未核实」。只补新增键，
+                        # 详情字段一律不动（DB 侧 JSONB 合并，见 _update_list_only）。
+                        patch = {}
+                        if isinstance(extra_fields, dict) and extra_fields.get('last_verified'):
+                            patch['last_verified'] = extra_fields['last_verified']
+
                         list_only_updates.append((
                             vehicle_status,
                             int(row.get('page_number', 1)),
@@ -628,6 +637,7 @@ class FastCSVImporter:
                             row.get('price', ''),
                             current_price,
                             original_price,
+                            json.dumps(patch),
                             vehicle_id,
                         ))
                     else:
@@ -843,12 +853,17 @@ class FastCSVImporter:
         这里只更新「列表页确实有、且详情页不产出」的字段，详情字段原样保留。
 
         记录元组顺序：(vehicle_status, page_number, car_url, price,
-                      current_price, original_price, vehicle_id)
+                      current_price, original_price, extra_patch_json, vehicle_id)
+
+        extra_patch 只装**复核类新增键**（目前是 last_verified），用 DB 侧
+        `coalesce(extra_fields,'{}'::jsonb) || patch` 合并 —— 只增不改，
+        详情字段（list_date / LLM 提取字段）在此路径上依旧原样保留。
         """
         sql = """
         UPDATE vehicles SET
             vehicle_status = %s, page_number = %s, car_url = %s,
             price = %s, current_price = %s, original_price = %s,
+            extra_fields = coalesce(extra_fields, '{}'::jsonb) || %s::jsonb,
             updated_at = CURRENT_TIMESTAMP
         WHERE vehicle_id = %s
         """

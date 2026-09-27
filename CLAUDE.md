@@ -95,8 +95,30 @@ HTTP 请求 / 代理 / 反爬退避 / CSV 写出 / DB 导入等基础设施**当
 - `scrape_vehicle_type()` 函数：被调度器调用的入口，编排单类型车辆爬取（spider 实例跨页复用，反爬计数与动态延迟才能跨页累积）
 - `build_rows()`：vehicle_id 优先取详情页「編號」，缺失时回退列表页 `h_vid`（否则主键为空会被 importer 静默丢弃）
 - 列表页同时提取浏览数/留言数与结构化字段（`_parse_list_row`），详情页解析失败时用列表页字段兜底构造记录（`_build_fallback_car`，`extra_fields.list_only=true` 标记）
+- **列表行已带「已售」标记 → 不再请求详情页**（`_scrape_single_car` 里的短路，
+  走的就是 `_build_fallback_car`）。实证：全库 `status=2 & page_number>0` 的 9,128 台里
+  **9,126 台（99.98%）**的 `contact_info` 含「資料亦被保護中」—— 详情页只剩保护页，
+  一个字段都拿不到；而深扫 1200 页里 39.6% 的行是这种。省下约 1 万次详情请求
+  （深扫 16h → ~10h），且**不丢任何字段**（兜底路径本来就只写列表页字段）。
+  记录照旧入库（`vehicle_status=2`）—— 已售车的价格/浏览量仍是行情与历史样本。
+- `_list_meta(item)`：列表行的浏览/留言/卖家更新日。**`_build_fallback_car` 里也要挂
+  `_list`** —— 短路路径直接 return 该函数，漏了就会丢掉 `list_date`（卖家真实更新时间）。
 - 描述通用提取（写入 `extra_fields` jsonb）：hand_count 手数、mileage_km、license_until 牌費到期、import_type 行/水貨、china_plate、is_swap、view_count/comment_count
 - 爬取结果逐页经 `core.importer.import_rows()` 直接入库；不再有 `auto_import_to_database()` 这一中间步骤
+- `build_rows()` 为**列表页见到且未带已售标记**的车写 `extra_fields.last_verified = 今天`
+  （北京时间，`today_beijing()`）。这是「久未核实」标签的唯一数据来源 —— 用**时间量**而不是
+  页码哨兵：掉出深扫范围的车日期自然变旧、标签随之出现，自维护不需要额外清理动作。
+  已售车**不写**（它已不是在售，写了标签就永远不生效）。
+  ⚠️ `today_beijing` 是**从 `core.revalidator` import 的**（本文件不再自带一份）：
+  「今天」一旦有两个来源，`last_verified` 的写入日与标签的判定日就会错开一天。
+- `_install_root_handler_once()`：模块导入时给 root logger 装**北京时间格式**的 handler，
+  但**幂等**（root 已有 handler 就跳过）。无条件 `addHandler` 会踩「入口先
+  `logging.basicConfig()` 再 import 本模块」= 2 个 handler = **每条日志打两遍**（实测踩到）。
+  本文件的 marker 常量（`MSG_BUSY_MARKER` 等）在 `core/revalidator.py`，不在这里重复。
+- `fetch_detail_raw(h_vid)`：详情页**轻量取回**（单次请求，不重试、不 `mark_proxy_failed`、
+  不触发反爬冷却，返回 `(status_code, body)`）。与 `_make_request_with_retry` 的区别是**故意的**：
+  车源复核会把「已删」当正常结果（站点对删帖返回 HTTP 200 的 `msg_noid.php`，不是 404），
+  走重试路径等于一个删帖烧 4 次请求 + 4 次代理误拉黑。共用的是随机 UA/代理池/全局限速器。
 - 支持 5 种车辆类型：私家车(1)、客货车(2)、货车(3)、电单车(4)、经典车(5)
 - 使用 `curl_cffi` 模拟 Chrome TLS 指纹
 - 多编码自动检测（big5/utf-8/gbk/gb2312/latin1）
@@ -176,6 +198,48 @@ config.json: schedule.windows = [上午, 下午, 晚上]     ← 三个「候选
   连续失败链自动冷却兜底、断点续跑保证中断无损。日常间隔仍是 [2.0,3.0]。
 - **page_hook 签名已改为 `hook(page)`**（原无参）——与已知问题 10 的 FileLock touch 耦合，
   改一处要看另一处。
+
+#### 车源复核（2026-09-27 起，「久未核实」治理）
+
+深扫覆盖不到的车（实测占在售 **42%**，10,036/23,966）长期停在 `vehicle_status=1`，
+实际早已已售/下架 —— 搜索把它们当在售返回，**客户打电话白跑**。复核就是把这个洞补上。
+
+- **模式优先级**：未完成的深扫续跑 > 到期的新深扫 > **到期/首次的车源复核** > 日常。
+  复核排在深扫之后（深扫刷 1200 页 ≈ 顺带做了一轮大范围核实，先做它更划算），
+  排在日常之前（日常只刷新前排 30 页，复核是把**死车摘出去**，后者代价大得多）。
+- **候选查询天然幂等**：`vehicle_status=1 AND (last_verified 为空 或 距今 > 30 天)`，
+  按 `last_verified NULLS FIRST` 排序取一批。**没有进度文件** —— 已处理的被写成今天，
+  下一轮自动落在队尾，被中断/被 `batch_size` 截断都只是"下次接着跑"（深扫必须记
+  `last_page` 是因为页码会漂，这里不会）。
+- **必须持续 touch 锁**：一批 3000 台约 1 小时，不 touch 就会踩已知问题 10。
+- **默认关闭**（`scraping.revalidation.enabled`）：复核不是只读操作，它会把车
+  改成 `status=2/3` 移出检索，运维必须能一键停。
+- **写库一律走 DB 侧 JSONB 合并**（`extra_fields = coalesce(extra_fields,'{}'::jsonb) || patch`）
+  —— 只增不改，绝不丢 `list_date` / LLM 提取字段。**这也是不能复用 `import_rows` 的原因**
+  （那是全字段 UPDATE）。兜底行路径（`importer._update_list_only`）同样加了这一句，
+  否则兜底行永远不会被记录核实、30 天后被误标。
+- **三态判据不在这里重复** —— 唯一出处是 `core/revalidator.py` 的模块 docstring 与
+  `classify_detail()`。核心红线：**不许用子串「已售」判已售**（正常在售页也含一次
+  「已售」，用它判会**把活车大批误杀**，比不治理更糟）。判不出来的（无表格、网络失败、
+  5xx）一律 `UNKNOWN` → **不动**：宁可漏判，不可误删。
+- **30 天窗口是单点定义**：`revalidator.VERIFY_WINDOW_DAYS`。检索侧的标签与复核的候选
+  都用它 —— 两处各配一个值必然漂移（标签说久未核实、复核却不来查它），所以
+  `config.json` 里**刻意不提供** `window_days`。
+- **`_run_revalidation_job()` 返回的是状态字符串，不是计数** ——
+  `"success"` / `"aborted"` / `"error"`，调用方据此决定要不要写
+  `revalidation.last_completed`。**这是 P0 修正**：返回 `alive+sold+deleted` 时
+  「被反爬中止、一台没处理」与「正常跑完」在调用方眼里完全一样，中止也会被标成完成，
+  **下一轮要等满 `interval_days`（7 天）才重来** —— 而中止恰恰意味着还有一大批车没查。
+  `last_run_date`（"今天不再跑第二次"）与 `last_completed`（"这一轮复核完成了"）
+  是两件事，前者任何返回值都照写。
+- **每轮复核前跑一次判据漂移探针**（`probe_drift`，只读 6 个请求，只告警不中止、
+  也**不中止本轮** —— 见已知问题 24）。
+- **复核轮也写 `crawl_logs`**（`vehicle_type='复核'`、`pages_scraped=0`、
+  `updated_vehicles=实际落库行数`、`anti_crawler_triggered=中止则 1`）。
+  不写的话这批变更在审计链里**没有任何出处**，也会把「台/页」基线算歪。
+- **异常绝不能静默变成"跳过多了一点"**：写库失败单列 `write_failed`，
+  判定计数（alive/sold/deleted）与落库计数（wrote）**分开记**。
+  不分开的话「整轮一条都没写进去」的报告依然全绿（P0-2 就是靠这个藏住的）。
 
 #### 配置解析的三条硬约定
 
@@ -398,6 +462,12 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 两张**纯派生表**，随时可由 `vehicles` 重算。`ensure_tables()` 用 DROP + CREATE
 （不是 IF NOT EXISTS），改结构时才不会静默保留旧列。
 
+`vehicle_features` 另有三个**复核派生列**（2026-09-27 加）：`last_verified`（date）、
+`verify_age_days`（距今天数，NULL=从未核实）、`is_unverified`（>30 天或从未核实）。
+来源是 `vehicles.extra_fields->>'last_verified'`，判定用 `revalidator.VERIFY_WINDOW_DAYS`，
+与复核候选同口径。**只作标签**：不参与打分、不做过滤 —— 过滤会把上万台一次藏掉，
+用户连"要不要冒险看看"的选择权都没有。
+
 ```bash
 uv run python -m carinfo.search.features            # 重建并全量重算（约 5 秒）
 uv run python -m carinfo.search.features --dry-run  # 只算不写，打印分布
@@ -411,13 +481,17 @@ uv run python _migration/test_search.py      # 内核：过滤正确性 + 确定
 uv run python _migration/test_parse.py       # 解析：规则用例 + 「二手」泛指 + LLM 键归一/模糊量守卫(假模型注入) + 排量边界 + spec 脏值收敛 + 端到端
 uv run python _migration/test_serving.py     # 解释层/API/MCP + 鉴权三态(含真跑 HTTP) + 连接池并发/重试 + LLM 不占连接 + 扫描护栏 + /health 降级 + ILIKE 转义 + total_matched + 特征表原子重算
 uv run python _migration/test_importer.py    # 入库：FileLock.touch 原子续命 + list_only 兜底行不覆盖详情字段（写操作全回滚）
-uv run python _migration/test_schedule.py    # 调度：窗口解析/告警 + _pick_random_time 未来性(防忙循环) + 窗口命中分布 + 过期重排 + 重启不重跑
+uv run python _migration/test_schedule.py    # 调度：窗口解析/告警 + _pick_random_time 未来性(防忙循环) + 窗口命中分布 + 过期重排 + 重启不重跑 + 复核模式优先级/开关/缺省关闭 + **复核返回状态决定是否写 last_completed**
+uv run python _migration/test_revalidator.py # 复核：三态判据 + **反例(在售页含「已售」子串不许判已售)** + 判不出必 UNKNOWN + 执行器(dry-run/busy 中止) + **报告口径(判定 vs 落库分开)** + **写库器串行化/失败必 rollback** + **漂移探针(含"车状态变了不算漂移")** + **已售短路不请求详情** + **today_beijing 单点** + **日志不双打** + **rebuild_default 的 rc 口径**，离线不联网
 uv run python _migration/eval_search.py              # 门禁：规则 + LLM 两种模式**分别**判定
 uv run python _migration/eval_search.py --mode rules # 只验规则路径
 uv run python _migration/eval_search.py --mode llm   # 只验模型路径（缺 key 直接失败，不降级）
 ```
 
-> 改 `service.py` 的调度逻辑必跑 `test_schedule.py`（31 项断言，离线、不起服务、不碰数据库）。
+> 改 `service.py` 的调度逻辑必跑 `test_schedule.py`（76 项断言，离线、不起服务、不碰数据库）。
+> ⚠️ `test_serving.py` 偶发 `DeadlockDetected` —— 它**故意**用 4 线程并发搜索去打特征表换名
+> 窗口，与 `swap_tables` 存在锁序冲突（已知问题 22）。**重跑即可**，不是代码坏了；
+> 留下的 `*_new` 影子表下一次重算会自动清掉。
 > 它守的三条不变量见上文「service.py — 调度服务 / 调度语义」。
 
 ### 本轮审核修复的硬约定（2026-09-25）
@@ -657,6 +731,56 @@ python -m carinfo
     的 5 分钟词表缓存是**每进程**的，特征表重算后**多进程同时跑时互不感知**（单进程无碍；
     要跨进程失效得引入版本号或通知机制）；(b) 池大小是每进程的，`DB_POOL_SIZE × 进程数`
     必须留在服务端 `max_connections=100` 预算内 —— 加到第 4、5 个进程前先算一下。
+17. **⚠️ 部署顺序（2026-09-27 复核功能）：代码与特征表必须一起上线，不能只重启服务。**
+    `engine._SELECT` / `api._VEHICLE_SQL` 现在引用 `f.is_unverified` / `f.verify_age_days`。
+    `ensure_tables()` 是 `CREATE TABLE IF NOT EXISTS`，**不会给已有表加列** —— 只有
+    跑一次 `uv run python -m carinfo.search.features`（影子表 DROP+CREATE → 原子 swap）
+    才会带上新列。顺序：**先重算特征表，再让新代码对外服务**。反了就是搜索 500。
+    （重算本身对旧代码无害——旧代码只是不 SELECT 多出来的列，所以"先重算后发代码"是安全的。）
+18. **复核功能上线还差一步一次性回填**：`last_verified` 是新键，存量车一个都没有。
+    不回填的话检索会把**全部 25,779 台**标成「久未核实」（标签等于没信息量），
+    复核也会把全库当候选白跑 3 小时以上。跑法：
+    `uv run --env-file .env python _migration/backfill_last_verified.py`（先看分布）
+    → `--apply`。口径是 `updated_at` 的香港日期、**只回填 `page_number>0`** 的车
+    （page=0 的 stale 池故意不回填 —— 它们正是本轮治理要抓的对象）。幂等，可重复跑。
+19. **复核的已知边界**：`revalidation.vehicle_type` 默认 `1`（私家车），而
+    `vehicle_features` 的标签是对**全部**在售车算的。结果是 2-5 类（客货车/货车/电单车/
+    经典车，约 1,814 台）因为 `pages=0` **从来没被爬过**，会长期带着「久未核实」标签。
+    这是**如实**的（它们确实从没被核实过），不是 bug；哪天给这些类型开爬、或把
+    `vehicle_type` 放开，它们自然会被处理。
+20. **「已售」页面的真相与旧结论的更正**：站点对已售车**保留详情页**（聯絡人資料格显示
+    「由於已售，資料亦被保護中」），对**已删**帖返回 **HTTP 200** + `window.location=
+    'msg_noid.php'`（**不是 404**）。所以"404 = 删帖"这个直觉是错的，别照直觉写判据。
+    实证：`archive/test.html` 是**列表页**，`_extract_sale_status` 也只作用于列表行
+    （`car28.py:624`），详情页三态判定在 2026-09-27 之前是**全新代码、零本地证据**。
+21. **凡改 `vehicles` 的路径都必须重算派生表**（2026-09-27 修）：统一入口
+    **`features.rebuild_default() -> (ok, msg)`**（吞异常、独立建连、`rc==0` 才算成功）。
+    爬取路径从 `car28._rebuild_features_after_crawl` 调它，复核路径从
+    `service._rebuild_features` 调它。此前**只有爬取路径**挂了重算，而
+    `extract.py` 里写明了那是"全链路唯一一处触发点" —— 复核分支在它**之前** `return`，
+    于是复核改了上万台 `vehicle_status` 之后，`market_stats` 里还混着死车、
+    `is_unverified` 标签也停在旧值。**以后再加改动 `vehicles` 的路径，先来这里挂重算。**
+    触发条件是 `report.wrote > 0`（真写了才重算），位置在 `mark_completed` **之前**
+    （重算挂掉 → 完成标记不写 → 下次会重跑；复核幂等，重跑只是再扫一遍候选）。
+22. **⚠️ `swap_tables` 与并发搜索存在锁序死锁**（实测踩到一次，PG 杀掉其中一方后
+    双双回滚、**正式表完好**，属自愈但会打断那次重算）：切换要 `ACCESS EXCLUSIVE`
+    锁 `market_stats` 与 `vehicle_features`，而 `engine._SELECT` 在一个事务里同时读这两张表。
+    两个方向相反就成环。表现是 `_migration/test_serving.py` 偶发
+    `DeadlockDetected`（该脚本**故意**用 4 线程并发搜索去打这个换名窗口，所以它最敏感）。
+    **重跑即可**；失败那轮会在库里留下 `*_new` 影子表，下一次 `ensure_tables()` 开头的
+    `DROP ... IF EXISTS` 会自动清掉，无需手工处理。生产上的真实影响 = 那次重算白跑
+    （`rebuild_default` 返回 False 并打 WARNING），派生的旧表继续可读。
+23. **`revalidator` 的 CLI 必须自己加载 `.env`**：本模块顶层刻意只依赖 stdlib
+    （好让 `features.py` 安全 import `VERIFY_WINDOW_DAYS`），所以它**不会**像
+    `core/proxy.py` 那样在 import 时顺手读 `.env`。`_load_db_conn()` 里那句
+    `load_dotenv_once()` 不能删 —— 删了 CLI 会拿 `localhost:5432` 去连，而且在
+    import 全部成功之后才炸 `Connection refused`，极易被误判成"数据库挂了"。
+24. **判据漂移探针（`revalidator.probe_drift`）只告警，不中止、不写库**：
+    拿库里的已知状态当预期答案抽查线上页面（3 台在售 + 3 台已售）。
+    判定漂移**只认**三种「页面取到了但标记对不上」的情形（见 `_drift_reason`），
+    「期望在售 → 实得已售/已删」这类**车本身状态变了的不算** —— 否则探针会天天
+    误报、几天后就被无视。刻意**不做字节哈希/指纹文件**：只对语义，站点改个无关
+    日期文案不会误报，也没有基线过期的运维负担。CLI 用 `--probe` 单独跑。
 ## 加新站点的步骤
 
 > ⚠️ 目前 `BaseSpider` 的 4 个抽象方法实际未被调度流程调用（见已知问题 2）。真正接入第二站时，需要先把 `scrape_vehicle_type` 改造成通用流程，否则光实现 4 个方法跑不起来。

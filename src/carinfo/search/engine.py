@@ -189,6 +189,12 @@ class ScoredVehicle:
     #: dealer_listings = 该卖家在售台数，供调用方自行再判。
     is_dealer: bool = False
     dealer_listings: int | None = None
+    #: 「久未核实」：>30 天没被任何一次爬取/复核证实仍在售（含从未核实过）。
+    #: **仅作标签**：不参与打分、不影响排序、不会被过滤 —— 车还在结果里，
+    #: 调用方（前端/Agent）自己决定要不要提示用户"先电话确认"。
+    is_unverified: bool = False
+    #: 距上次核实的天数（None = 从未核实过，与 is_unverified 互为补充）
+    verify_age_days: int | None = None
     #: 描述提取的新字段(展示用;license_until 是原文片段如「26年12月」,
     #: 牌費在香港是真金白银——剩余牌費可退,买家高度关心)
     license_until: str | None = None
@@ -247,6 +253,8 @@ class ScoredVehicle:
             "is_anomaly": self.is_anomaly,
             "is_dealer": self.is_dealer,
             "dealer_listings": self.dealer_listings,
+            "is_unverified": self.is_unverified,
+            "verify_age_days": self.verify_age_days,
             "license_until": self.license_until,
             "china_plate": self.china_plate,
             "is_swap": self.is_swap,
@@ -276,6 +284,7 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
        f.base_model, f.brand_norm, f.price_ratio, f.market_median, f.market_p25,
        f.market_p75, f.market_level, f.market_ref_n, f.age_days, f.condition_score,
        f.has_condition, f.heat_score, f.is_anomaly, f.dealer_listings, f.is_dealer,
+       f.verify_age_days, f.is_unverified,
        COUNT(*) OVER () AS _total_matched
 FROM vehicles v
 JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
@@ -585,7 +594,8 @@ def search(conn, spec: SearchSpec) -> SearchResult:
             vid, car_model, car_brand, year, price, car_url, seats, engine_volume, extra,
             contact_name, phone_number, contact_email,
             base_model, brand_norm, ratio, med, p25, p75, level, ref_n, age_days, cond,
-            has_cond, heat, is_anomaly, dealer_listings, is_dealer, _total,
+            has_cond, heat, is_anomaly, dealer_listings, is_dealer,
+            verify_age_days, is_unverified, _total,
         ) = row
         ef = extra if isinstance(extra, dict) else {}
         # year/price 提前解析：near 维度要按原始数值算偏差，不能再从字符串现取
@@ -630,6 +640,8 @@ def search(conn, spec: SearchSpec) -> SearchResult:
                 is_anomaly=bool(is_anomaly),
                 is_dealer=bool(is_dealer),
                 dealer_listings=int(dealer_listings) if dealer_listings is not None else None,
+                is_unverified=bool(is_unverified),
+                verify_age_days=int(verify_age_days) if verify_age_days is not None else None,
                 license_until=(ef.get("license_until") or None) if isinstance(ef.get("license_until"), str) else None,
                 china_plate=bool(ef.get("china_plate")),
                 is_swap=bool(ef.get("is_swap")),

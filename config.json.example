@@ -21,6 +21,16 @@
       "fail_streak_threshold": 10,
       "cooldown_minutes": [15, 30, 60]
     },
+    "revalidation": {
+      "_window_note": "「多久算久未核实」不在这里配 —— 它必须与检索侧标签同源，单点定义在 revalidator.VERIFY_WINDOW_DAYS(30)。这里配会两边漂移。",
+      "_comment": "车源复核：按 h_vid 复查「久未核实」的在售车，判「仍在售/已售/已删」并落库，把死车从检索里摘掉。整段可选，缺省 enabled=false。调度优先级：深扫续跑 > 到期深扫 > 到期复核 > 日常。",
+      "enabled": true,
+      "interval_days": 7,
+      "batch_size": 3000,
+      "concurrency": 4,
+      "vehicle_type": 1,
+      "request_interval": [1.0, 1.5]
+    },
     "vehicle_types": {
       "1": {"name": "私家车", "pages": 30},
       "2": {"name": "客货车", "pages": 0},
