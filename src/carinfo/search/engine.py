@@ -689,15 +689,33 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     - 模型偶发输出残缺关键词（'保姆车'/'LM'）：keyword 0 命中直接空手而归。
 
     放宽顺序（每一步必须留下说明，宁可明说查不到，不许静默顶包）：
-    1. 去掉 model_keyword 重查（keyword 撞 0 最常见，且往往是模型抖动产物）；
-    2. 精确年份（min==max）→ ±3 年重查；
-    3. 都不行 → 原样返回 0 结果（summary 会如实说没有）。
+    1. 车型关键词 + 精确年份同时在 → **保车型、年份 ±3 重查**：车型是用户的
+      身份诉求，年份才是该放宽的那头（2026-09-28 线上事故：库内 7 系
+      16/17 年换代空窗，「17年的宝马740」首查 0 命中，旧版先丢关键词，
+      返回 175 台 2017 年宝马，X1 顶到了 740 的位置）；
+    2. 去掉 model_keyword 重查（keyword 单独撞 0 时往往是模型抖动产物，
+      如 '保姆车'/'LM'；此步只在步骤 1 不适用或放宽年份也没救回来时生效）；
+    3. 精确年份（min==max）→ ±3 年重查（此时保剩余条件）；
+    4. 都不行 → 原样返回 0 结果（summary 会如实说没有）。
     """
     result = search(conn, spec)
     if result.total_matched > 0:
         return result, []
 
     fb_notes: list[str] = []
+    exact_year = (spec.year_min
+                  if spec.year_min is not None and spec.year_min == spec.year_max
+                  else None)
+
+    # 步骤 1：保车型关键词，放宽年份
+    if spec.model_keyword and exact_year is not None:
+        r1 = search(conn, replace(spec, year_min=exact_year - 3,
+                                  year_max=exact_year + 3))
+        if r1.total_matched > 0:
+            fb_notes.append(f"**没有 {exact_year} 年的「{spec.model_keyword}」**"
+                            f"（该车型/条件下），以下为年份最接近的结果（±3 年内）")
+            return r1, fb_notes
+
     if spec.model_keyword:
         r2 = search(conn, replace(spec, model_keyword=None))
         if r2.total_matched > 0:
@@ -705,11 +723,14 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
                             f"已忽略它重新检索（该关键词可能是解析噪声）")
             return r2, fb_notes
 
-    if spec.year_min is not None and spec.year_min == spec.year_max:
-        r3 = search(conn, replace(spec, year_min=spec.year_min - 3,
-                                  year_max=spec.year_max + 3))
+    if exact_year is not None:
+        # 到这里说明关键词已证实是噪声（或本来就没有），放宽时一并去掉，
+        # 避免「噪声关键词 + 放宽年份」双重放水
+        r3 = search(conn, replace(spec, model_keyword=None,
+                                  year_min=exact_year - 3,
+                                  year_max=exact_year + 3))
         if r3.total_matched > 0:
-            fb_notes.append(f"**没有 {spec.year_min} 年的车**（该车型/条件下），"
+            fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
                             f"以下为年份最接近的结果（±3 年内）")
             return r3, fb_notes
 
