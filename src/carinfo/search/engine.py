@@ -680,6 +680,105 @@ def search(conn, spec: SearchSpec) -> SearchResult:
     )
 
 
+def _is_identity_code(kw: str | None) -> bool:
+    """ASCII 字母数字码（**且至少含一个字母**）= 车型身份，放宽阶梯里永不丢弃。
+
+    道理：车型要么查到、要么明说没有，宽松度只花在年份/价格这些数值条件上
+    （「身份永不顶包」）。实测「17年的宝马M760」首查 0（库里没有 M760）后，
+    旧逻辑走步骤 2 丢掉关键词，返回 175 台 2017 年宝马，X1 顶到了 M760 的位置。
+
+    为什么要含字母：纯数字码（30/50/760）与预算/年份数字无法区分 —— 实测关键词
+    '30' 模糊匹配 767 台、'50' 1638 台，放行等于放弃身份约束。Z8/M8/X1/M760
+    这类真实型号码都含字母；740 这种纯数字型号走不到这里（`resolve_model_target`
+    会先在 ctx.models 里等值命中）。
+    """
+    if not kw:
+        return False
+    s = kw.strip()
+    return bool(s) and s.isascii() and s.isalnum() and any(c.isalpha() for c in s)
+
+
+def _money(x: float | None) -> str:
+    """香港习惯金额写法（提示文案用）。与 `explain.fmt_money` 同口径 —— engine 不能
+    反向依赖 explain，故此处保留一份最小实现。"""
+    if x is None:
+        return "—"
+    return f"HK${x / 10_000:.1f} 萬" if x >= 10_000 else f"HK${x:,.0f}"
+
+
+def _fmt_year_ranges(years: list[int]) -> str:
+    """把分散的年份压成连续区间： [2010,2011,2012,2018] → '2010-2012、2018'。"""
+    ys = sorted(set(years))
+    if not ys:
+        return ""
+    spans: list[tuple[int, int]] = []
+    lo = hi = ys[0]
+    for y in ys[1:]:
+        if y == hi + 1:
+            hi = y
+        else:
+            spans.append((lo, hi))
+            lo = hi = y
+    spans.append((lo, hi))
+    return "、".join(f"{a}-{b}" if a != b else f"{a}" for a, b in spans)
+
+
+def _target_hint(conn, spec: SearchSpec, identity_kw: str | None) -> tuple[list[int], float | None]:
+    """诚实 0 时探「库里到底有什么」：身份条件命中的 (年份列表, 最便宜价)。
+
+    **只按身份算**（identity_kw 的 car_model 模糊 / base_model / 品牌），忽略用户的
+    价格/年份等数值条件 —— 否则再算一遍还是 0。可见性条件必须与 `_SELECT` 对齐
+    （在售、有价、有联系方式、vehicle_type、默认排除异常车），否则诚实 0 的提示
+    会报出实际搜不到的车 —— 那就不是诚实了。
+    """
+    where = [
+        "v.vehicle_status = 1",
+        "v.current_price IS NOT NULL AND v.current_price > 0",
+        (
+            "(length(btrim(coalesce(v.phone_number, ''))) > 0"
+            " OR length(btrim(coalesce(v.contact_email, ''))) > 0)"
+        ),
+    ]
+    params: list[Any] = []
+    if spec.vehicle_type is not None:
+        where.append("v.vehicle_type = %s")
+        params.append(spec.vehicle_type)
+    if spec.exclude_anomaly:
+        where.append("f.is_anomaly = FALSE")
+    if identity_kw:
+        where.append("v.car_model ILIKE %s ESCAPE '\\'")
+        params.append(f"%{_like_escape(identity_kw)}%")
+    elif spec.base_models:
+        where.append("f.base_model = ANY(%s)")
+        params.append(list(spec.base_models))
+    elif spec.brand:
+        where.append("f.brand_norm = %s")
+        params.append(spec.brand)
+    else:
+        return [], None
+
+    base = ("FROM vehicles v JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id "
+            "WHERE " + " AND ".join(where))
+    cur = conn.cursor()
+    cur.execute(f"SELECT DISTINCT v.year {base} AND char_length(v.year) = 4 ORDER BY v.year",
+                params)
+    years = [int(r[0]) for r in cur.fetchall() if r[0] and str(r[0]).isdigit()]
+    cur.execute(f"SELECT min(v.current_price) {base}", params)
+    row = cur.fetchone()
+    cur.close()
+    return years, (float(row[0]) if row and row[0] is not None else None)
+
+
+def _target_hint_safe(conn, spec: SearchSpec,
+                      identity_kw: str | None) -> tuple[list[int], float | None]:
+    """`_target_hint` 的容错包装。提示是**锦上添花**，绝不能因为它出错就把一个
+    本来正常返回 0 的查询变成 500（服务可用性优先于文案）。"""
+    try:
+        return _target_hint(conn, spec, identity_kw)
+    except Exception:  # noqa: BLE001 —— 任何失败都退回「无提示」，主流程照常返回 0
+        return [], None
+
+
 def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str]]:
     """检索 + 零结果时的逐级放宽重查（P2/P3 的兜底，API 与 MCP 共用）。
 
@@ -696,7 +795,9 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     2. 去掉 model_keyword 重查（keyword 单独撞 0 时往往是模型抖动产物，
       如 '保姆车'/'LM'；此步只在步骤 1 不适用或放宽年份也没救回来时生效）；
     3. 精确年份（min==max）→ ±3 年重查（此时保剩余条件）；
-    4. 都不行 → 原样返回 0 结果（summary 会如实说没有）。
+    4. 都不行 → 原样返回 0 结果，并补一句「库里到底有什么」的**数字**
+       （`_target_hint`：有车型给年份段/最低价，只有品牌给品牌最低价），
+       让用户能据此改口，而不是干说"建议放宽预算或年份"。
     """
     result = search(conn, spec)
     if result.total_matched > 0:
@@ -706,6 +807,8 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     exact_year = (spec.year_min
                   if spec.year_min is not None and spec.year_min == spec.year_max
                   else None)
+    #: 身份码关键词：放宽阶梯里绝不丢弃（见 docstring 与 `_is_identity_code`）
+    identity_kw = spec.model_keyword if _is_identity_code(spec.model_keyword) else None
 
     # 步骤 1：保车型关键词，放宽年份
     if spec.model_keyword and exact_year is not None:
@@ -716,14 +819,15 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
                             f"（该车型/条件下），以下为年份最接近的结果（±3 年内）")
             return r1, fb_notes
 
-    if spec.model_keyword:
+    # 步骤 2：只允许丢**噪声**关键词；身份码跳过（丢了就是顶包）
+    if spec.model_keyword and identity_kw is None:
         r2 = search(conn, replace(spec, model_keyword=None))
         if r2.total_matched > 0:
             fb_notes.append(f"关键词「{spec.model_keyword}」没有命中任何车，"
                             f"已忽略它重新检索（该关键词可能是解析噪声）")
             return r2, fb_notes
 
-    if exact_year is not None:
+    if exact_year is not None and identity_kw is None:
         # 到这里说明关键词已证实是噪声（或本来就没有），放宽时一并去掉，
         # 避免「噪声关键词 + 放宽年份」双重放水
         r3 = search(conn, replace(spec, model_keyword=None,
@@ -733,6 +837,35 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
             fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
                             f"以下为年份最接近的结果（±3 年内）")
             return r3, fb_notes
+
+    # 走到这里说明没有可放宽的数值条件（或关键词是身份码，不许丢）→ 诚实 0。
+    # 补一句「库里到底有什么」的**数字**：只按身份算、忽略数值条件，让用户能改口。
+    # 放在 engine 层：conn 在手，API / MCP / /search/spec 三条路径一次覆盖，
+    # 也不必给纯函数 explain 传连接。
+    if identity_kw is not None:
+        years, cheap = _target_hint_safe(conn, spec, identity_kw)
+        if years:
+            fb_notes.append(
+                f"「{identity_kw}」库里有 {_fmt_year_ranges(years)} 年的车"
+                + (f"，最便宜约 {_money(cheap)}" if cheap is not None else "")
+                + "；但没有符合你其余条件的，未用其它车型顶替")
+        else:
+            # 型号确实不在库 → 退一步给同品牌最低价，好歹给个可改口的数字
+            _, brand_cheap = _target_hint_safe(conn, spec, None) if spec.brand else ([], None)
+            extra = f"；库里最便宜的{spec.brand}约 {_money(brand_cheap)}" if brand_cheap else ""
+            fb_notes.append(f"库里没有「{identity_kw}」这款车源{extra}")
+    elif spec.base_models:
+        label = spec.base_model or spec.base_models[0]
+        years, cheap = _target_hint_safe(conn, spec, None)
+        if years:
+            fb_notes.append(
+                f"「{label}」库里有 {_fmt_year_ranges(years)} 年的车"
+                + (f"，最便宜约 {_money(cheap)}" if cheap is not None else "")
+                + "；但没有符合你其余条件的")
+    elif spec.brand:
+        _, cheap = _target_hint_safe(conn, spec, None)
+        if cheap is not None:
+            fb_notes.append(f"库里最便宜的{spec.brand}约 {_money(cheap)}")
 
     return result, fb_notes
 

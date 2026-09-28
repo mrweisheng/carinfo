@@ -218,7 +218,11 @@ def summarize(result: SearchResult) -> str:
     target = spec.base_model or spec.brand or spec.model_keyword or "全部车型"
     n = len(result.items)
     if not result.items:
-        return f"库里没有符合「{target}」条件的车。建议放宽预算或年份。"
+        # 诚实 0 必须优先点名**用户说的型号**：`target` 在 model_keyword='M760' +
+        # brand='BMW' 时取到的是 brand，会拼出「没有符合 BMW 条件的车」—— 而库里
+        # 有 1959 台宝马，用户问的是 M760，直接误导。
+        who = spec.model_keyword or target
+        return f"库里没有符合「{who}」条件的车。建议放宽预算或年份。"
 
     cheapest = min(
         (x for x in result.items if x.price is not None), key=lambda x: x.price, default=None

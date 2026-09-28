@@ -446,6 +446,7 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
     if keyword is not None:
         kw = str(keyword).strip()
         truncated = False
+        is_full_token = False
         if re.fullmatch(r"[A-Za-z0-9]+", kw):
             # token 集合 = 原文分词 + **空格相连的 ASCII 段组压平**（'LM 350'
             # 分词是 'LM'/'350' 两截，'350' 与第二截相等不算截断，压平成
@@ -457,11 +458,19 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
                 flat = re.sub(r"\s+", "", grp)
                 if flat not in tokens:
                     tokens.append(flat)
+            # 完整 token 判定必须是**精确相等**（list 的 in 是相等比较，不是子串）：
+            # 写成子串会把「530」的片段「30」也当完整词放行（实测 '%30%' 命中 767 台）。
+            is_full_token = kw.upper() in tokens
             for token in tokens:
                 if kw.upper() in token and len(kw) < len(token) * 2 / 3:
                     truncated = True
                     break
-        if len(kw) < 3 or truncated:
+        # 丢弃条件（2026-09-28 收紧）：长度 <3 的一律不信任，**除非**它既是原文的
+        # 完整 token、又至少含一个字母。Z8/M8/X1 这类真实两字符型号据此放行；
+        # 纯数字 token（「30萬」的 30）与截断片段（LM350 的 LM）照旧丢弃 ——
+        # 前者模糊匹配实测命中 767 台、后者会卷进其它型号。
+        too_short = len(kw) < 3 and not (is_full_token and any(c.isalpha() for c in kw))
+        if too_short or truncated:
             notes.append(f"模型给出的关键词 {kw!r} 疑似残缺（过短或截断），已丢弃")
             keyword = None
             try:
