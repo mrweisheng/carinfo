@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,7 +72,9 @@ model_keyword   型号拿不准或用户说了具体子型号（如 "730"、"2.0
 displacement    排量字符串，如 "3.5"
 year_min        年份下限，整数
 year_max        年份上限，整数
-year_near       年份**模糊锚点**（"2015年左右"）→ 2015。只影响排序，不是筛选
+year_near       年份**模糊锚点**（"2015年左右"）→ 2015。只影响排序，不是筛选。
+                ⚠️ 用户说**裸年份**（"17年的Model 3"/"2015年威尔法"，没有"左右"）
+                = 精确要求 → year_min 与 year_max **都填该年**。"左右/大约"才用 year_near
 price_min       价格下限，港币整数
 price_max       价格上限，港币整数
 price_near      价格**模糊锚点**（"五十万左右"）→ 500000。只影响排序，不是筛选
@@ -352,7 +355,12 @@ def parse_query(
 
     if llm is not None and llm.configured:
         try:
-            raw_llm = llm.chat_json(SYSTEM_PROMPT, f"用户查询：{query}\n{SOFT_HINT}")
+            # 解析用 parse_temperature（默认 0.0，config.llm 可调；实测 temp=0.2
+            # 时 5/12 次把 LM350 截成 'LM'）。兼容注入式假模型（测试桩无 cfg
+            # 属性、签名可能不带 temperature）—— 没有	cfg 就不传该参数。
+            _cfg = getattr(llm, "cfg", None)
+            _tkw = {"temperature": _cfg.parse_temperature} if _cfg is not None else {}
+            raw_llm = llm.chat_json(SYSTEM_PROMPT, f"用户查询：{query}\n{SOFT_HINT}", **_tkw)
             # 批量协议：{"queries": [组1, 组2...]}；兼容旧单对象格式（裸 dict）。
             raw_groups = raw_llm.get("queries") if isinstance(raw_llm, dict) else None
             if not (isinstance(raw_groups, list) and raw_groups
@@ -404,17 +412,65 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
     if not data:
         return None
 
+    # 车型定位：模型可能同时给 base_model（可能被截断，如 'LM'）和
+    # model_keyword（可能是完整型号 'LM350'）。**两个都试**，base_model 归一
+    # miss 时再拿 keyword 去归一 —— 只取第一个会把正确的那个丢掉
+    # （2026-09-27 审核实测：脏 base_model='LM' + 对 keyword='LM350' 的组合）。
+    bm_raw, kw_raw = data.get("base_model"), data.get("model_keyword")
     base_model, brand, keyword, displacement = resolve_model_target(
-        data.get("base_model") or data.get("model_keyword"),
-        data.get("brand"),
-        ctx,
-    )
+        bm_raw or kw_raw, data.get("brand"), ctx)
+    if bm_raw and kw_raw and base_model is None:
+        base_model, brand2, keyword, displacement = resolve_model_target(
+            kw_raw, data.get("brand") or brand, ctx)
+        if base_model:
+            brand = brand or brand2
+            kw_raw = None
+            notes.append(f"模型给的车型 {bm_raw!r} 在库里找不到，已用关键词 "
+                         f"{data['model_keyword']!r} 识别出车系 {base_model!r}")
     if data.get("model_keyword") and base_model:
         # 模型给了关键词但也解析出了车系 → 以车系为准，关键词丢弃
         keyword = None
     if data.get("base_model") and base_model is None and not keyword:
         notes.append(f"模型给的车型 {data['base_model']!r} 在库里找不到，已退化为模糊匹配")
         keyword = str(data["base_model"])
+
+    # ── 短关键词/截断关键词防呆（P3）───────────────────────────────────
+    # 模型偶发把 'LM350' 截成 'LM'（temp=0.2 实测 5/12 次；temp=0 后仍有
+    # 1/20 次截成 '350'）。'%LM%' / '%350%' 模糊匹配会把 LM500 / IS350 等
+    # 其它车型卷进来 —— 型号污染，比查不到更糟。两类残缺一律不信任：
+    #   ① 长度 < 3；
+    #   ② 截断检测：keyword 是原文里某个更长型号词的**不到 2/3** 的片段
+    #      （'350' vs 'LM350'：3 < 5×2/3≈3.3 → 残缺）。完整出现的不拦
+    #      （'730' 在原文就是 730）。
+    # 丢弃后用规则层从原文重新抓车型补救（门控已放开，有品牌也能扫键）。
+    if keyword is not None:
+        kw = str(keyword).strip()
+        truncated = False
+        if re.fullmatch(r"[A-Za-z0-9]+", kw):
+            # token 集合 = 原文分词 + **空格相连的 ASCII 段组压平**（'LM 350'
+            # 分词是 'LM'/'350' 两截，'350' 与第二截相等不算截断，压平成
+            # 'LM350' 才暴露它是残缺片段）。只压平 ASCII 段组：整句压平会把
+            # 中文带进来（'宝马730' 压平后 '730' 成了它的"片段"，把完整的
+            # 730 误判成截断 —— 实测教训）。
+            tokens = re.findall(r"[A-Z0-9]+", query.upper())
+            for grp in re.findall(r"[A-Z0-9]+(?:\s+[A-Z0-9]+)*", query.upper()):
+                flat = re.sub(r"\s+", "", grp)
+                if flat not in tokens:
+                    tokens.append(flat)
+            for token in tokens:
+                if kw.upper() in token and len(kw) < len(token) * 2 / 3:
+                    truncated = True
+                    break
+        if len(kw) < 3 or truncated:
+            notes.append(f"模型给出的关键词 {kw!r} 疑似残缺（过短或截断），已丢弃")
+            keyword = None
+            try:
+                rescue = rule_based_parse(query, ctx)
+                if rescue.base_model:
+                    base_model = rescue.base_model
+                    notes.append(f"已按规则从原文重新识别出车型 {rescue.base_model!r}")
+            except Exception:   # noqa: BLE001 —— 补救失败不影响主流程（最多查宽）
+                pass
 
     # 模糊量守卫：原文说"左右"时，不许让区间溜进来，也不许让偏好丢掉。
     # 以**原文**为准而不是模型 —— 模型把"五十万左右"写成 price_max=500000 的话，
@@ -449,6 +505,10 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
         # 统一交给 SearchSpec.__post_init__ 收敛：转不了退回 DEFAULT_LIMIT。
         "limit": data.get("limit") if data.get("limit") is not None else DEFAULT_LIMIT,
     }
+    # 同款变体展开（P1）：LM350 → [LM350, LM350H]。映射在 SearchContext 里
+    # 预计算（构建规则见 context.build_variant_map 的 docstring）。
+    if base_model:
+        payload["base_models"] = [base_model] + ctx.variant_map.get(base_model, [])
     # family 透传（spec.__post_init__ 做白名单收敛）。base_model 命中时不用 family：
     # 精确车系与家族前缀同时 AND 会出现「ALPHARD 且以 7 开头」的空集
     if data.get("family") and not base_model:
@@ -621,16 +681,25 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
     # --- 车型：再扫库内真实车系键（用户直接打英文名，或库里长尾车系）---
     # 边界用 (?<![A-Z0-9])…(?![A-Z0-9]) 而不是 \b：\b 在「ALPHARD車」这种
     # 中英混排里失效（「車」在 Python 眼里也是 word character）。
-    if not payload.get("base_model") and not payload.get("brand"):
+    # 2026-09-27 放开门控（原来要求「无品牌」才扫）：「雷克萨斯LM350」会先命中
+    # 品牌 LEXUS，导致 LM350 永远识别不出 —— P3 的规则补救依赖这一步能扫到车型
+    # （键名字面匹配，品牌在场不会引入误命中：键不在原文就不会中）。
+    if not payload.get("base_model"):
+        # 双口径匹配：原文边界匹配 + **压平匹配**（去空格/连字符后比，与
+        # vocab.match_compact 同口径）——「LM 350」这种带空格写法原文匹配
+        # 必然落空，LLM 降级时车型条件会静默消失（2026-09-27 审核实锤）
+        up_compact = re.sub(r"[\s\-]+", "", up)
         for model in sorted(ctx.models, key=len, reverse=True):
             if len(model) < 3 or not any(c.isalpha() for c in model):
                 continue  # 跳过 '3.5' / '5.5' / '2015' 这类从脏数据兜出来的数字键
-            if re.search(rf"(?<![A-Z0-9]){re.escape(model)}(?![A-Z0-9])", up):
+            if (re.search(rf"(?<![A-Z0-9]){re.escape(model)}(?![A-Z0-9])", up)
+                    or re.search(rf"(?<![A-Z0-9]){re.escape(model.replace(' ', ''))}(?![A-Z0-9])",
+                                 up_compact)):
                 payload["base_model"] = model
                 break
 
     # --- 纯数字车系（911 / 718 / 458）只认「整句就是它」，避免「300萬以內」误命中 ---
-    if not payload.get("base_model") and not payload.get("brand"):
+    if not payload.get("base_model"):
         stripped = up.strip()
         if stripped in ctx.models:
             payload["base_model"] = stripped
@@ -661,8 +730,18 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
     # --- 年份 ---
     # 同样不能用 \b：「2015年」里「年」是 word character，\b 在数字后不成立，
     # 会导致年份一个字都抽不出来。改用数字边界断言。
-    for m in _YEAR_RE.finditer(query):
-        y, pos = int(m.group(1)), m.start()
+    # 两位年份（"17年"）单独补一张正则（+2000 归一）：口语里说 17 年就是 2017 年，
+    # _YEAR_RE 只认四位会把它整个漏掉（LLM 不可用的降级路径下裸年份全丢）。
+    year_hits: list[tuple[int, int, int]] = [(int(m.group(1)), m.start(), len(m.group(1)))
+                                             for m in _YEAR_RE.finditer(query)]
+    for m in re.finditer(r"(?<!\d)(\d{2})(?=年)(?!\d)", query):
+        y2 = int(m.group(1)) + 2000
+        # 未来年不收（「車齡30年」→ 2030 不是年份诉求）；两位年份天然只到 99，
+        # 这里再按当前年截一次，避免「30年」这类车龄/数量词被锁成未来年份
+        if 2000 <= y2 <= datetime.now().year:
+            # 记原文长度 2（不是归一后 2017 的 4）：裸年份判定要拿它索引原文
+            year_hits.append((y2, m.start(), 2))
+    for y, pos, raw_len in sorted(year_hits, key=lambda t: t[1]):
         around = _window(query, pos)
         if any(w in around for w in _MIN_WORDS):
             payload["year_min"] = max(payload.get("year_min", y), y)
@@ -670,6 +749,13 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             payload["year_max"] = min(payload.get("year_max", y), y)
         elif any(w in around for w in _AROUND_WORDS):
             payload.setdefault("year_near", y)   # "2015年左右" → 软锚点，不是 year_min
+        elif query[pos + raw_len:pos + raw_len + 1] == "年":
+            # 裸年份（"17年的X"/"2015年威尔法"，数字后紧跟「年」且无左右/边界词）
+            # = 精确要求（2026-09-27 定稿：「找17年的Model 3」曾被静默当成
+            # "2017左右"参与排序，返回 19/20/21 年的车且不说明）。
+            # 只认带「年」字的：裸数字（"编号2015"）不锁。
+            payload["year_min"] = y
+            payload["year_max"] = y
 
     # --- 座位数 ---（"七座"与"七人车"同义：粤语口语常说 N 人车）
     seat = re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*[座坐]", query) \
@@ -765,5 +851,10 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         payload["max_price_ratio"] = 0.8
     elif "性价比" in query or "性價比" in query:
         payload["max_price_ratio"] = 0.9
+
+    # --- 同款变体展开（与 LLM 路径同一份映射，P1）---
+    if payload.get("base_model"):
+        payload["base_models"] = [payload["base_model"]] + ctx.variant_map.get(
+            payload["base_model"], [])
 
     return SearchSpec.from_dict(payload)

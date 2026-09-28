@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 class ScanTooWide(RuntimeError):
@@ -328,8 +328,16 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
     params: list[Any] = []
 
     if spec.base_model:
-        sql += " AND f.base_model = %s"
-        params.append(spec.base_model)
+        # 同款变体集合（P1，2026-09-27）：LM350 → [LM350, LM350H]。
+        # spec.__post_init__ 保证 base_models 非空时含 base_model 本身；
+        # 这里以列表为准（单点），等值匹配变 ANY。
+        keys = list(spec.base_models) or [spec.base_model]
+        if len(keys) == 1:
+            sql += " AND f.base_model = %s"
+            params.append(keys[0])
+        else:
+            sql += " AND f.base_model = ANY(%s)"
+            params.append(keys)
     if spec.brand:
         sql += " AND f.brand_norm = %s"
         params.append(spec.brand)
@@ -670,6 +678,42 @@ def search(conn, spec: SearchSpec) -> SearchResult:
         spec=spec, items=items, total_matched=total_matched, scanned=scanned,
         elapsed_ms=elapsed, notes=notes,
     )
+
+
+def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str]]:
+    """检索 + 零结果时的逐级放宽重查（P2/P3 的兜底，API 与 MCP 共用）。
+
+    背景（2026-09-27 两个线上案例）：
+    - 「找17年的特斯拉 Model 3」：库内该车型 2019 年起 —— 精确年份 0 命中，
+      旧逻辑静默把年份当软偏好，返回 19/20/21 年的车且只字不提；
+    - 模型偶发输出残缺关键词（'保姆车'/'LM'）：keyword 0 命中直接空手而归。
+
+    放宽顺序（每一步必须留下说明，宁可明说查不到，不许静默顶包）：
+    1. 去掉 model_keyword 重查（keyword 撞 0 最常见，且往往是模型抖动产物）；
+    2. 精确年份（min==max）→ ±3 年重查；
+    3. 都不行 → 原样返回 0 结果（summary 会如实说没有）。
+    """
+    result = search(conn, spec)
+    if result.total_matched > 0:
+        return result, []
+
+    fb_notes: list[str] = []
+    if spec.model_keyword:
+        r2 = search(conn, replace(spec, model_keyword=None))
+        if r2.total_matched > 0:
+            fb_notes.append(f"关键词「{spec.model_keyword}」没有命中任何车，"
+                            f"已忽略它重新检索（该关键词可能是解析噪声）")
+            return r2, fb_notes
+
+    if spec.year_min is not None and spec.year_min == spec.year_max:
+        r3 = search(conn, replace(spec, year_min=spec.year_min - 3,
+                                  year_max=spec.year_max + 3))
+        if r3.total_matched > 0:
+            fb_notes.append(f"**没有 {spec.year_min} 年的车**（该车型/条件下），"
+                            f"以下为年份最接近的结果（±3 年内）")
+            return r3, fb_notes
+
+    return result, fb_notes
 
 
 def _sort_items(items: list[ScoredVehicle], spec: SearchSpec) -> None:

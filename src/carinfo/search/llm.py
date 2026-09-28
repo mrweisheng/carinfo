@@ -54,6 +54,12 @@ class LLMConfig:
     api_key: str = ""
     model: str = DEFAULT_MODEL
     temperature: float = 0.2
+    #: 解析（NL→spec）专用的温度。2026-09-27 实测：temp=0.2 时同一句
+    #: 「雷克萨斯LM350」5/12 次被截成 'LM'；temp=0.0 **降低但不消除**截断
+    #: （后续复测原生输出仍偶发 'LM'/'350'，端到端 8/8 全对靠的是 parser 的
+    #: 短关键词防呆兜底）—— 温度是第一道墙，防呆才是主力，别只依赖前者。
+    #: 与通用 temperature 分开配：润色/摘要等生成型调用仍用 0.2。
+    parse_temperature: float = 0.0
     timeout: float = 30.0
     max_retries: int = 2
     #: 关闭思考模式(M3 实测:`thinking.type=disabled` 生效;`reasoning_effort` /
@@ -66,16 +72,21 @@ class LLMConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "LLMConfig":
         """只认非敏感参数。`api_key` 不从这里读 —— 那是 `.env` 的事(见 config.load_api_key)。"""
         d = data or {}
-        try:
-            temp = float(d.get("temperature", 0.2))
-        except (TypeError, ValueError):
-            temp = 0.2
-        # MiniMax 拒绝 temperature=0，夹到 (0, 1]
-        temp = min(1.0, max(0.01, temp))
+
+        def _num(key, default, lo, hi):
+            try:
+                v = float(d.get(key, default))
+            except (TypeError, ValueError):
+                v = default
+            # 0 是合法值（2026-09-27 实测 MiniMax 接受 temperature=0.0 且解析
+            # 稳定性最佳；旧认知「拒绝 0 要夹到 0.01」是错的，勿改回）
+            return min(hi, max(lo, v))
+
         return cls(
             base_url=str(d.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
             model=str(d.get("model") or DEFAULT_MODEL),
-            temperature=temp,
+            temperature=_num("temperature", 0.2, 0.0, 1.0),
+            parse_temperature=_num("parse_temperature", 0.0, 0.0, 1.0),
             timeout=float(d.get("timeout_seconds", 30)),
             max_retries=int(d.get("max_retries", 2)),
             disable_thinking=bool(d.get("disable_thinking", False)),
@@ -92,8 +103,15 @@ class LLMClient:
     def configured(self) -> bool:
         return bool(self.cfg.api_key)
 
-    def chat(self, system: str, user: str, model: str | None = None) -> str:
-        """一次单轮对话，返回正文（已剥掉 thinking 段）。"""
+    def chat(self, system: str, user: str, model: str | None = None,
+             temperature: float | None = None) -> str:
+        """一次单轮对话，返回正文（已剥掉 thinking 段）。
+
+        `temperature`：本次调用覆盖配置值。解析层（parser）固定传 0 ——
+        实测 24 次重放：temp=0.2 时同一句「雷克萨斯LM350」5/12 次被模型
+        截成 base_model='LM'（经归一 miss 退化为 keyword='LM' → 型号污染），
+        temp=0 时 12/12 全对。解析是模式转换任务，要的就是确定性。
+        """
         if not self.configured:
             raise LLMError("未配置 MiniMax API key：请在项目根目录的 .env 里设置 MINIMAX_API_KEY")
 
@@ -103,7 +121,7 @@ class LLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": self.cfg.temperature,
+            "temperature": self.cfg.temperature if temperature is None else temperature,
             "stream": False,
         }
         if self.cfg.disable_thinking:
@@ -158,9 +176,10 @@ class LLMClient:
             raise LLMError(f"MiniMax 响应无 content：{str(body)[:200]}")
         return strip_thinking(content)
 
-    def chat_json(self, system: str, user: str, model: str | None = None) -> dict:
+    def chat_json(self, system: str, user: str, model: str | None = None,
+                  temperature: float | None = None) -> dict:
         """要 JSON 的调用：剥 thinking → 取 code fence → json.loads。"""
-        raw = self.chat(system, user, model)
+        raw = self.chat(system, user, model, temperature=temperature)
         return extract_json(raw)
 
 

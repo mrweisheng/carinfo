@@ -38,7 +38,7 @@ from carinfo.search.auth import (
 from carinfo.search.config import load_llm_config, load_search_config
 from carinfo.search.context import SearchContext
 from carinfo.search.db import fetch
-from carinfo.search.engine import search
+from carinfo.search.engine import search, search_with_fallback
 from carinfo.search.explain import explain
 from carinfo.search.llm import LLMClient
 from carinfo.search.parser import parse_query
@@ -126,15 +126,20 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
     for s in parsed.specs:
         s.limit = n
 
-    def _run_all(conn):                                       # ③ 短借：检索（每组一次）
-        return [(label, search(conn, s)) for label, s in zip(parsed.labels, parsed.specs)]
+    def _run_all(conn):                                       # ③ 短借：检索（每组一次，带 0 结果放宽）
+        out = []
+        for label, s in zip(parsed.labels, parsed.specs):
+            r, fb_notes = search_with_fallback(conn, s)
+            out.append((label, r, fb_notes))
+        return out
 
     results = fetch(_run_all)
-    outs = [(label, explain(r, llm=llm, use_llm=False)) for label, r in results]
+    outs = [(label, explain(r, llm=llm, use_llm=False), fb)
+            for label, r, fb in results]
 
     # 多车混输（2026-09-27）：items 扁平合并、每条 query 标注来源组；单组时行为不变
     items = []
-    for label, out in outs:
+    for label, out, _fb in outs:
         for it in out.items:
             items.append({
                 "vehicle_id": it["vehicle_id"],
@@ -153,22 +158,29 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "query": label or None,
             })
     first = outs[0][1]
+
+    def _prefix_fb(out, fb: list[str]) -> str:
+        """放宽说明放 summary 首句：先知道「没有完全符合的」，再看车。"""
+        return ("；".join(fb) + "。" if fb else "") + out.summary
+
     payload = {
-        "summary": first.summary,
+        "summary": _prefix_fb(first, outs[0][2]),
         "parse_source": parsed.source,
         "spec": first.spec,
         "total_matched": first.total_matched,
-        "notes": list(parsed.notes) + list(first.notes),
+        "notes": list(parsed.notes) + list(first.notes)
+                 + [n for _l, _o, fb in outs for n in fb],
         "items": items,
     }
     if len(outs) > 1:
         payload["summary"] = " ｜ ".join(
-            (f"【{label}】" if label else "") + out.summary for label, out in outs
+            (f"【{label}】" if label else "") + _prefix_fb(out, fb)
+            for label, out, fb in outs
         )
-        payload["total_matched"] = sum(out.total_matched for _l, out in outs)
+        payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)
         payload["query_groups"] = [
             {"label": label or f"条件{i + 1}", "total_matched": out.total_matched}
-            for i, (label, out) in enumerate(outs)
+            for i, (label, out, _fb) in enumerate(outs)
         ]
     return payload
 
@@ -250,10 +262,12 @@ def _do_hot_models(conn, limit: int) -> dict[str, Any]:
 
 
 def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
-    result = search(conn, spec)
+    # 与 search_cars 同走 0 结果放宽（行为统一）
+    result, fb_notes = search_with_fallback(conn, spec)
     out = explain(result)
+    summary = "；".join(fb_notes) + "。" + out.summary if fb_notes else out.summary
     return {
-        "summary": out.summary,
+        "summary": summary,
         "total_matched": out.total_matched,
         "items": [
             {

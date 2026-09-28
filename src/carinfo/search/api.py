@@ -47,7 +47,7 @@ from carinfo.search.db import (
     pool_stats,
     warm_pool,
 )
-from carinfo.search.engine import ScanTooWide, search
+from carinfo.search.engine import ScanTooWide, search, search_with_fallback
 from carinfo.search.explain import explain, fmt_money
 from carinfo.search.llm import LLMClient
 from carinfo.search.parser import parse_query
@@ -162,31 +162,45 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
     if parsed.notes:
         log.warning("[search]   解析提示=%s", parsed.notes)
 
-    # ③ 检索（短借；fetch 内已含连接级错误重试）—— 每组一次
+    # ③ 检索（短借；fetch 内已含连接级错误重试）—— 每组一次，带 0 结果放宽
     def _run_all(conn):
-        return [(label, search(conn, s)) for label, s in zip(parsed.labels, parsed.specs)]
+        out = []
+        for label, s in zip(parsed.labels, parsed.specs):
+            r, fb_notes = search_with_fallback(conn, s)
+            out.append((label, r, fb_notes))
+        return out
 
     results = fetch(_run_all)
 
     matched = ", ".join(f"{label or '组' + str(i + 1)}:{r.total_matched}"
-                        for i, (label, r) in enumerate(results))
+                        for i, (label, r, _fb) in enumerate(results))
     log.info("[search]   命中 %s（%.0fms）", matched,
              (time.perf_counter() - t0) * 1000)
+    for label, r, fb in results:
+        if fb:
+            log.info("[search]   组[%s] 触发放宽: %s", label or "-", fb)
 
     # ④ 解释（模板确定性 + 可选 LLM 润色；无连接）
-    outs = [(label, explain(r, llm=get_llm(can_use), use_llm=cfg["polish_summary"]))
-            for label, r in results]
+    outs = [(label, explain(r, llm=get_llm(can_use), use_llm=cfg["polish_summary"]), fb)
+            for label, r, fb in results]
 
     first = outs[0][1]
     payload = first.__dict__.copy()
     payload["parse_source"] = parsed.source
     payload["notes"] = list(parsed.notes) + list(first.notes)
+    all_fb = [n for _l, _o, fb in outs for n in fb]
+    if all_fb:
+        payload["notes"] = payload["notes"] + all_fb
+
+    def _prefix_fb(out, fb: list[str]) -> str:
+        """放宽说明必须在 summary 首句 —— 用户得先知道「没有完全符合的」再看车。"""
+        return ("；".join(fb) + "。" if fb else "") + out.summary
 
     if len(outs) > 1:
         # 多组：items 扁平合并（每条标注组）+ 各组元信息；summary 逐组拼接。
         # spec/total_matched 等顶层字段保持第一组（旧消费方兼容），多组信息在 query_groups
         items = []
-        for label, out in outs:
+        for label, out, _fb in outs:
             for it in out.items:
                 it = dict(it)
                 it["query_label"] = label
@@ -195,12 +209,15 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
         payload["query_groups"] = [
             {"label": label or f"条件{i + 1}", "total_matched": out.total_matched,
              "spec": out.spec}
-            for i, (label, out) in enumerate(outs)
+            for i, (label, out, _fb) in enumerate(outs)
         ]
-        payload["total_matched"] = sum(out.total_matched for _l, out in outs)
+        payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)
         payload["summary"] = " ｜ ".join(
-            (f"【{label}】" if label else "") + out.summary for label, out in outs
+            (f"【{label}】" if label else "") + _prefix_fb(out, fb)
+            for label, out, fb in outs
         )
+    else:
+        payload["summary"] = _prefix_fb(first, outs[0][2])
     return payload
 
 
@@ -338,8 +355,13 @@ def search_spec(body: dict = Body(...)) -> JSONResponse:
         raise HTTPException(status_code=400, detail=f"参数不合法：{e}") from e
 
     def _run(conn):
-        result = search(conn, spec)
-        return explain(result).__dict__
+        # 与 /search 同走 0 结果放宽（行为统一：结构化调用不再"空手而归也不吭声"）
+        result, fb_notes = search_with_fallback(conn, spec)
+        out = explain(result).__dict__
+        if fb_notes:
+            out["notes"] = list(out.get("notes") or []) + fb_notes
+            out["summary"] = "；".join(fb_notes) + "。" + out["summary"]
+        return out
 
     return JSONResponse(fetch(_run))
 

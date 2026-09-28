@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 #: 返回条数：默认 5，上限 50（导航形态下给太多反而选不动）
@@ -122,6 +122,10 @@ class SearchSpec:
     #: `car_model ~ '^family[0-9 ]'` 前缀匹配（后跟数字/空格排除 SL 混入 S 级），
     #: 通常与 brand 联用。具体型号（「730」）不走这里，走 model_keyword 模糊。
     family: str | None = None
+    #: 同款变体键列表（2026-09-27 变体合并）：base_model 命中时由解析层展开，
+    #: 如 LM350 → [LM350, LM350H]（燃油/混动同款，漏并会少 18 台）。构建规则
+    #: 见 context.build_variant_map（同品牌+尾缀白名单+数量门槛+跨品牌防线）。
+    base_models: list[str] = field(default_factory=list)
     #: 中港牌(兩地牌)。None=不筛;True=只要中港牌;False=排除。
     #: 数据来自描述提取(覆盖约 2%),筛 True 的结果天然偏少,属正常。
     china_plate: bool | None = None
@@ -192,6 +196,14 @@ class SearchSpec:
             if val is not None and not isinstance(val, str):
                 setattr(self, fname, None)
 
+        # model_keyword 的底线长度（2026-09-27，程序直传入口的防线）：
+        # /search/spec 与 MCP search_by_spec 不经过 parser 的截断防呆（那里有
+        # 原文可对照），这里是它们唯一的闸 —— 单字符 keyword 的 '%X%' 模糊
+        # 匹配几乎必然型号污染。底线设 2 而不是 3：'X5'/'Z3' 这类两位合法型号
+        # 不能误伤（截断检测需要原文上下文，spec 层做不了，只挡最短的）。
+        if self.model_keyword is not None and len(self.model_keyword.strip()) < 2:
+            self.model_keyword = None
+
         # family（车系家族前缀）比普通字符串严一档：它的值会拼进 `car_model ~`
         # 的正则，只放行 [A-Z0-9 -]（大写化后），长度 <= 20。任何其它字符（含
         # 正则元字符）= 脏值，置 None 退回无家族条件 —— 宁可查宽不可带毒。
@@ -201,6 +213,24 @@ class SearchSpec:
             else:
                 fam = self.family.strip().upper()
                 self.family = fam if fam and len(fam) <= 20 and re.fullmatch(r"[A-Z0-9 -]+", fam) else None
+
+        # base_models（同款变体键列表）：只收 [A-Z0-9 .-] 的字符串键、去重、
+        # 排序（快照测试可断言）。base_models 为空且 base_model 有值时回填
+        # [base_model]，引擎侧只看这一个字段（单点）。
+        if self.base_models is None:
+            self.base_models = []
+        if not isinstance(self.base_models, (list, tuple)):
+            self.base_models = []
+        else:
+            cleaned = []
+            for b in self.base_models:
+                if isinstance(b, str):
+                    b = b.strip().upper()
+                    if b and len(b) <= 30 and re.fullmatch(r"[A-Z0-9 .-]+", b):
+                        cleaned.append(b)
+            self.base_models = sorted(set(cleaned))
+        if not self.base_models and self.base_model:
+            self.base_models = [self.base_model]
 
         # exclude_anomaly 只接受真布尔/可判真假的标量
         self.exclude_anomaly = bool(self.exclude_anomaly)
