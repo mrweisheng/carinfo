@@ -155,7 +155,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 |---|---|---|
 | `base_model` / `brand` | string | 车系键 / 品牌键(大写英文,如 `ALPHARD` / `TOYOTA`;不知道就别传,用 `/search`) |
 | `model_keyword` | string | 原始关键词,对 car_model 做模糊匹配(归一失败时的兜底) |
-| `displacement` | string | 排量偏好如 `"3.5"`,只加分不过滤 |
+| `displacement` | string | 排量偏好如 `"3.5"`：命中保持满分、不符降 match（**仍不过滤**）。按 ±0.25L 容差比真实排量，兜住 3456/3490 几等登记噪声 |
 | `year_min` / `year_max` | int | 年份硬过滤 |
 | `price_min` / `price_max` | number | 价格硬过滤(港币) |
 | `price_near` / `year_near` | number | 「50万左右」软锚点:参与贴合度排序,**不删候选** |

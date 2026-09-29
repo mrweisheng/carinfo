@@ -61,3 +61,21 @@ def test_numeric_strings_coerced():
     assert s.seats == 7
     assert s.year_min == 2015
     assert s.price_max == 500000
+
+
+def test_numeric_displacement_coerced_to_str():
+    """模型把排量当数字给是常见的，不能落进「非 str 一律丢」的网。"""
+    assert SearchSpec(raw_query="q", displacement=3.5).displacement == "3.5"
+    assert SearchSpec.from_dict({"displacement": 2.0}).displacement == "2.0"
+
+
+def test_base_models_only_backfills_base_model():
+    """程序入口只传 base_models 时，base_model 必须回填，否则 SQL 车系过滤静默失效。"""
+    s = SearchSpec.from_dict({"base_models": ["A6", "A7"]})
+    assert s.base_model == "A6"
+    assert s.has_model_target is True
+
+
+def test_year_near_upper_bound_matches_parser():
+    assert SearchSpec(raw_query="q", year_near=2040).year_near == 2040
+    assert SearchSpec(raw_query="q", year_near=2050).year_near is None

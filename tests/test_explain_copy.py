@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from carinfo.search.engine import CORE_DIMS, DIM_LABELS, ScoredVehicle, SearchResult
+from carinfo.search.engine import CORE_DIMS, DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
 from carinfo.search.explain import build_result_dict, explain, item_explain, summarize
 from carinfo.search.spec import SearchSpec
 
@@ -97,3 +97,10 @@ def test_explain_passes_relaxed_through():
     out = explain(s)
     assert out.relaxed == ["import_type"]
     assert isinstance(out.items, list)
+
+
+def test_score_breakdown_reports_weight_sum():
+    """前端按权重和做分母：含 relaxed 时和为 1.08，必须显式给出，别让它猜。"""
+    it = _vehicle(scores={"match": 1.0, "relaxed": 0.5}, score=1.2)
+    d = build_result_dict(it, SearchSpec(raw_query="q"))
+    assert abs(d["weight_sum"] - (WEIGHTS["match"] + WEIGHTS["relaxed"])) < 1e-9

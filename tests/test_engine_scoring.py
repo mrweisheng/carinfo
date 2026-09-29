@@ -12,11 +12,14 @@ import pytest
 
 from carinfo.search.engine import (
     CORE_DIMS,
+    DISPLACEMENT_MISMATCH_CAP,
+    DISPLACEMENT_UNKNOWN_SCORE,
     L3_RELAX_ORDER,
     WEIGHTS,
     _identity_keyword,
     _score_relaxed,
     is_identity_code,
+    score_match,
 )
 from carinfo.search.spec import SearchSpec
 
@@ -94,3 +97,67 @@ def test_score_relaxed_full_and_zero():
                           {"import_type": "水貨", "mileage_km": 10_000}) == 1.0
     assert _score_relaxed(["import_type", "mileage_max"], spec,
                           {"import_type": "行貨", "mileage_km": 90_000}) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 排量偏好（2026-09-29 修复：旧实现 `min(1.0, m+0.10)` 在 base_model 命中时是空操作）
+# ---------------------------------------------------------------------------
+def _alphard_spec(disp):
+    return SearchSpec(raw_query="q", base_model="ALPHARD", displacement=disp)
+
+
+def test_displacement_preference_orders_matching_first():
+    s = _alphard_spec("3.5")
+    # 命中（含容差内 3456cc）保持满分
+    assert score_match(s, "ALPHARD SA VELLFIRE", "ALPHARD", None, "3500cc") == 1.0
+    assert score_match(s, "ALPHARD EXECUTIVE", "ALPHARD", None, "3456cc") == 1.0
+    # 不符降 match（仍在结果里，只是排后面）
+    assert score_match(s, "ALPHARD 2.5S", "ALPHARD", None, "2500cc") < 1.0
+
+
+def test_displacement_falls_back_to_car_model_text():
+    s = _alphard_spec("3.5")
+    assert score_match(s, "ALPHARD 3.5 VELLFIRE", "ALPHARD", None, None) == 1.0
+    assert score_match(s, "ALPHARD 2.5", "ALPHARD", None, None) < 1.0
+
+
+def test_displacement_unknown_not_penalized():
+    """缺排量信息不罚 —— 与「缺维不扣分」一致。"""
+    s = _alphard_spec("3.5")
+    assert score_match(s, "ALPHARD SA VELLFIRE", "ALPHARD", None, None) == 1.0
+    assert score_match(s, "ALPHARD 8", "ALPHARD", None, None) == 1.0  # 8 是代次不是排量
+
+
+def test_no_displacement_spec_never_penalized():
+    s = SearchSpec(raw_query="q", base_model="ALPHARD")
+    assert score_match(s, "ALPHARD 2.5", "ALPHARD", None, "2500cc") == 1.0
+
+def test_displacement_registration_noise_tolerated():
+    """登记排量有噪声：3.5L 常登 3456/3490/3498/3499cc，2.5L 常登 2490 几 —— 都算命中。"""
+    s35 = _alphard_spec("3.5")
+    for cc in ("3456cc", "3490cc", "3498cc", "3499cc", "3500cc", "3510cc"):
+        assert score_match(s35, "ALPHARD", "ALPHARD", None, cc) == 1.0, cc
+    s25 = _alphard_spec("2.5")
+    for cc in ("2490cc", "2493cc", "2494cc", "2498cc", "2500cc"):
+        assert score_match(s25, "ALPHARD", "ALPHARD", None, cc) == 1.0, cc
+    # 档位不同仍必须分开（容差远小于档距）
+    assert score_match(s35, "ALPHARD", "ALPHARD", None, "2494cc") < 1.0
+    assert score_match(s25, "ALPHARD", "ALPHARD", None, "3498cc") < 1.0
+
+def test_displacement_car_model_fallback_requires_decimal():
+    """车名里的裸数字是代次/型号（MODEL 3→3、A6→6、740→0.74），不能当排量。"""
+    s_model3 = SearchSpec(raw_query="q", base_model="MODEL 3", displacement="3.5")
+    assert score_match(s_model3, "MODEL 3", "MODEL 3", None, None) == 1.0
+    s_a6 = SearchSpec(raw_query="q", base_model="A6", displacement="2.0")
+    assert score_match(s_a6, "A6", "A6", None, None) == 1.0
+    # 车名里带小数点(3.5/2.5) 才算排量
+    s = _alphard_spec("3.5")
+    assert score_match(s, "ALPHARD 3.5", "ALPHARD", None, None) == 1.0
+    assert score_match(s, "ALPHARD 2.5", "ALPHARD", None, None) < 1.0
+
+def test_only_displacement_ranks_by_displacement():
+    """没有车型目标、只有排量偏好时，也要按排量排序（否则该维恒 None，偏好失效）。"""
+    s = SearchSpec(raw_query="q", displacement="3.5")   # 无 base_model/brand/keyword
+    assert score_match(s, "SOME CAR", None, None, "3500cc") == 1.0
+    assert score_match(s, "SOME CAR", None, None, "2500cc") == DISPLACEMENT_MISMATCH_CAP
+    assert score_match(s, "SOME CAR", None, None, None) == DISPLACEMENT_UNKNOWN_SCORE

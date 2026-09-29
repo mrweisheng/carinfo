@@ -1,4 +1,4 @@
-"""解析层回归（**离线**：合成 ctx + FakeLLM，不连库不联网）。
+﻿"""解析层回归（**离线**：合成 ctx + FakeLLM，不连库不联网）。
 
 锁住两个 P0 的解析成因，以及 Fix-1/2/2b/4/6 与「库外型号形状补救」：
 
@@ -98,3 +98,20 @@ def test_llm_full_keyword_is_kept(synth_ctx, fake_llm):
                     llm=fake_llm({"model_keyword": "740", "brand": "BMW"}))
     assert r.spec.model_keyword == "740"
     assert r.spec.keyword_is_identity is True
+
+
+# ---------------------------------------------------------------------------
+# 规则路径排量（P1-1：无 LLM 时排量偏好也要抽出来）
+# ---------------------------------------------------------------------------
+def test_rule_displacement_extracted(synth_ctx):
+    assert rule_based_parse("18年埃尔法3.5L排量", synth_ctx).displacement == "3.5"
+    assert rule_based_parse("宝马 3500cc", synth_ctx).displacement == "3500"
+    assert rule_based_parse("排量3000的宝马", synth_ctx).displacement == "3000"
+
+
+def test_rule_displacement_not_confused_with_price(synth_ctx):
+    # 「3.5萬」是预算不是排量
+    assert rule_based_parse("3.5萬的阿尔法", synth_ctx).displacement is None
+    # 预算与排量同时出现，各归各
+    s = rule_based_parse("50萬以內的阿尔法 3.5L", synth_ctx)
+    assert s.displacement == "3.5" and s.price_max == 500000
