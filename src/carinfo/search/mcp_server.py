@@ -179,6 +179,7 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
             for label, out, fb in outs
         )
         payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)
+        payload["relaxed"] = sorted({r for _l, out, _fb in outs for r in (out.relaxed or [])})
         payload["query_groups"] = [
             {"label": label or f"条件{i + 1}", "total_matched": out.total_matched,
              "relaxed": out.relaxed}

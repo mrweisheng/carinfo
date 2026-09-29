@@ -205,6 +205,9 @@ def build_result_dict(item: ScoredVehicle, spec: SearchSpec | None = None) -> di
         "labels": item_labels(item),
         "explain": item_explain(item, spec),
         "market_basis": market_basis_text(item),
+        # 本条件实际参与维度的权重和（含 relaxed 时可为 1.08）。前端按权重和 ≠1
+        # 渲染进度条会错位，给个可直接用的分母（与 engine.combine 的归一一致）。
+        "weight_sum": round(sum(WEIGHTS[d] for d in item.scores), 4),
         "score_breakdown": [
             {
                 "dim": d,

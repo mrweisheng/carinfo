@@ -96,7 +96,9 @@ class SearchSpec:
     base_model: str | None = None      # 归一后的车系键，如 'ALPHARD'
     brand: str | None = None           # 归一后的品牌，如 'TOYOTA'
     model_keyword: str | None = None   # 归一失败的原始关键词，走 car_model 模糊匹配
-    displacement: str | None = None    # 排量偏好（'3.5'）—— 只做加分，不做硬过滤
+    #: 排量偏好（'3.5'）—— 只调排序，不做硬过滤（engine.score_match 用 ±0.25L 容差
+    #: 比 engine_volume，兜住 3456/3490 几/2494 这类登记噪声；不符仅降 match，车仍在）
+    displacement: str | None = None
     #: 关键词是否已被解析层认证为**库内真实型号**（Fix-2，2026-09-28）。
     #: 零命中放宽阶梯里「真型号永不丢弃」需要它：engine 手上没有 SearchContext，
     #: 判不出「是不是某个库内键的前缀」（'740' → 740LI），只能由解析层盖章。
@@ -200,6 +202,12 @@ class SearchSpec:
         vt = _coerce_int(self.vehicle_type)
         self.vehicle_type = vt if vt in VALID_VEHICLE_TYPES else (None if self.vehicle_type is None else 1)
 
+        # displacement 特例：模型常把它当数字给（{"displacement": 3.5}）。它是
+        # 排量偏好不是脏值，转成字符串保留，别落进下面「非 str 一律置 None」的网。
+        if self.displacement is not None and not isinstance(self.displacement, str):
+            if isinstance(self.displacement, (int, float)) and not isinstance(self.displacement, bool):
+                self.displacement = str(self.displacement)
+
         # 字符串字段：非字符串的（数字/列表/dict）一律置 None，别让它们进 ILIKE 参数
         for fname in ("base_model", "brand", "model_keyword", "displacement",
                       "transmission", "fuel_type", "import_type"):
@@ -242,6 +250,12 @@ class SearchSpec:
             self.base_models = sorted(set(cleaned))
         if not self.base_models and self.base_model:
             self.base_models = [self.base_model]
+        # 反向回填：只传 base_models（程序化入口）时给 base_model 一个代表键 ——
+        # 否则 `_where_clause` 的 `if spec.base_model` 守卫会让变体过滤静默失效、
+        # has_model_target 也判不出（2026-09-29 审核）。引擎仍按 base_models 全列表
+        # 做 `= ANY(...)` 过滤，base_model 只作代表/判空用。
+        if not self.base_model and self.base_models:
+            self.base_model = self.base_models[0]
 
         # exclude_anomaly 只接受真布尔/可判真假的标量
         self.exclude_anomaly = bool(self.exclude_anomaly)
@@ -274,7 +288,9 @@ class SearchSpec:
         if self.price_near is not None and not 10_000 <= self.price_near <= 100_000_000:
             self.price_near = None
         self.year_near = _coerce_int(self.year_near)
-        if self.year_near is not None and not 1950 <= self.year_near <= 2030:
+        # 上限 2049 与 parser._YEAR_RE（19[5-9]\d|20[0-4]\d）**同口径**，别各写一个：
+        # 之前这里写 2030，解析层却认到 2049，2031-2049 的「左右」两头不一致。
+        if self.year_near is not None and not 1950 <= self.year_near <= 2049:
             self.year_near = None
 
     # ------------------------------------------------------------------

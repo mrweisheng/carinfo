@@ -212,6 +212,8 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
             for i, (label, out, _fb) in enumerate(outs)
         ]
         payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)
+        # 顶层 relaxed 是各组并集（旧实现只带第一组，多车混输时漏报放宽）
+        payload["relaxed"] = sorted({r for _l, out, _fb in outs for r in (out.relaxed or [])})
         payload["summary"] = " ｜ ".join(
             (f"【{label}】" if label else "") + _prefix_fb(out, fb)
             for label, out, fb in outs
