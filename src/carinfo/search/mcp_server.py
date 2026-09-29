@@ -40,6 +40,7 @@ from carinfo.search.context import SearchContext
 from carinfo.search.db import fetch
 from carinfo.search.engine import search_with_fallback
 from carinfo.search.explain import explain
+from carinfo.search.image_proxy import proxied_cover_url, proxied_image_url
 from carinfo.search.llm import LLMClient
 from carinfo.search.parser import parse_query
 from carinfo.search.spec import DEFAULT_LIMIT, MAX_LIMIT, SearchSpec
@@ -153,7 +154,8 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "labels": it["labels"],
                 "why": it["explain"],
                 "url": it["car_url"],
-                "image_url": it["image_url"],
+                "image_url": proxied_cover_url(it["vehicle_id"]) if it.get("vehicle_id") else it["image_url"],
+                "image_url_raw": it["image_url"],
                 "contact": it["contact_display"],
                 "query": label or None,
             })
@@ -230,7 +232,9 @@ def _do_car_detail(conn, vehicle_id: str) -> dict[str, Any]:
     cur.close()
 
     data = dict(zip(cols, row))
-    data["images"] = images
+    # 图片走我们的代理 URL（调用方不直接接触 28car）；原链保留在 images_raw
+    data["images"] = [proxied_image_url(vehicle_id, i) for i in range(len(images))]
+    data["images_raw"] = images
 
     # 联系人展示串：找车的最终目的是联系车主，详情必带（电话优先，仅邮箱带「電郵」前缀）
     name = (data.get("contact_name") or "").strip()
@@ -280,7 +284,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
                 "year": it["year"],
                 "price": it["price"],
                 "price_ratio": it["price_ratio"],
-                "image_url": it["image_url"],
+                "image_url": proxied_cover_url(it["vehicle_id"]) if it.get("vehicle_id") else it["image_url"],
                 "labels": it["labels"],
                 "contact": it["contact_display"],
             }

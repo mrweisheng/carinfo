@@ -19,6 +19,7 @@ config.json
 # 运行产物
 car_data_*.csv
 data/csv/
+data/image_cache/
 *.log
 *.pid
 *.lock

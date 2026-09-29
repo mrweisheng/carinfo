@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from carinfo.search.auth import (
     ENV_ALLOW_NO_AUTH,
@@ -49,6 +49,12 @@ from carinfo.search.db import (
 )
 from carinfo.search.engine import ScanTooWide, search, search_with_fallback
 from carinfo.search.explain import explain, fmt_money
+from carinfo.search.image_proxy import (
+    IMG_CACHE_CONTROL,
+    fetch_image,
+    proxied_cover_url,
+    proxied_image_url,
+)
 from carinfo.search.llm import LLMClient
 from carinfo.search.parser import parse_query
 from carinfo.search.spec import MAX_LIMIT, SearchSpec
@@ -220,6 +226,7 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
         )
     else:
         payload["summary"] = _prefix_fb(first, outs[0][2])
+    _proxy_items(payload.get("items"))
     return payload
 
 
@@ -267,7 +274,9 @@ def _do_vehicle(conn, vehicle_id: str) -> dict[str, Any] | None:
     cur.close()
 
     data = dict(zip(cols, row))
-    data["images"] = images
+    # 图片走我们自己的代理 URL，调用方不直接接触 28car（原链保留在 images_raw）。
+    data["images"] = [proxied_image_url(vehicle_id, i) for i in range(len(images))]
+    data["images_raw"] = images
 
     # 联系人展示串：找车的最终目的是联系车主，详情必带（电话优先，仅邮箱带「電郵」前缀）
     name = (data.get("contact_name") or "").strip()
@@ -294,6 +303,43 @@ def _do_vehicle(conn, vehicle_id: str) -> dict[str, Any] | None:
             f"比同款行情低 {(1 - r) * 100:.0f}%" if r < 1 else f"比同款行情高 {(r - 1) * 100:.0f}%"
         )
     return data
+
+
+_IMAGE_URL_SQL = """
+SELECT image_url FROM vehicle_images WHERE vehicle_id = %s
+ORDER BY image_order OFFSET %s LIMIT 1
+"""
+_COVER_URL_SQL = """
+SELECT image_url FROM vehicle_images WHERE vehicle_id = %s
+ORDER BY image_order LIMIT 1
+"""
+
+
+def _do_image_url(conn, vehicle_id: str, index: int) -> str | None:
+    """第 index 张（0 起）图片的 28car 原始 URL。只按主键查，**绝不接受调用方传 URL**。"""
+    cur = conn.cursor()
+    cur.execute(_IMAGE_URL_SQL, (vehicle_id, index))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def _do_cover_url(conn, vehicle_id: str) -> str | None:
+    cur = conn.cursor()
+    cur.execute(_COVER_URL_SQL, (vehicle_id,))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def _proxy_items(items) -> None:
+    """把列表项的首图换成我们的代理 URL（原链保留在 image_url_raw）。"""
+    for it in items or []:
+        raw = it.get("image_url")
+        vid = it.get("vehicle_id")
+        if raw and vid:
+            it["image_url_raw"] = raw
+            it["image_url"] = proxied_cover_url(vid)
 
 
 def _do_models(conn, limit: int) -> list[dict[str, Any]]:
@@ -363,6 +409,7 @@ def search_spec(body: dict = Body(...)) -> JSONResponse:
         if fb_notes:
             out["notes"] = list(out.get("notes") or []) + fb_notes
             out["summary"] = "；".join(fb_notes) + "。" + out["summary"]
+        _proxy_items(out.get("items"))
         return out
 
     return JSONResponse(fetch(_run))
@@ -375,6 +422,36 @@ def vehicle_detail(vehicle_id: str) -> JSONResponse:
     if data is None:
         raise HTTPException(status_code=404, detail="车源不存在或已下架")
     return JSONResponse(data)
+
+
+def _serve_image(url: str) -> Response:
+    """按 DB 里的原始 URL 取图并回传字节（直连 + 缓存 + 限流 + 降级，见 image_proxy）。"""
+    got = fetch_image(url)
+    if got is None:
+        raise HTTPException(status_code=502, detail="图片获取失败或已失效")
+    body, ctype = got
+    return Response(content=body, media_type=ctype,
+                    headers={"Cache-Control": IMG_CACHE_CONTROL})
+
+
+@app.get("/vehicle/{vehicle_id}/cover")
+def vehicle_cover(vehicle_id: str) -> Response:
+    """首图（封面）字节。调用方只接触本服务，不直连 28car。"""
+    url = fetch(lambda conn: _do_cover_url(conn, vehicle_id))
+    if not url:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return _serve_image(url)
+
+
+@app.get("/vehicle/{vehicle_id}/image/{index}")
+def vehicle_image(vehicle_id: str, index: int) -> Response:
+    """第 index 张图片（0 起，对应详情 images 数组下标）的字节。"""
+    if index < 0:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    url = fetch(lambda conn: _do_image_url(conn, vehicle_id, index))
+    if not url:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return _serve_image(url)
 
 
 @app.get("/models")
