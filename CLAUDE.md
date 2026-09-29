@@ -65,7 +65,8 @@ carinfo/
 │       └── sites/                  # 各站点业务实现
 │           ├── __init__.py
 │           └── car28.py            # 28car.com 业务（Car28Spider）
-├── _migration/                     # 迁移脚本 + 搜索子系统的验证脚本（test_*.py / eval_search.py）
+├── tests/                          # 跟踪的 pytest 门禁（离线；随代码版本化，见「验证与评测」）
+├── _migration/                     # 迁移脚本 + 本地临时验证脚本（test_*.py / eval_search.py；gitignored）
 ├── data/
 │   └── csv/                        # CSV 备份（只写不读，供排查/补导；gitignored）
 └── archive/                        # 历史 dump / 调试遗留（gitignored）
@@ -161,7 +162,7 @@ config.json: schedule.windows = [上午, 下午, 晚上]     ← 三个「候选
              └─ next_run_window next_run 落在哪个窗口（可读性）
 ```
 
-三条不变量（`_migration/test_schedule.py` 锁死，改调度必跑）：
+三条不变量（`tests/test_schedule_rules.py` 锁死，改调度必跑）：
 
 1. **`_pick_random_time()` 必须返回严格晚于 `now` 的时刻。** `run_forever()` 每轮都会
    调它并写进 `next_run`；一旦可能返回过去时刻，等待秒数被 `max(1, ...)` 兜成 1 秒
@@ -370,11 +371,18 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 同样的输入 + 同样的库 → 永远同样的排序，每一分可解释、可回归、能加评测门禁。
 绝不让模型对候选打分（不可复现，也无法调试）。
 
-### 打分口径（`engine.WEIGHTS`，2026-09-25 第二次定标）
+### 打分口径（`engine.WEIGHTS`，2026-09-25 第二次定标，2026-09-28 增第七维）
 
 ```
-匹配 0.28 | 性价比 0.28 | 贴合度 0.08 | 时效 0.08 | 车况 0.20 | 热度 0.08
+核心六维（`CORE_DIMS`）:
+匹配 0.28 | 性价比 0.28 | 贴合度 0.08 | 时效 0.08 | 车况 0.20 | 热度 0.08   ← 和 = 1.00
+第七维（`relaxed` 松绑补偿，SOFT_BOOST）: 0.08                              ← 总和 = 1.08
 ```
+
+⚠️ **权重集合不再恒等于 1.0**。第七维只在零命中放宽阶梯（`search_with_fallback`
+L3）里出现，常态缺席；`combine()` 按**实际参与维度的权重和**归一（除以 `total_w`），
+所以总分仍是 [0,1]、正常查询的排序与历史完全一致。`explain.item_explain` 的「缺维」
+叙述**只认 `CORE_DIMS`**（六个），否则每条结果都会多一句「缺松绑补偿数据」的噪声。
 
 定标依据是外部审核报告（docs/搜索排序审核报告.md）的 D-1/D-2，**旧的
 「前五维 × 0.8 等比 + near 0.20」口径已废弃**（等比缩放只保证无锚点查询不变，
@@ -398,7 +406,8 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 - 车况子项权重（features.py）：hand 0.50 / mileage 0.40 / import 0.10（import 从
   0.20 降，且**只有行貨单项时封顶 0.60** —— 「行貨」两个字不构成车况证据，
   修复前 1,000 台凭它拿满分）。
-- `test_search.py [9]` 锁权重设计值 + near/fresh ≤0.10 两条硬约束，改权重先过它。
+- `test_search.py [9]` 锁权重设计值 + 核心六维和=1 + boost 类（near/fresh/relaxed）
+  ≤0.10，改权重先过它。
 
 ### 模糊量：「50 万左右 / 2015 年左右」（`*_near` 软锚点）
 
@@ -475,6 +484,16 @@ uv run python -m carinfo.search.features --dry-run  # 只算不写，打印分�
 
 ### 验证与评测（改 search/ 后必跑）
 
+**跟踪的 pytest 套件（首选；随代码版本化、全离线、CI 可跑）：**
+
+```bash
+uv run pytest -q                              # 全部 139 例
+uv run pytest tests/test_schedule_rules.py    # 调度：窗口解析/告警 + _pick_random_time 未来性(防忙循环) + 窗口命中分布 + 过期重排 + 重启不重跑 + 深扫/复核模式优先级/开关/缺省关闭 + **复核返回状态决定是否写 last_completed**（迁移自 _migration/test_schedule.py）
+uv run pytest tests/test_revalidator_rules.py # 复核：三态判据 + **反例(在售页含「已售」子串不许判已售)** + 判不出必 UNKNOWN + 执行器(dry-run/busy 中止) + **报告口径(判定 vs 落库分开)** + **写库器串行化/失败必 rollback** + **漂移探针** + **已售短路不请求详情** + **today_beijing 单点** + **日志不双打** + **rebuild_default 的 rc 口径**（迁移自 _migration/test_revalidator.py）
+```
+
+**`_migration/` 本地门禁（gitignored；仍需真库/联网的集成验证放这里）：**
+
 ```bash
 uv run python _migration/test_normalize.py   # 归一：10 项断言（含反向断言防误杀）
 uv run python _migration/test_search.py      # 内核：过滤正确性 + 确定性 + 缺维归一 + 权重等比锁/无锚点等价性
@@ -488,7 +507,7 @@ uv run python _migration/eval_search.py --mode rules # 只验规则路径
 uv run python _migration/eval_search.py --mode llm   # 只验模型路径（缺 key 直接失败，不降级）
 ```
 
-> 改 `service.py` 的调度逻辑必跑 `test_schedule.py`（76 项断言，离线、不起服务、不碰数据库）。
+> 改 `service.py` 的调度逻辑必跑 `tests/test_schedule_rules.py`（跟踪、离线、不起服务、不碰数据库；它由 `_migration/test_schedule.py` 迁移而来，两者覆盖同一批不变量）。
 > ⚠️ `test_serving.py` 偶发 `DeadlockDetected` —— 它**故意**用 4 线程并发搜索去打特征表换名
 > 窗口，与 `swap_tables` 存在锁序冲突（已知问题 22）。**重跑即可**，不是代码坏了；
 > 留下的 `*_new` 影子表下一次重算会自动清掉。
@@ -711,7 +730,7 @@ python -m carinfo
 1. **历史包袱：vehicle_id 不带 28car 前缀** —— 现存 11 万+ 行数据 vehicle_id 无前缀，且 `vehicle_images` 有 FK + `ON UPDATE RESTRICT`，无法批量改写。新站点统一用 `{site_name}_{native_id}` 前缀；详见 `core/base_spider.py:vehicle_id()` docstring。
 2. **BaseSpider 目前是空壳抽象**：4 个抽象方法定义了但调度流程没真正调用——`scrape_vehicle_type` 走的是 `get_html_1` / `get_date_code` / `extract_car_info`。接入第二站时需要把 HTTP/代理/反爬 等基础设施真的下沉到 core，并让 `scrape_vehicle_type` 改成基于 `spider.list_url()` / `spider.parse_list()` 的通用流程。
 3. **`os.environ` 传爬取统计**：已修复 —— `scrape_vehicle_type()` 返回统计 dict，由 `service.py` / `car28.main()` 聚合后经 `record_crawl_log()` 写入 `crawl_logs`；`importer.main()`（CSV 补导通道）已不再读写环境变量，也不再写爬取日志。
-4. **无测试**：项目没有常驻的单元测试（历次修复靠一次性脚本验证，建议后续补 pytest）。
+4. **测试**：跟踪的 `tests/` 已有 139 例 pytest（离线为主，`@pytest.mark.db` 的真库黄金用例连不上自动 skip），由 `_migration/` 一次性脚本逐步迁移而来。仍需真库/联网的集成验证留在 `_migration/`（gitignored）。
 5. **相对路径依赖**：`config.json`、状态文件、CSV 等都用相对路径，依赖 `run_service.py` 中的 `os.chdir(repo_root)`。
 6. **CSV 现在只是备份**：爬取结果逐页通过 `import_rows()` 直接入库；`data/csv/*.csv` 只写不读，供排查/审计/手动补导（`python -m carinfo.core.importer` 仍可从 CSV 补导）。入库失败时该页数据仍在 CSV 里可补救。
 7. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
@@ -798,6 +817,6 @@ python -m carinfo
 - 代理相关改动需同步 `core/proxy.py` 和 `sites/car28.py` 中的 `scrape_vehicle_type` 函数
 - 不要提交 `.env`（含真实密码）和 `config.json`（含代理配置）
 - 搜索子系统**只读**：不要在 `search/` 下加写操作；确需写入必须走 `core/importer.py` 的通道
-- 改 `search/` 后必跑四套单测 + `eval_search.py`（见「验证与评测」），门禁绿灯才算改完
+- 改 `search/` 后必跑 `uv run pytest -q` + `eval_search.py`（见「验证与评测」），门禁绿灯才算改完
 - `search/**` 一律用 `db.fetch()` 借连接，**不要**自己 `psycopg2.connect()`（`features.py`
   的一次性 CLI 重算脚本是唯一例外）；写操作**绝不**走 `fetch()`（重试会写两次）
