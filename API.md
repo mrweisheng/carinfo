@@ -113,7 +113,7 @@ curl -s -H "X-API-Key: $KEY" \
 - `parse_source`:`llm`(模型解析)/ `fallback`(规则降级,`notes` 里会写原因)。
 - `spec`:这次查询实际生效的检索条件,**建议在 UI 上回显它**,让用户知道系统理解成了什么。
 - `total_matched`:满足硬过滤的候选总数(不是返回条数)。
-- **`image_url`**:每条候选的**首图(封面)**;要全部图片(每车 ≤5 张)用 `/vehicle/{id}` 的 `images`。
+- **`image_url`**:每条候选的**首图(封面)** URL。**它指向本服务**（`/vehicle/{id}/cover`），调用方**不会**直接接触 28car；28car 原始链接在 `image_url_raw`。要全部图片（每车 ≤5 张）用 `/vehicle/{id}` 的 `images`。
 - **`contact_display`**:每条候选的**卖家联系方式**(如 `Chan · 98524136`),拿到检索结果即可直接联系车主,无需再查详情。检索只返回**在售且带联系方式**的车源(电话或邮箱);仅留邮箱的卖家联系方式慢,统一排在有电话的车源之后,并打「仅邮箱联系」标签。
 
 **它能听懂什么**(中文/粤语/英文混合):
@@ -185,11 +185,11 @@ curl -s -H "X-API-Key: $KEY" https://searchcar.eazycar.top/vehicle/s2689574
 返回车辆全量字段(含原始 `description`、`extra_fields`)+ 行情比价数据
 (`price_ratio` / `market_p25` / `market_median` / `market_p75` / `market_level` /
 `market_ref_n`)+ 格式化好的 `price_text` / `price_verdict`("比同款行情低 12%")
-+ **全部图片 `images`**(URL 数组,按原页顺序,每车 ≤5 张)
++ **全部图片 `images`**(URL 数组,按原页顺序,每车 ≤5 张;**指向本服务**,见 §2.7)
 + **卖家联系方式**:`contact_name` / `phone_number`(8 位手机号) /
 `contact_email`(仅留邮箱的卖家,约 7%) / `contact_info`(原始文本) /
 `contact_display`(一行式,如 `陳生 · 62037222` 或 `趙生 · 電郵 xxx@yahoo.com.hk`)。
-不存在或已下架 → 404。
+不存在或已下架 → 404。28car 原始图片链接保留在 `images_raw`。
 
 ### 2.5 `GET /models` — 库内车系榜
 
@@ -208,6 +208,35 @@ curl -s -H "X-API-Key: $KEY" https://searchcar.eazycar.top/health
 
 返回 `ok`、特征表行数、`llm_configured`(模型解析是否可用)、连接池状态。
 数据库不可用时仍返回 JSON(`"ok": false`)+ 503,适合监控探活。
+
+### 2.7 图片代理 `GET /vehicle/{id}/cover` 和 `GET /vehicle/{id}/image/{i}`
+
+**调用方不直接接触 28car**：图片字节由本服务代理回传（服务端直连 28car CDN 并本地缓存）。
+
+```bash
+# 封面（首图）
+curl -s -H "X-API-Key: $KEY" -o cover.jpg \
+  https://searchcar.eazycar.top/vehicle/s2689574/cover
+# 第 i 张（0 起，对应详情 images 的下标）
+curl -s -H "X-API-Key: $KEY" -o img1.jpg \
+  https://searchcar.eazycar.top/vehicle/s2689574/image/1
+```
+
+- 成功 → `200`，`Content-Type: image/jpeg`，`Cache-Control: public, max-age=2592000`（图片不可变，可放心缓存）。
+- 图不存在（id 错/下标越界）→ `404`；上游取图失败或已失效 → `502`。调用方按"无图"降级即可。
+- **鉴权同其他路由**：`<img>` 标签带不了请求头，服务端消费方（bot/后端）带 `X-API-Key` 即可。
+- 图片端点**只接受 `vehicle_id` + 下标**，不接受任何外部 URL（防 SSRF）。
+- 响应里的 `image_url` / `images` 默认就是本服务的代理地址；若调用方需要 28car 原链，用 `image_url_raw` / `images_raw`。
+
+**调用端要改什么？（一句话）** 只需一处：**下载图片时带上 `X-API-Key`**（以前下 28car 直链不用带）。
+字段名与结构不变（`image_url` / `images` 照旧），也不要硬编码 28car 域名——直接用响应里的 URL 就行。
+
+| 调用端形态 | 是否要改 |
+|---|---|
+| 服务端下载图片（bot/后端 fetch 后上传，如飞书 `im/v1/images`） | **只加 `X-API-Key` 请求头**，URL 照用 |
+| 把 `image_url` 直接放进浏览器 `<img src>` | **不能这样用**（`<img>` 带不了请求头 → 401）；改由服务端代理下载，或改用 MCP/详情接口取字节 |
+| 之前硬编码了 `*.28car.com` 域名拼图 | 去掉硬编码，改用响应里的 `image_url` / `images` |
+| 之前就只把 `image_url` 当不透明字符串用、且带鉴权头下载 | **无感**，不用改 |
 
 ---
 
@@ -330,8 +359,8 @@ seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默
 | `china_plate` / `is_swap` | 中港牌 / 换车帖(可作检索条件,见 spec 字段表) |
 | `is_dealer` / `dealer_listings` | 车行判定 / 该卖家在售挂车数。同一联系方式(电话或邮箱)挂 ≥4 台 = 车行;实测车行贡献 72% 在售盘源,结果里打「车行(挂N台)」标签。检索条件 `dealer`(见 spec 表) |
 | `age_days` | 挂牌天数 |
-| `image_url` | 搜索候选的**首图(封面)**URL,28car CDN 直链(见 §1.5 的失效说明) |
-| `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张) |
+| `image_url` | 搜索候选的**首图(封面)**URL，指向本服务(`/vehicle/{id}/cover`)；28car 原链在 `image_url_raw`（见 §2.7） |
+| `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张)，指向本服务；原链在 `images_raw` |
 | `contact_display` / MCP 列表的 `contact` | 卖家联系方式一行式:电话型 `Chan · 98524136`;仅邮箱型 `趙生 · 電郵 xxx@yahoo.com.hk`。检索结果只含在售且带联系方式的车源,仅邮箱的排在有电话的之后 |
 | `contact_name` / `phone_number` / `contact_email` / `contact_info` | 详情接口的结构化联系人:姓名 / 8 位电话 / 邮箱(约 7% 卖家只留邮箱) / 原始文本 |
 
