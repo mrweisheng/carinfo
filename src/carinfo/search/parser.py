@@ -396,11 +396,16 @@ def parse_query(
         return ParseResult(spec=rule_based_parse(query, ctx), source="fallback",
                            notes=notes, raw_llm=raw_llm)
 
+    # 输入里的**已知中文别名**（如「布威」→STEPWGN）：确定性证据，优先于模型对生僻
+    # 叫法的猜测（实测「找一台本田布威」被 M3 猜成 Honda BR-V）。只对单组查询生效 ——
+    # 多组时同一个别名会被错配到别的组（「布威或阿尔法」里 布威 会覆盖 ALPHARD 那组）。
+    query_alias = ctx.find_model_alias(query) if len(groups) == 1 else None
+
     specs: list[SearchSpec] = []
     labels: list[str] = []
     for data in groups:
         label = str(data.get("label") or "").strip()[:16]
-        spec = _group_to_spec(data, query, ctx, notes)
+        spec = _group_to_spec(data, query, ctx, notes, query_alias)
         if spec is not None:
             specs.append(spec)
             labels.append(label)
@@ -413,8 +418,12 @@ def parse_query(
 
 
 def _group_to_spec(data: dict, query: str, ctx: SearchContext,
-                   notes: list[str]) -> SearchSpec | None:
-    """把模型输出的一组条件（已过白名单）转成 SearchSpec。空组返回 None。"""
+                   notes: list[str], query_alias: str | None = None) -> SearchSpec | None:
+    """把模型输出的一组条件（已过白名单）转成 SearchSpec。空组返回 None。
+
+    `query_alias`：输入原文里命中的**已知中文别名**所对应的车系（由 parse_query 单组
+    时预先解析）。它是确定性证据，会覆盖模型给的车型 —— 模型对生僻叫法会猜错。
+    """
     if not data:
         return None
 
@@ -439,6 +448,17 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
     if data.get("base_model") and base_model is None and not keyword:
         notes.append(f"模型给的车型 {data['base_model']!r} 在库里找不到，已退化为模糊匹配")
         keyword = str(data["base_model"])
+
+    # 输入里的已知中文别名优先（见 parse_query 的 query_alias 说明）。放在短词防呆之前：
+    # 命中别名就把模型猜错的英文关键词一起丢掉，不留给下游。
+    if query_alias and base_model != query_alias:
+        guess = bm_raw or kw_raw
+        notes.append(
+            f"按输入中的中文别名识别出车系 {query_alias!r}"
+            + (f"（模型给的是 {guess!r}）" if guess else "")
+        )
+        base_model = query_alias
+        keyword = None
 
     # ── 短关键词/截断关键词防呆（P3）───────────────────────────────────
     # 模型偶发把 'LM350' 截成 'LM'（temp=0.2 实测 5/12 次；temp=0 后仍有

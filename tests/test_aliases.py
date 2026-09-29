@@ -93,3 +93,41 @@ def test_valid_alias_gates():
 def test_seed_present_in_module():
     from carinfo.search.aliases import SEED_ALIASES
     assert SEED_ALIASES.get("步威") == "STEPWGN"
+
+
+# ---------------------------------------------------------------------------
+# LLM 路径：输入里的中文别名优先于模型猜测
+# ---------------------------------------------------------------------------
+class _FakeLLM:
+    configured = True
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def chat_json(self, system, user, **kwargs):
+        return self.payload
+
+
+def test_query_alias_overrides_llm_guess(monkeypatch):
+    """「找一台本田布威」：M3 会猜成 Honda BR-V，但输入里的「布威」（同音步威）
+    是确定性证据，必须归到 STEPWGN。"""
+    from carinfo.search.parser import parse_query
+
+    alias_map, pinyin_map = _build_alias_maps([])
+    ctx = SearchContext(Vocabulary(), {"STEPWGN", "ALPHARD"}, {"HONDA"}, {}, alias_map, pinyin_map)
+    llm = _FakeLLM({"queries": [{"brand": "HONDA", "model_keyword": "BR-V"}]})
+    pr = parse_query("找一台本田布威", ctx, llm=llm)
+    assert pr.spec.base_model == "STEPWGN"
+    assert pr.spec.model_keyword is None
+
+
+def test_query_alias_not_applied_to_multigroup(monkeypatch):
+    """多车混输时不做整句别名覆盖（会把同一个别名错配到别的组）。"""
+    from carinfo.search.parser import parse_query
+
+    alias_map, pinyin_map = _build_alias_maps([])
+    ctx = SearchContext(Vocabulary(), {"STEPWGN", "ALPHARD", "VELLFIRE"}, set(),
+                        {}, alias_map, pinyin_map)
+    llm = _FakeLLM({"queries": [{"base_model": "ALPHARD"}, {"base_model": "VELLFIRE"}]})
+    pr = parse_query("阿尔法或者威尔法", ctx, llm=llm)
+    assert [s.base_model for s in pr.specs] == ["ALPHARD", "VELLFIRE"]
