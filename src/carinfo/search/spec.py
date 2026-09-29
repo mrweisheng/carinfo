@@ -97,6 +97,17 @@ class SearchSpec:
     brand: str | None = None           # 归一后的品牌，如 'TOYOTA'
     model_keyword: str | None = None   # 归一失败的原始关键词，走 car_model 模糊匹配
     displacement: str | None = None    # 排量偏好（'3.5'）—— 只做加分，不做硬过滤
+    #: 关键词是否已被解析层认证为**库内真实型号**（Fix-2，2026-09-28）。
+    #: 零命中放宽阶梯里「真型号永不丢弃」需要它：engine 手上没有 SearchContext，
+    #: 判不出「是不是某个库内键的前缀」（'740' → 740LI），只能由解析层盖章。
+    #: 解析层判据是 `ctx.is_model_code(keyword)`（等值键 / 键前缀 / 词表命中）；
+    #: engine 侧再 OR 上自己的 `is_identity_code`（含字母的 ASCII 码，如 M760）。
+    #:
+    #: ⚠️ **刻意不进 `ALLOWED_LLM_FIELDS`** —— 模型不可注入。但 `from_dict` 走的是
+    #: `dataclass_fields` 全量白名单，也就是说 `/search/spec` 与 MCP `search_by_spec`
+    #: 的**程序化调用方可以传它**。误设为 True 会锁死「噪声关键词不许丢弃」，
+    #: 让零命中查询退不回放宽结果。这是程序调用方可控的风险点，不是模型可注入点。
+    keyword_is_identity: bool | None = None
 
     # ---- 硬过滤（车况/属性）----
     year_min: int | None = None
@@ -239,6 +250,8 @@ class SearchSpec:
         self.china_plate = _coerce_opt_bool(self.china_plate)
         self.swap = _coerce_opt_bool(self.swap)
         self.dealer = _coerce_opt_bool(self.dealer)
+        # keyword_is_identity：解析层盖的章，同样是三态（None=未盖章，engine 自行判定）
+        self.keyword_is_identity = _coerce_opt_bool(self.keyword_is_identity)
 
         # ---- 区间写反自动纠正 ----
         if (

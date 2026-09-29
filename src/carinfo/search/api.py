@@ -208,7 +208,7 @@ def _do_search_nl(q: str, limit: int | None, can_use: bool) -> dict[str, Any]:
         payload["items"] = items
         payload["query_groups"] = [
             {"label": label or f"条件{i + 1}", "total_matched": out.total_matched,
-             "spec": out.spec}
+             "spec": out.spec, "relaxed": out.relaxed}
             for i, (label, out, _fb) in enumerate(outs)
         ]
         payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)

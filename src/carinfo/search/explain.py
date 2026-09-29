@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from carinfo.search.engine import DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
+from carinfo.search.engine import CORE_DIMS, DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
 from carinfo.search.llm import LLMClient, LLMError
 from carinfo.search.spec import SearchSpec
 
@@ -171,8 +171,11 @@ def item_explain(item: ScoredVehicle, spec: SearchSpec | None = None) -> str:
     if item.scores.get("fresh") is not None and item.scores["fresh"] < 0.3:
         parts.append(f"挂牌已 {item.age_days} 天，热度可能虚高")
 
-    # 缺维如实说：不要让用户以为"车况分低"是真的车况差，可能只是没数据
-    missing = [DIM_LABELS[d] for d in WEIGHTS if d not in item.scores]
+    # 缺维如实说：不要让用户以为"车况分低"是真的车况差，可能只是没数据。
+    # **只认核心六维** —— 第七维 `relaxed` 是「松绑补偿」，常态缺席（99% 的查询
+    # 没有松绑发生）。若把它也纳入「缺数据」叙述，每条结果都会多一句
+    # 「缺松绑补偿数据」的噪声（2026-09-28）。
+    missing = [DIM_LABELS[d] for d in CORE_DIMS if d not in item.scores]
     if missing:
         parts.append("缺" + "/".join(missing) + "数据，该维度未计分")
 
@@ -189,6 +192,9 @@ class ExplainedResult:
     total_matched: int = 0
     spec: dict = field(default_factory=dict)
     source_query: str | None = None
+    #: 被放宽掉的条件名（如 ["import_type"]），空 = 没有放宽。给前端做徽标/
+    #: 一键收紧；人话说明在 summary 首句（由 API/MCP 从 fb_notes 拼入）。
+    relaxed: list[str] = field(default_factory=list)
 
 
 def build_result_dict(item: ScoredVehicle, spec: SearchSpec | None = None) -> dict:
@@ -215,14 +221,29 @@ def build_result_dict(item: ScoredVehicle, spec: SearchSpec | None = None) -> di
 def summarize(result: SearchResult) -> str:
     """确定性摘要。不调模型 —— 摘要里的每个数字都必须可核对。"""
     spec = result.spec
-    target = spec.base_model or spec.brand or spec.model_keyword or "全部车型"
+    # 点名顺序：车系 > **关键词型号** > 品牌。关键词排在品牌之前是因为
+    # 「宝马740」这类查询的 base_model 为空、只有 model_keyword='740'，
+    # 按旧顺序会拼出「在 6 台『BMW』里筛出 5 台」—— 用户问的是 740，
+    # 说「BMW」既不精确也没告诉用户"我按 740 找的"。
+    # （Fix-2b 让规则路径也开始产出关键词，这条路径从少见变成常见，2026-09-28）
+    target = spec.base_model or spec.model_keyword or spec.brand or "全部车型"
     n = len(result.items)
     if not result.items:
         # 诚实 0 必须优先点名**用户说的型号**：`target` 在 model_keyword='M760' +
         # brand='BMW' 时取到的是 brand，会拼出「没有符合 BMW 条件的车」—— 而库里
         # 有 1959 台宝马，用户问的是 M760，直接误导。
         who = spec.model_keyword or target
-        return f"库里没有符合「{who}」条件的车。建议放宽预算或年份。"
+        if not spec.has_model_target:
+            # 纯条件筛选（如「50万以内的7座MPV」）：没有名号可点名，也不该拼出
+            # 「符合『全部车型』条件」这种别扭话；保留泛化的放宽建议。
+            return "库里没有符合条件的车。建议放宽预算或年份。"
+        # 有车型/品牌目标时**不再**加「建议放宽预算或年份」这句空话：零命中协议会把
+        # 探针攒出的具体数字（「库里 740 有 … 年的车」「去掉『行貨』还有 3 台」）
+        # 拼在 summary 首句（见 API/MCP 的 `_prefix_fb`），那句泛泛的建议只会重复且更弱。
+        # 且收敛句必须**不与前置说明打架**：旧文案「库里没有符合『740』条件的车」碰上
+        # 前置的「不限年份还有 27 台」，会被读成「库里根本没有 740」。故显式限定到
+        # 「同时满足你这些条件」——否定的是条件组合，不是车型本身（Fix-7 补，2026-09-28）。
+        return f"没有「{who}」能同时满足你这些条件。"
 
     cheapest = min(
         (x for x in result.items if x.price is not None), key=lambda x: x.price, default=None
@@ -301,4 +322,5 @@ def explain(result: SearchResult, llm: LLMClient | None = None, use_llm: bool = 
         total_matched=result.total_matched,
         spec=result.spec.to_dict(),
         source_query=result.spec.raw_query,
+        relaxed=list(result.relaxed),
     )

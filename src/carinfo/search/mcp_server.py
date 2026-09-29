@@ -38,7 +38,7 @@ from carinfo.search.auth import (
 from carinfo.search.config import load_llm_config, load_search_config
 from carinfo.search.context import SearchContext
 from carinfo.search.db import fetch
-from carinfo.search.engine import search, search_with_fallback
+from carinfo.search.engine import search_with_fallback
 from carinfo.search.explain import explain
 from carinfo.search.llm import LLMClient
 from carinfo.search.parser import parse_query
@@ -168,6 +168,7 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
         "parse_source": parsed.source,
         "spec": first.spec,
         "total_matched": first.total_matched,
+        "relaxed": first.relaxed,
         "notes": list(parsed.notes) + list(first.notes)
                  + [n for _l, _o, fb in outs for n in fb],
         "items": items,
@@ -179,7 +180,8 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
         )
         payload["total_matched"] = sum(out.total_matched for _l, out, _fb in outs)
         payload["query_groups"] = [
-            {"label": label or f"条件{i + 1}", "total_matched": out.total_matched}
+            {"label": label or f"条件{i + 1}", "total_matched": out.total_matched,
+             "relaxed": out.relaxed}
             for i, (label, out, _fb) in enumerate(outs)
         ]
     return payload
@@ -269,6 +271,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
     return {
         "summary": summary,
         "total_matched": out.total_matched,
+        "relaxed": out.relaxed,
         "items": [
             {
                 "vehicle_id": it["vehicle_id"],

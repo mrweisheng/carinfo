@@ -117,6 +117,39 @@ class SearchContext:
             cls._loaded_at = now
             return cls._instance
 
+    def is_model_code(self, kw: str | None) -> bool:
+        """关键词是否**指向库内车型**：等值键、某键的前缀（≥2 字符）、或词表命中。
+
+        放宽阶梯用它区分「真型号」与「解析噪声」：真型号永不丢弃（丢了就是顶包），
+        只有噪声才允许丢。
+
+        **必须按前缀判，不能只做等值。** 纯数字型号（'740'）不在 `models` 里 ——
+        库里只有 740I / 740LI / 740LIA，等值判定会把真型号误判成噪声
+        （2026-09-28 实测：`'740' not in ctx.models` 为真，旧注释声称的
+        「740 会先在 ctx.models 等值命中」不成立）。
+
+        ⚠️ **这是「宽判」不是「精判」，会返回若干 True 的假阳性 —— 调用方必须自己
+        兜底**（2026-09-29 实测订正，旧注释举的 'LM'/'30'/'2015' 反例**全错**）：
+
+        - `'LM'` → **True**（`'LM350'.startswith('LM')`）。靠 `_group_to_spec` 的
+          截断守卫（len<3 且是更长 token 的 <2/3 片段 → 丢弃）拦掉，**不是**靠这里；
+        - `'30'` / `'2015'` → **True**（库里确有 '30'、'2015' 这些脏键，且是前缀）；
+        - `'3000'` → **True**（词表松匹配 `'3000'.startswith('300')` 命中 HINO 的
+          '300' 前缀模式）。故规则层额外按「长度 ≥3 + 排量写法过滤」兜底
+          （见 `parser` 的 `_QUANTITY_RE`）；
+        - `'Z8'` / `'M760'` → **False**（不在库、无前缀、词表也不命中）—— 这两个
+          是**库外型号**，由 `engine.is_identity_code`（含字母的 ASCII 码）与规则层
+          的「型号形状」兜底（两边取或）。
+        """
+        if not kw:
+            return False
+        k = kw.strip().upper()
+        if len(k) < 2:
+            return False
+        if k in self.models or self.vocab.match_compact(k):
+            return True
+        return any(m.startswith(k) for m in self.models)
+
     @classmethod
     def reset(cls) -> None:
         """特征表重算后调用，强制下次重新加载。"""

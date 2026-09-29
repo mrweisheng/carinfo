@@ -51,6 +51,15 @@ from carinfo.search.spec import SORT_NEWEST, SORT_PRICE_ASC, SORT_PRICE_DESC, Se
 #: - value 0.20→0.28:用户说「50万左右」想要的仍是「这个价位里性价比最高的」。
 #: - 旧的「前五维×0.8 等比缩放」论证只保证无锚点查询不受 near 影响,没有为 0.20
 #:   提供依据(报告 D-2 指出),本轮起弃用,test_search [10] 的旧口径等价断言已删。
+#:
+#: ⚠️ **2026-09-28 新增第七维 `relaxed`(松绑补偿)**:零命中查询把 L3 条件放宽后,
+#:    满足**原条件**的车在这一维拿分(比例),让它们排在前面 —— Google SOFT_BOOST
+#:    模式。它**常态缺席**(没有松绑发生就不参与),`combine()` 的缺维归一会把它
+#:    从分母去掉,所以对**既有查询的排序零影响**。
+#:    为什么不外挂在总分之外:外挂会让总分可能 >1.0,且 `score_breakdown` 只列
+#:    `WEIGHTS` 维度 → 这一分**不可见、无法核对**,违反「每一分可解释」铁律。
+#:    ⚠️ 后果:`sum(WEIGHTS)` 变为 **1.08**(六维仍是 1.00)。若测试里锁了
+#:    「权重和 == 1.0」或锁了 `WEIGHTS` 的键集,需同步更新(方案文档 §6 已记)。
 WEIGHTS: dict[str, float] = {
     "match": 0.28,
     "value": 0.28,
@@ -58,7 +67,13 @@ WEIGHTS: dict[str, float] = {
     "fresh": 0.08,
     "condition": 0.20,
     "heat": 0.08,
+    "relaxed": 0.08,
 }
+
+#: 核心六维（顺序即展示顺序）。**解释层的「缺维」叙述只认这六个** ——
+#: `relaxed` 常态缺席,若把它也算进「缺数据」,每条结果都会多一句
+#: 「缺松绑补偿数据」的噪声(见 explain.item_explain)。
+CORE_DIMS: tuple[str, ...] = ("match", "value", "near", "fresh", "condition", "heat")
 
 DIM_LABELS = {
     "match": "车型匹配",
@@ -67,6 +82,7 @@ DIM_LABELS = {
     "fresh": "挂牌时效",
     "condition": "车况",
     "heat": "关注热度",
+    "relaxed": "松绑补偿",
 }
 
 #: ── 「50 万左右 / 2015 年左右」的贴合带 ──
@@ -271,13 +287,27 @@ class SearchResult:
     scanned: int                # 实际拉进内存打分的行数
     elapsed_ms: int
     notes: list[str] = field(default_factory=list)   # 给 explain 层用的诊断信息
+    #: 被放宽掉的条件名（如 ["import_type", "mileage_max"]），空 = 本次没有放宽。
+    #: 由 `search_with_fallback` 的 L3 松绑填写；API/MCP 并入每组 payload，
+    #: 给前端/Agent 做结构化消费（徽标、一键按原条件收紧）。人话说明另走 fb_notes。
+    relaxed: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # SQL 拼装
 # ---------------------------------------------------------------------------
 
-_SELECT = """
+#: **可见性条件**：在售 + 有价 + 有联系方式。列表详情、诚实 0 的「库里有什么」探针、
+#: 以及零命中协议里的 COUNT/EXISTS 探针**共用这一份** —— 三处各自手写一份必然漂移，
+#: 漂移的后果是「诚实 0 的提示报出实际搜不到的车」，那就不是诚实了。
+_VISIBILITY_WHERE = (
+    "v.vehicle_status = 1 AND v.current_price IS NOT NULL AND v.current_price > 0"
+    "  AND (length(btrim(coalesce(v.phone_number, ''))) > 0"
+    "       OR length(btrim(coalesce(v.contact_email, ''))) > 0)"
+)
+
+_SELECT = (
+    """
 SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_url,
        v.seats, v.engine_volume, v.extra_fields,
        v.contact_name, v.phone_number, v.contact_email,
@@ -288,10 +318,11 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
        COUNT(*) OVER () AS _total_matched
 FROM vehicles v
 JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
-WHERE v.vehicle_status = 1 AND v.current_price IS NOT NULL AND v.current_price > 0
-  AND (length(btrim(coalesce(v.phone_number, ''))) > 0
-       OR length(btrim(coalesce(v.contact_email, ''))) > 0)
+WHERE """
+    + _VISIBILITY_WHERE
+    + """
 """
+)
 
 #: TopN 的首图(封面)。DISTINCT ON 取每车 image_order 最小的一张 —— 不写死
 #: `image_order = 0`,首张非 0 的脏数据也能兜住。
@@ -322,9 +353,14 @@ def _like_escape(text: str) -> str:
                 .replace("_", "\\_"))
 
 
-def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
-    """把 spec 翻成参数化 SQL。**所有值必须走占位符**，不做字符串拼接。"""
-    sql = _SELECT
+def _where_clause(spec: SearchSpec) -> tuple[str, list[Any]]:
+    """过滤条件片段（以 ' AND ' 开头的字符串）+ 参数。
+
+    **单点**：`build_query` 与零命中协议的 COUNT/EXISTS 探针都从这里取条件，
+    保证「主查询」与「探针」过滤口径永远一致（探针只改其中某个条件）。
+    **所有值必须走占位符**，不做字符串拼接。
+    """
+    clauses: list[str] = []
     params: list[Any] = []
 
     if spec.base_model:
@@ -333,18 +369,18 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
         # 这里以列表为准（单点），等值匹配变 ANY。
         keys = list(spec.base_models) or [spec.base_model]
         if len(keys) == 1:
-            sql += " AND f.base_model = %s"
+            clauses.append(" AND f.base_model = %s")
             params.append(keys[0])
         else:
-            sql += " AND f.base_model = ANY(%s)"
+            clauses.append(" AND f.base_model = ANY(%s)")
             params.append(keys)
     if spec.brand:
-        sql += " AND f.brand_norm = %s"
+        clauses.append(" AND f.brand_norm = %s")
         params.append(spec.brand)
     if spec.model_keyword:
         # 归一失败时的模糊兜底：关键词出现在 car_model 任意位置即可。
         # 必须转义 LIKE 元字符（见 _like_escape）。
-        sql += " AND v.car_model ILIKE %s ESCAPE '\\'"
+        clauses.append(" AND v.car_model ILIKE %s ESCAPE '\\'")
         params.append(f"%{_like_escape(spec.model_keyword)}%")
     if spec.family:
         # 车系家族前缀（「宝马7系/奔驰S级/Model 3」）：库里这类车按排量变体
@@ -352,64 +388,74 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
         # 尾部 [0-9 ] 是排他键：S 级（S500/S580）不会被 SL350 混入（S 后是 L）、
         # 7 系不会被 X7 混入（X 开头）。M760 这类 M 前缀高性能版用 OR 兜住。
         # family 已在 spec.__post_init__ 收敛为 [A-Z0-9 -] 白名单，参数化安全。
+        #
+        # Fix-3（2026-09-28）：尾部加 `|$` —— 原 `[0-9 ]` 要求家族名后**必须**
+        # 跟数字/空格，标题恰好是裸家族键的车被漏掉（实测 base_model='A6' 37 台
+        # 只命中 33 台、'MODEL 3' 277 台只命中 270 台）。加 `$` 后 37/37、277/277。
+        # 风险检查（实测）：新分支只多出「car_model 恰好等于家族名」这一类 ——
+        # fam='S'（奔驰）裸键 0 台、fam='7'（宝马）裸键 0 台；SL500/SMART 仍被
+        # 排除（S 后是 L/M，两个分支都不匹配）✓。
+        # OR 分支 `^M{fam}` 保留：它兜住 M 前缀高性能版（fam='7' → `^M7` 命中
+        # M760...）。对 fam='MODEL 3' 会拼出永假的 `^MMODEL 3`（无害，不删是为了
+        # 保持「M 前缀兜底」这条语义对所有 family 一致）。
         fam = spec.family
-        pat = f"^(M-?)?{fam}[0-9 ]"
-        sql += " AND (v.car_model ~* %s OR v.car_model ~* %s)"
+        pat = f"^(M-?)?{fam}([0-9 ]|$)"
+        clauses.append(" AND (v.car_model ~* %s OR v.car_model ~* %s)")
         params.append(pat)
         params.append(f"^M{fam}")
 
     if spec.year_min is not None:
         # year 是 varchar，但库内全是 4 位标准年，字典序等值于数值序，能用上索引
-        sql += " AND char_length(v.year) = 4 AND v.year >= %s"
+        clauses.append(" AND char_length(v.year) = 4 AND v.year >= %s")
         params.append(str(spec.year_min))
     if spec.year_max is not None:
-        sql += " AND char_length(v.year) = 4 AND v.year <= %s"
+        clauses.append(" AND char_length(v.year) = 4 AND v.year <= %s")
         params.append(str(spec.year_max))
 
     if spec.price_min is not None:
-        sql += " AND v.current_price >= %s"
+        clauses.append(" AND v.current_price >= %s")
         params.append(spec.price_min)
     if spec.price_max is not None:
-        sql += " AND v.current_price <= %s"
+        clauses.append(" AND v.current_price <= %s")
         params.append(spec.price_max)
 
     if spec.seats is not None:
         # 座位数实测有 '7' / '7 座位' / '7座' 多种写法，取前导数字比
-        sql += " AND v.seats ~ '^[0-9]+' AND substring(v.seats from '^[0-9]+')::int = %s"
+        clauses.append(" AND v.seats ~ '^[0-9]+' AND substring(v.seats from '^[0-9]+')::int = %s")
         params.append(spec.seats)
     if spec.vehicle_type is not None:
-        sql += " AND v.vehicle_type = %s"
+        clauses.append(" AND v.vehicle_type = %s")
         params.append(spec.vehicle_type)
     if spec.transmission:
         # 语义上是枚举（库里只有 2 种写法），通配符顶多让匹配变宽、不会注入；
         # 但口径与 model_keyword 统一，避免"有的字段转义有的不转"这种不一致。
-        sql += " AND v.transmission ILIKE %s ESCAPE '\\'"
+        clauses.append(" AND v.transmission ILIKE %s ESCAPE '\\'")
         params.append(f"%{_like_escape(spec.transmission)}%")
     if spec.fuel_type:
-        sql += " AND v.fuel_type ILIKE %s ESCAPE '\\'"
+        clauses.append(" AND v.fuel_type ILIKE %s ESCAPE '\\'")
         params.append(f"%{_like_escape(spec.fuel_type)}%")
 
     if spec.import_type:
-        sql += " AND v.extra_fields->>'import_type' = %s"
+        clauses.append(" AND v.extra_fields->>'import_type' = %s")
         params.append(_norm_import(spec.import_type))
     if spec.china_plate is not None:
         # jsonb ->> 出来是文本 'true'。IS DISTINCT FROM 让 NULL(描述没提)也
         # 算"不是中港牌" —— False 是排除语义,不能把 NULL 的车留下来
         if spec.china_plate:
-            sql += " AND v.extra_fields->>'china_plate' = 'true'"
+            clauses.append(" AND v.extra_fields->>'china_plate' = 'true'")
         else:
-            sql += " AND v.extra_fields->>'china_plate' IS DISTINCT FROM 'true'"
+            clauses.append(" AND v.extra_fields->>'china_plate' IS DISTINCT FROM 'true'")
     if spec.swap is not None:
         if spec.swap:
-            sql += " AND v.extra_fields->>'is_swap' = 'true'"
+            clauses.append(" AND v.extra_fields->>'is_swap' = 'true'")
         else:
-            sql += " AND v.extra_fields->>'is_swap' IS DISTINCT FROM 'true'"
+            clauses.append(" AND v.extra_fields->>'is_swap' IS DISTINCT FROM 'true'")
     if spec.dealer is not None:
         # is_dealer 由特征表给出且 NOT NULL；COALESCE 只是防御重算瞬间的极端情况
-        sql += f" AND COALESCE(f.is_dealer, FALSE) = {'TRUE' if spec.dealer else 'FALSE'}"
+        clauses.append(f" AND COALESCE(f.is_dealer, FALSE) = {'TRUE' if spec.dealer else 'FALSE'}")
     if spec.hand_max is not None:
-        sql += (" AND v.extra_fields->>'hand_count' ~ '^[0-9]+$'"
-                " AND (v.extra_fields->>'hand_count')::int <= %s")
+        clauses.append(" AND v.extra_fields->>'hand_count' ~ '^[0-9]+$'"
+                       " AND (v.extra_fields->>'hand_count')::int <= %s")
         params.append(spec.hand_max)
     if spec.mileage_max is not None:
         # 口径必须跟展示层 `_mileage_of()` **完全一致**：优先 mileage_km，没有才退回
@@ -417,7 +463,7 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
         # mileage_km=140000 / mileage='180km' 的车（OR 分支被文本那侧满足），
         # 展示出来却是 14 万公里 —— 违反"里程≤5万"的硬条件。
         # 两个键都没有的车**排除**：买家无法核实里程，就不该出现在"里程以内"的结果里。
-        sql += (
+        clauses.append(
             " AND COALESCE("
             "   CASE WHEN v.extra_fields->>'mileage_km' ~ '^[0-9]+$'"
             "        THEN (v.extra_fields->>'mileage_km')::int END,"
@@ -428,12 +474,45 @@ def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
         params.append(spec.mileage_max)
 
     if spec.max_price_ratio is not None:
-        sql += " AND f.price_ratio IS NOT NULL AND f.price_ratio <= %s"
+        clauses.append(" AND f.price_ratio IS NOT NULL AND f.price_ratio <= %s")
         params.append(spec.max_price_ratio)
     if spec.exclude_anomaly:
-        sql += " AND f.is_anomaly = FALSE"
+        clauses.append(" AND f.is_anomaly = FALSE")
 
-    return sql, params
+    return "".join(clauses), params
+
+
+def build_query(spec: SearchSpec) -> tuple[str, list[Any]]:
+    """把 spec 翻成参数化 SQL。**所有值必须走占位符**，不做字符串拼接。"""
+    where, params = _where_clause(spec)
+    return _SELECT + where, params
+
+
+#: ── 零命中协议的探针 ──
+#: 与主查询共用 `_where_clause` + `_VISIBILITY_WHERE`，只差「取哪些列 / 要不要窗口」。
+#: 实测成本（本库 2.3 万可见车，2026-09-28）：①复用 build_query 包一层 count ≈
+#: 98–172ms；②裸 count(*) 去掉窗口函数 ≈ 48–109ms；③EXISTS + LIMIT 1 ≈ 47–62ms。
+#: 「命中判否」用 ③（最便宜），「要数字」才用 ②。方案文档原写的「≤5 次 <100ms」
+#: 不成立，实际一轮零命中协议最坏约 400–700ms（相对正常查询 ~1s 的基线可接受，
+#: 且只在**已经 0 命中**的路径上付这个钱）。
+def _exists_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
+    where, params = _where_clause(spec)
+    return (
+        "SELECT 1 FROM vehicles v "
+        "JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id WHERE "
+        + _VISIBILITY_WHERE + where + " LIMIT 1",
+        params,
+    )
+
+
+def _count_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
+    where, params = _where_clause(spec)
+    return (
+        "SELECT count(*) FROM vehicles v "
+        "JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id WHERE "
+        + _VISIBILITY_WHERE + where,
+        params,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -457,10 +536,15 @@ def score_match(
 
     m = 0.30  # 理论上到不了这里（SQL 已过滤），留个兜底
     if spec.base_model:
-        if base_model == spec.base_model:
-            m = 1.00
-        elif base_model and base_model.startswith(spec.base_model):
-            m = 0.85
+        # 同款变体**同分**（Fix-5，2026-09-28）：LM350H 是刻意并入的同款混动
+        # （context.build_variant_map 的三道约束认定它是变体，不是另一款车），
+        # 不该因为「不是正身」被系统性压 0.15 分。
+        # 旧实现：`== spec.base_model` 得 1.00、`startswith` 得 0.85。而 SQL 侧
+        # 早已改成 `f.base_model = ANY(base_models)` 等值限定 —— 车辆命中的键
+        # **必然等于列表里的某一项**，那条 startswith 分支永远不会命中，
+        # 是死代码（2026-09-28 审核指出），这里连判定带注释一起删掉。
+        keys = spec.base_models or [spec.base_model]
+        m = 1.00 if base_model in keys else 0.30
     elif spec.brand:
         # 只指定品牌时，品牌确实命中才给 0.80（别因为 SQL 过滤了就想当然）
         m = 0.80 if brand_norm == spec.brand else 0.30
@@ -564,6 +648,47 @@ def _mileage_of(ef: dict) -> int | None:
     return km if km and 0 < km <= 1_000_000 else None
 
 
+def _score_relaxed(names: list[str], spec: SearchSpec, ef: dict) -> float | None:
+    """松绑补偿维（第七维）：被放宽的条件里，这台车**满足几项** → 比例分。
+
+    `names` 是被放宽的条件名（来自 `search_with_fallback`），`spec` 是**放宽前**的
+    原始 spec（阈值都在它身上 —— 放宽后的 spec 那些字段已被置 None，拿不到阈值）。
+
+    ⚠️ **只放宽 1 个条件时这一维恒为 0 → 直接返回 None（该维缺席）。**
+    这不是偷懒，是一条可证明的性质：零命中意味着「满足全部条件的车集为空」。
+    只放宽条件 C 时，可用集 R =「满足除 C 外全部条件」，若 R 中存在满足 C 的车，
+    它必然也满足全部条件 → 与「零命中」矛盾。**故 R 中满足 C 的车必然是 0 台。**
+    实测印证：`LM350 + 水貨 + 一手` 松绑后 32 台，relaxed 分全为 0.0。
+    让它以 0 参与只会把总分按 1/(1+0.08) 无谓稀释（排序不变，分数变小），
+    所以单条件松绑时不引入该维。
+
+    只有**累积放宽 ≥2 个条件**时才有部分满足：例如「行貨 + 一手 + ≤5万公里」
+    三个条件一起杀死查询、最终全放宽，则同时满足其中两项的车在此维拿 0.5，
+    排在 0 分的车前面。
+
+    量级说明：权重 0.08 是**刻意的弱信号**（与 near 0.08 同理：boost 必须显著
+    低于 match/value，否则就把用户的硬条件偷换成偏好）。它只在校验分接近时
+    改变顺序，**不承诺**「满足原条件的车一定排在最前」——那需要覆盖六维的差距，
+    与该设计原则冲突。
+    """
+    if not names or len(names) < 2:
+        return None
+    hit = 0
+    for name in names:
+        if name == "import_type":
+            if spec.import_type and _norm_import(ef.get("import_type")) == _norm_import(spec.import_type):
+                hit += 1
+        elif name == "mileage_max":
+            km = _mileage_of(ef)
+            if km is not None and spec.mileage_max is not None and km <= spec.mileage_max:
+                hit += 1
+        elif name == "hand_max":
+            h = _int_or_none(ef.get("hand_count"))
+            if h is not None and spec.hand_max is not None and h <= spec.hand_max:
+                hit += 1
+    return hit / len(names)
+
+
 def _attach_covers(conn, items: list[ScoredVehicle]) -> None:
     """给**已切片的 TopN** 补首图。列表语义只带一张,全量图片走详情接口。
 
@@ -583,8 +708,15 @@ def _attach_covers(conn, items: list[ScoredVehicle]) -> None:
         it.image_url = covers.get(it.vehicle_id)
 
 
-def search(conn, spec: SearchSpec) -> SearchResult:
-    """主入口。conn 由调用方给（API 层用连接池，MCP 用单连接）。"""
+def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
+           relaxed_source: SearchSpec | None = None) -> SearchResult:
+    """主入口。conn 由调用方给（API 层用连接池，MCP 用单连接）。
+
+    `relaxed` / `relaxed_source`：仅由 `search_with_fallback` 在 **L3 松绑后重查**时
+    传入 —— 前者是被放宽的条件名（透出到 `SearchResult.relaxed` 并触发第七维），
+    后者是**放宽前**的原始 spec（阈值在它身上，用于算松绑补偿分）。
+    两者默认都不传 = 常规硬查，行为与历史完全一致。
+    """
     t0 = time.perf_counter()
     sql, params = build_query(spec)
     cur = conn.cursor()
@@ -627,6 +759,8 @@ def search(conn, spec: SearchSpec) -> SearchResult:
             "fresh": score_fresh(age_days),
             "condition": float(cond) if has_cond and cond is not None else None,
             "heat": float(heat) if heat is not None else None,
+            # 第七维：只有 L3 松绑重查时才存在（其余场合为 None → 缺维归一）
+            "relaxed": _score_relaxed(relaxed or [], relaxed_source or spec, ef),
         }
         total, used = combine(dims)
         items.append(
@@ -676,11 +810,11 @@ def search(conn, spec: SearchSpec) -> SearchResult:
     elapsed = int((time.perf_counter() - t0) * 1000)
     return SearchResult(
         spec=spec, items=items, total_matched=total_matched, scanned=scanned,
-        elapsed_ms=elapsed, notes=notes,
+        elapsed_ms=elapsed, notes=notes, relaxed=list(relaxed or []),
     )
 
 
-def _is_identity_code(kw: str | None) -> bool:
+def is_identity_code(kw: str | None) -> bool:
     """ASCII 字母数字码（**且至少含一个字母**）= 车型身份，放宽阶梯里永不丢弃。
 
     道理：车型要么查到、要么明说没有，宽松度只花在年份/价格这些数值条件上
@@ -689,13 +823,35 @@ def _is_identity_code(kw: str | None) -> bool:
 
     为什么要含字母：纯数字码（30/50/760）与预算/年份数字无法区分 —— 实测关键词
     '30' 模糊匹配 767 台、'50' 1638 台，放行等于放弃身份约束。Z8/M8/X1/M760
-    这类真实型号码都含字母；740 这种纯数字型号走不到这里（`resolve_model_target`
-    会先在 ctx.models 里等值命中）。
+    这类真实型号码都含字母。
+
+    ⚠️ **2026-09-28 订正**：本函数原先的注释声称「740 这种纯数字型号走不到这里
+    （`resolve_model_target` 会先在 ctx.models 里等值命中）」——**这个假设不成立**。
+    实测 `'740' not in ctx.models`（库里只有 740I/740LI/740LIA），所以纯数字型号
+    既不含字母、又不在 models 里，两条路都漏 → 被当噪声丢弃 → 321 台宝马顶包。
+    修法：由解析层用 `SearchContext.is_model_code`（含键前缀判定）盖章到
+    `spec.keyword_is_identity`，本函数退化为「兜底的一半」，两者取或。
     """
     if not kw:
         return False
     s = kw.strip()
     return bool(s) and s.isascii() and s.isalnum() and any(c.isalpha() for c in s)
+
+
+def _identity_keyword(spec: SearchSpec) -> str | None:
+    """放宽阶梯里的**身份关键词**：真型号返回原文，噪声返回 None（可丢）。
+
+    两侧取或：
+    - `spec.keyword_is_identity` —— 解析层用 `ctx.is_model_code` 盖的章
+      （能认出 '740' 这种「库内某键的前缀」，engine 自己判不了）；
+    - `is_identity_code` —— engine 自己的兜底（含字母的 ASCII 码，如 M760）。
+    """
+    kw = spec.model_keyword
+    if not kw:
+        return None
+    if spec.keyword_is_identity or is_identity_code(kw):
+        return kw
+    return None
 
 
 def _money(x: float | None) -> str:
@@ -779,25 +935,123 @@ def _target_hint_safe(conn, spec: SearchSpec,
         return [], None
 
 
+#: L3 弱意图属性层 —— 零命中时**最先松绑**的条件，按「实测数据覆盖率升序」排列
+#: （覆盖率越低 = 越可能是**库里根本没这个字段**而误杀，越先松绑）。
+#: 实测覆盖率（本库 23,323 台可见池，2026-09-28）：
+#:
+#:     import_type 32.4%  <  mileage_max 44.1%  <  hand_max 68.9%
+#:
+#: ⚠️ **transmission / seats 刻意不在 L3**：它们是 `vehicles` 的表列，覆盖率实测
+#:    **100%** —— 「不符」不可能是字段缺失，放宽它们等于把「七座」「自动波」的
+#:    硬要求变成软偏好，是**语义倒退**而不是数据补丁。方案原 §3 把这两个放进 L3
+#:    的立论（「数据覆盖率低」）与实测不符，2026-09-28 审核后移出。
+L3_RELAX_ORDER: tuple[str, ...] = ("import_type", "mileage_max", "hand_max")
+
+#: 被放宽条件的人话标签（**不带阈值**的静态名，带阈值走 `_l3_label`）
+_L3_NAMES = {
+    "import_type": "行/水货",
+    "mileage_max": "里程上限",
+    "hand_max": "手数上限",
+}
+
+
+def _l3_label(name: str, spec: SearchSpec) -> str:
+    """把被放宽的条件说成人话（带原阈值），用于 note 与诊断文案。"""
+    if name == "import_type" and spec.import_type:
+        return f"『{spec.import_type}』"
+    if name == "mileage_max" and spec.mileage_max is not None:
+        return f"『里程 {spec.mileage_max:,} 公里以內』"
+    if name == "hand_max" and spec.hand_max is not None:
+        return f"『{spec.hand_max} 手以內』"
+    return f"『{_L3_NAMES.get(name, name)}』"
+
+
+def _probe_exists(conn, spec: SearchSpec) -> bool:
+    """EXISTS 探针：最便宜的「有没有命中」判定（实测 47–62ms）。
+
+    任何异常都当「没有」—— 探针是**锦上添花**：它失败最多让放宽不发生，
+    绝不能把一次本来正常返回 0 的查询变成 500（服务可用性优先于文案）。
+    """
+    try:
+        sql, params = _exists_sql(spec)
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        cur.close()
+        return row is not None
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _probe_count(conn, spec: SearchSpec) -> int | None:
+    """COUNT 探针：要给用户**数字**时用（实测 48–109ms）。失败返回 None。"""
+    try:
+        sql, params = _count_sql(spec)
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        cur.close()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _relax_diagnostics(conn, spec: SearchSpec) -> list[str]:
+    """诚实 0 时的**逐条件诊断**：去掉某一个条件还能有多少台。
+
+    给用户可决策的数字（「去掉『行貨』还有 3 台；去掉『一手』还有 5 台」），
+    而不是干说「建议放宽条件」。只在已经走到诚实 0 的路径上跑，最多 4 条，
+    探针失败自动跳过（→ 只是少一句提示）。
+    """
+    msgs: list[str] = []
+    for name in L3_RELAX_ORDER:
+        if len(msgs) >= 3:
+            break
+        if getattr(spec, name) is None:
+            continue
+        n = _probe_count(conn, replace(spec, **{name: None}))
+        if n:
+            msgs.append(f"去掉{_l3_label(name, spec)}还有 {n} 台")
+    if spec.price_max is not None and len(msgs) < 4:
+        n = _probe_count(conn, replace(spec, price_max=None))
+        if n:
+            msgs.append(f"不限预算还有 {n} 台")
+    if (spec.year_min is not None or spec.year_max is not None) and len(msgs) < 4:
+        n = _probe_count(conn, replace(spec, year_min=None, year_max=None, year_near=None))
+        if n:
+            msgs.append(f"不限年份还有 {n} 台")
+    return msgs
+
+
 def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str]]:
-    """检索 + 零结果时的逐级放宽重查（P2/P3 的兜底，API 与 MCP 共用）。
+    """检索 + 零结果时的逐级放宽重查（API 与 MCP 共用）。
 
-    背景（2026-09-27 两个线上案例）：
-    - 「找17年的特斯拉 Model 3」：库内该车型 2019 年起 —— 精确年份 0 命中，
-      旧逻辑静默把年份当软偏好，返回 19/20/21 年的车且只字不提；
-    - 模型偶发输出残缺关键词（'保姆车'/'LM'）：keyword 0 命中直接空手而归。
+    **统一零命中协议**（2026-09-28 重写，替换旧的「阶梯」）：
 
-    放宽顺序（每一步必须留下说明，宁可明说查不到，不许静默顶包）：
-    1. 车型关键词 + 精确年份同时在 → **保车型、年份 ±3 重查**：车型是用户的
-      身份诉求，年份才是该放宽的那头（2026-09-28 线上事故：库内 7 系
-      16/17 年换代空窗，「17年的宝马740」首查 0 命中，旧版先丢关键词，
-      返回 175 台 2017 年宝马，X1 顶到了 740 的位置）；
-    2. 去掉 model_keyword 重查（keyword 单独撞 0 时往往是模型抖动产物，
-      如 '保姆车'/'LM'；此步只在步骤 1 不适用或放宽年份也没救回来时生效）；
-    3. 精确年份（min==max）→ ±3 年重查（此时保剩余条件）；
-    4. 都不行 → 原样返回 0 结果，并补一句「库里到底有什么」的**数字**
-       （`_target_hint`：有车型给年份段/最低价，只有品牌给品牌最低价），
-       让用户能据此改口，而不是干说"建议放宽预算或年份"。
+    Step 0  全条件硬查，命中即返回；
+    Step 1  【L3 松绑·降级为软信号】按覆盖率升序**累积**放宽 `import_type →
+            mileage_max → hand_max`：每步先做一次 EXISTS 探针（最便宜），
+            命中就用放宽后的条件重查，并让**满足原条件**的车在第七维
+            「松绑补偿」上拿分、排在前面（Google SOFT_BOOST 模式）；
+    Step 2  【保身份放宽年份】精确年份 + 关键词同时在场 → 年份 ±3（现状保留）；
+    Step 3  【丢噪声关键词】只允许丢**非身份码**的关键词（身份码丢了就是顶包）；
+    Step 4  【精确年份 ±3】去掉已证实是噪声的关键词后再放宽年份；
+    Step 5  【诚实 0 + 逐条件诊断】身份数字提示（现状）+ 逐条件探针的可决策数字。
+
+    每一步都必须留下说明 —— 宁可明说查不到，不许静默顶包。
+    ⚠️ **区间年份（min≠max）不做 ±1 放宽**：2026-09-28 实测 `car_model ILIKE
+    '%740%'` 在 2015 有 1 台、2018 有 7 台，一旦给区间两端各 +1 年，方案 §0/§6
+    断言的「`2016到2017年的宝马740` 应当诚实 0」立刻被打破 —— 那是**真的顶包**
+    （用户要 16-17 年，系统回 15/18 年）。要么承认该返回邻近年份、要么不要 ±1，
+    这里选后者：区间放宽没有可信的带宽依据（精确年份的 ±3 来自「换代空窗」实测），
+    不如诚实 0 + 年份段提示让用户自己改口。
+    ⚠️ **规则路径（无 LLM）的已知差异**：`2016到2017年` 这类区间，规则层现已能
+    解析（见 parser 的年份区间块），但更复杂的相对表述仍可能解错；`§6` 的用例
+    以 LLM 路径为口径。
+
+    成本（本库实测）：Step 1 最多 3 次 EXISTS 探针（≈50ms/次）+ 1 次完整重查；
+    Step 5 最多 4 次 COUNT 探针（≈50–110ms/次）。最坏一轮约 400–700ms，
+    **只在已经 0 命中的路径上付**（正常查询 = 一次 search，不变）。
     """
     result = search(conn, spec)
     if result.total_matched > 0:
@@ -807,48 +1061,81 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     exact_year = (spec.year_min
                   if spec.year_min is not None and spec.year_min == spec.year_max
                   else None)
-    #: 身份码关键词：放宽阶梯里绝不丢弃（见 docstring 与 `_is_identity_code`）
-    identity_kw = spec.model_keyword if _is_identity_code(spec.model_keyword) else None
+    #: 身份码关键词：放宽阶梯里绝不丢弃（见 `_identity_keyword`）
+    identity_kw = _identity_keyword(spec)
 
-    # 步骤 1：保车型关键词，放宽年份
+    # ── Step 1：L3 松绑（降级为软信号）────────────────────────────────────
+    l3_present = [n for n in L3_RELAX_ORDER if getattr(spec, n) is not None]
+    if l3_present:
+        dropped: list[str] = []
+        for name in l3_present:
+            dropped.append(name)
+            probe = replace(spec, **{k: None for k in dropped})
+            if not _probe_exists(conn, probe):
+                continue
+            r1 = search(conn, probe, relaxed=list(dropped), relaxed_source=spec)
+            if r1.total_matched > 0:
+                labels = "、".join(_l3_label(n, spec) for n in dropped)
+                if len(dropped) == 1:
+                    # 单条件松绑时**可证明**没有任何结果满足该条件（见
+                    # `_score_relaxed` 的证明），所以只说「放宽了」，**不能**说
+                    # 「满足原条件的排在前面」—— 那是一句不可能兑现的话。
+                    fb_notes.append(
+                        f"**库里没有满足 {labels} 的车**，已放宽这个条件；"
+                        f"以下结果不再要求它"
+                    )
+                else:
+                    fb_notes.append(
+                        f"**没有同时满足 {labels} 的车**，已放宽这些条件；"
+                        f"满足其中更多条件的排在前面"
+                    )
+                return r1, fb_notes
+
+    # ── Step 2：保车型关键词，放宽年份（现状步骤 1 保留）──────────────────
     if spec.model_keyword and exact_year is not None:
-        r1 = search(conn, replace(spec, year_min=exact_year - 3,
+        r2 = search(conn, replace(spec, year_min=exact_year - 3,
                                   year_max=exact_year + 3))
-        if r1.total_matched > 0:
+        if r2.total_matched > 0:
             fb_notes.append(f"**没有 {exact_year} 年的「{spec.model_keyword}」**"
                             f"（该车型/条件下），以下为年份最接近的结果（±3 年内）")
-            return r1, fb_notes
-
-    # 步骤 2：只允许丢**噪声**关键词；身份码跳过（丢了就是顶包）
-    if spec.model_keyword and identity_kw is None:
-        r2 = search(conn, replace(spec, model_keyword=None))
-        if r2.total_matched > 0:
-            fb_notes.append(f"关键词「{spec.model_keyword}」没有命中任何车，"
-                            f"已忽略它重新检索（该关键词可能是解析噪声）")
             return r2, fb_notes
 
-    if exact_year is not None and identity_kw is None:
-        # 到这里说明关键词已证实是噪声（或本来就没有），放宽时一并去掉，
-        # 避免「噪声关键词 + 放宽年份」双重放水
-        r3 = search(conn, replace(spec, model_keyword=None,
-                                  year_min=exact_year - 3,
-                                  year_max=exact_year + 3))
+    # ── Step 3：只允许丢**噪声**关键词；身份码跳过（丢了就是顶包）────────
+    if spec.model_keyword and identity_kw is None:
+        r3 = search(conn, replace(spec, model_keyword=None))
         if r3.total_matched > 0:
-            fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
-                            f"以下为年份最接近的结果（±3 年内）")
+            fb_notes.append(f"关键词「{spec.model_keyword}」没有命中任何车，"
+                            f"已忽略它重新检索（该关键词可能是解析噪声）")
             return r3, fb_notes
 
-    # 走到这里说明没有可放宽的数值条件（或关键词是身份码，不许丢）→ 诚实 0。
-    # 补一句「库里到底有什么」的**数字**：只按身份算、忽略数值条件，让用户能改口。
-    # 放在 engine 层：conn 在手，API / MCP / /search/spec 三条路径一次覆盖，
-    # 也不必给纯函数 explain 传连接。
+    if exact_year is not None and identity_kw is None:
+        # ── Step 4：到这里说明关键词已证实是噪声（或本来就没有），放宽时一并去掉，
+        #    避免「噪声关键词 + 放宽年份」双重放水 ────────────────────────────
+        r4 = search(conn, replace(spec, model_keyword=None,
+                                  year_min=exact_year - 3,
+                                  year_max=exact_year + 3))
+        if r4.total_matched > 0:
+            fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
+                            f"以下为年份最接近的结果（±3 年内）")
+            return r4, fb_notes
+
+    # ── Step 5：没有可放宽的条件（或关键词是身份码，不许丢）→ 诚实 0。
+    #    补上「库里到底有什么」的**数字**：只按身份算、忽略数值条件，让用户能改口。
+    #    放在 engine 层：conn 在手，API / MCP / /search/spec 三条路径一次覆盖，
+    #    也不必给纯函数 explain 传连接。
     if identity_kw is not None:
         years, cheap = _target_hint_safe(conn, spec, identity_kw)
         if years:
-            fb_notes.append(
-                f"「{identity_kw}」库里有 {_fmt_year_ranges(years)} 年的车"
-                + (f"，最便宜约 {_money(cheap)}" if cheap is not None else "")
-                + "；但没有符合你其余条件的，未用其它车型顶替")
+            line = (f"「{identity_kw}」库里有 {_fmt_year_ranges(years)} 年的车")
+            if cheap is not None:
+                line += f"，最便宜约 {_money(cheap)}"
+                # Fix-8：超预算幅度 —— 比「没有符合的」更可决策
+                # （用户据此判断「加点预算」还是「换型号」）。
+                if spec.price_max and cheap > spec.price_max:
+                    over = (cheap - spec.price_max) / spec.price_max * 100
+                    line += f"（超预算 {over:.0f}%）"
+            line += "；但没有符合你其余条件的，未用其它车型顶替"
+            fb_notes.append(line)
         else:
             # 型号确实不在库 → 退一步给同品牌最低价，好歹给个可改口的数字
             _, brand_cheap = _target_hint_safe(conn, spec, None) if spec.brand else ([], None)
@@ -866,6 +1153,11 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
         _, cheap = _target_hint_safe(conn, spec, None)
         if cheap is not None:
             fb_notes.append(f"库里最便宜的{spec.brand}约 {_money(cheap)}")
+
+    # 逐条件诊断：把「去掉哪个条件还有多少台」直接给用户（可决策数字）
+    diag = _relax_diagnostics(conn, spec)
+    if diag:
+        fb_notes.append("；".join(diag))
 
     return result, fb_notes
 

@@ -456,7 +456,16 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
             tokens = re.findall(r"[A-Z0-9]+", query.upper())
             for grp in re.findall(r"[A-Z0-9]+(?:\s+[A-Z0-9]+)*", query.upper()):
                 flat = re.sub(r"\s+", "", grp)
-                if flat not in tokens:
+                # 压平组**只有本身是已知车型**时才参与截断判定（Fix-1，2026-09-28）：
+                # 原先无条件压平，'740 2018' → '7402018' 让**完整的** '740' 被当成
+                # 它的截断片段（'740' 是前缀且 3 < 8×2/3）→ 真型号被丢弃 →
+                # 全系列宝马顶包（实测 229 台，Top 是 X3/X5）。
+                # 实测 '7402018' ∉ models、vocab.match_compact 也不命中，故 gating 后
+                # '740' 不再被误判；'LM 350' → 'LM350' ∈ models，仍能拦下残缺的 '350'
+                # ——**原有防线一字未减**。副作用：库外长尾车型的空格写法漏判截断
+                # → 关键词保留 → 查宽，是安全方向。
+                if flat not in tokens and (flat in ctx.models
+                                           or ctx.vocab.match_compact(flat)):
                     tokens.append(flat)
             # 完整 token 判定必须是**精确相等**（list 的 in 是相等比较，不是子串）：
             # 写成子串会把「530」的片段「30」也当完整词放行（实测 '%30%' 命中 767 台）。
@@ -514,6 +523,11 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
         # 统一交给 SearchSpec.__post_init__ 收敛：转不了退回 DEFAULT_LIMIT。
         "limit": data.get("limit") if data.get("limit") is not None else DEFAULT_LIMIT,
     }
+    # 关键词身份盖章（Fix-2，2026-09-28）：'740' 这类**库内某键的前缀**是真型号，
+    # 零命中放宽时不许当噪声丢弃（丢了就是顶包）。engine 手上没有 SearchContext，
+    # 判不出前缀，故由解析层盖章；engine 侧再 OR 上自己的「含字母 ASCII 码」判定。
+    if keyword:
+        payload["keyword_is_identity"] = bool(ctx.is_model_code(keyword))
     # 同款变体展开（P1）：LM350 → [LM350, LM350H]。映射在 SearchContext 里
     # 预计算（构建规则见 context.build_variant_map 的 docstring）。
     if base_model:
@@ -638,6 +652,19 @@ _AROUND_WORDS = ("左右", "上下", "前後", "前后", "大概", "差不多", 
 #: character，`\b` 在数字后不成立，会导致年份一个字都抽不出来。
 _YEAR_RE = re.compile(r"(?<!\d)(19[5-9]\d|20[0-4]\d)(?!\d)")
 
+#: 「数字 + 排量/功率单位」写法（'3000CC' / '2000KW'）—— 是排量/功率，不是型号。
+#: **必须排在 `ctx.is_model_code` 之前**：词表的松匹配（`match_compact`）会把
+#: '3000' 命中 HINO 的 '300' 前缀模式，使 `is_model_code` 误判为 True —— 实测
+#: 「3000cc 宝马」会被锁成 `model_keyword='3000CC'` → 0 台 + 误导提示
+#: （Fix-2b 排量守卫，2026-09-29；原以为「库里没有 3000 开头的键」能兜住，实测不成立）。
+_QUANTITY_RE = re.compile(r"\d+(?:\.\d+)?(?:CC|KW|HP|PS|NM|KM)")
+
+#: 型号**形状**：字母 ≤3 + 数字 ≤4（'M760' / 'C200' / 'RS6'）。规则层没有世界知识，
+#: 但「库外型号」多为此形状 —— 用它把 '宝马M760' 补成身份关键词，与 LLM 路径行为
+#: 一致（诚实 0）。长度守卫 ≥3 挡掉 'V6' / 'W12' 这类引擎排布短词；字母 >3 的
+#: 'SDRIVE18IA' 天然不命中（2026-09-29，用户确认的可选项）。
+_CODE_SHAPE_RE = re.compile(r"[A-Z]{1,3}[0-9]{1,4}")
+
 
 def _rule_near_anchor(query: str, kind: str) -> tuple[float | None, bool]:
     """从原文里按规则抽出模糊锚点。返回 `(锚点, 是否还有明确边界词)`。
@@ -699,8 +726,15 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         # 必然落空，LLM 降级时车型条件会静默消失（2026-09-27 审核实锤）
         up_compact = re.sub(r"[\s\-]+", "", up)
         for model in sorted(ctx.models, key=len, reverse=True):
-            if len(model) < 3 or not any(c.isalpha() for c in model):
-                continue  # 跳过 '3.5' / '5.5' / '2015' 这类从脏数据兜出来的数字键
+            if len(model) < 2 or not any(c.isalpha() for c in model):
+                continue  # 跳过 '3.5' / '5.5' / '2015' 这类从脏数据兜出来的纯数字键
+            # len<3 → len<2（Fix-4，2026-09-28）：两位真实键（M3/X5/Z4/A6…）原先被
+            # 一刀切跳过，无 LLM 时「宝马M3」「奥迪A6」退化成全品牌 1,959 台。
+            # 纯数字键仍由 `not any(c.isalpha())` 拦住（'30'/'2015' 不会误命中），
+            # 单字符脏键仍被 len<2 拦住。风险面实测为 **97 个两位含字母键**
+            # （含 EV/GT/RS/AC 等泛型短词），靠 `(?<![A-Z0-9])…(?![A-Z0-9])`
+            # 边界断言挡住子串误命中；用户单独喊「EV」这类词会被当成车系——
+            # 属可接受代价（宁可认出也不漏识），已在方案文档 §5 Fix-4 记录。
             if (re.search(rf"(?<![A-Z0-9]){re.escape(model)}(?![A-Z0-9])", up)
                     or re.search(rf"(?<![A-Z0-9]){re.escape(model.replace(' ', ''))}(?![A-Z0-9])",
                                  up_compact)):
@@ -736,6 +770,27 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             # 多个模糊量时取最靠前的（"50 万左右"后面再蹦一个数，语义已经不清了）。
             payload.setdefault("price_near", amt)
 
+    # --- 年份区间（「2016到2017年」「14-17年」）---
+    # 现状只认单个年份，且靠「数字后紧跟『年』」判定裸年份 —— '2016到2017年' 里
+    # 2016 后面是「到」不是「年」，于是被忽略，只剩 2017 被锁成**精确年**，
+    # 语义从「区间」悄悄缩成「某一年」。区间空窗正是 B-2 的典型场景，
+    # 规则路径必须先能表达区间，修复才有处落地（2026-09-28 审核补充）。
+    interval: tuple[int, int] | None = None
+    _iv = re.search(r"(?<!\d)(\d{2,4})\s*(?:到|至|~|～|—|–|-)\s*(\d{2,4})(?=\s*年)", query)
+    if _iv:
+        a, b = int(_iv.group(1)), int(_iv.group(2))
+        if len(_iv.group(1)) == 2:
+            a += 2000
+        if len(_iv.group(2)) == 2:
+            b += 2000
+        if a > b:
+            a, b = b, a
+        if 1950 <= a <= 2049 and 1950 <= b <= 2049:
+            interval = (a, b)
+            payload["year_min"] = a
+            payload["year_max"] = b
+    iv_span: tuple[int, int] | None = _iv.span() if interval else None
+
     # --- 年份 ---
     # 同样不能用 \b：「2015年」里「年」是 word character，\b 在数字后不成立，
     # 会导致年份一个字都抽不出来。改用数字边界断言。
@@ -751,6 +806,8 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             # 记原文长度 2（不是归一后 2017 的 4）：裸年份判定要拿它索引原文
             year_hits.append((y2, m.start(), 2))
     for y, pos, raw_len in sorted(year_hits, key=lambda t: t[1]):
+        if iv_span and iv_span[0] <= pos < iv_span[1]:
+            continue          # 已由区间表达（'2016到2017年'），不再缩成单年
         around = _window(query, pos)
         if any(w in around for w in _MIN_WORDS):
             payload["year_min"] = max(payload.get("year_min", y), y)
@@ -785,6 +842,53 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         if re.fullmatch(r"[A-Z0-9 -]+", candidate):
             payload["family"] = candidate
 
+    # --- 型号关键词补救（Fix-2b，2026-09-28 审核补充）---
+    # 规则层原先**压根不产出 model_keyword**（只写 base_model/brand），于是「品牌 +
+    # 非完整键的型号」这类查询直接丢掉型号条件：实测 `宝马740 2018年` 解析成
+    # 「BMW + 2018」→ 命中 229 台全系列宝马（Top 是 X3/X5）→ 顶包；
+    # `宝马740 50万以内` → 1,838 台。同样的成因，与 Fix-1/Fix-2 修的 LLM 路径
+    # **不是同一条** —— 那两处对这条路径一点作用都没有。
+    # '740' 不是库内完整键（库里是 740I/740LI/740LIA），上面的键扫描扫不到它，
+    # 只能靠「是不是某键的前缀」把它补成 model_keyword。
+    # 放在 family 之后：family 命中的查询（「宝马7系」）不该再叠一个关键词，
+    # 两者 AND 起来容易空集。
+    # 主判据是 `ctx.is_model_code`（等值键 / 键前缀 / 词表命中）—— 库内证据。
+    # 库外型号（如 'M760'：库里既无 M760 也无 M760* 前缀）is_model_code 判不出，
+    # 再用**形状**兜底（`_CODE_SHAPE_RE`，见下），使规则路径与 LLM 路径**行为一致**
+    # （诚实 0），不再退化成品牌级 1,959 台（2026-09-29 起）。
+    if not payload.get("base_model") and not payload.get("family"):
+        for _m in re.finditer(r"[A-Z0-9]+", up):
+            tok = _m.group(0)
+            if len(tok) < 3 or tok in ctx.models:
+                continue          # 完整键上面的扫描已处理；两位前缀歧义太大，不收
+            # 排量/功率写法（'3000CC'）不是型号。必须排在 is_model_code **之前**：
+            # 词表松匹配把 '3000' 命中 HINO 的 '300' 前缀，is_model_code 会误判 True
+            # —— 实测「3000cc 宝马」被锁成 model_keyword='3000CC' → 0 台 + 误导提示。
+            if _QUANTITY_RE.fullmatch(tok):
+                continue
+            # 单位前瞻：看 token **后至多 3 个字符**（允许空格），不是只看后 1 个 ——
+            # '3000 cc'（数字与单位间有空格）后 1 个字符是空格，原先漏判。
+            after = up[_m.end():_m.end() + 3].lstrip()
+            if after[:1] and after[:1] in "萬万億亿千kKwW公里座坐年手匹":
+                continue          # '50萬' 的 50、'2018年' 的 2018、'5萬公里' 的 5 都不是型号
+            if after[:2] in ("CC", "KW", "HP", "PS", "NM", "KM"):
+                continue          # '3000 cc' 这种空格分隔的排量写法
+            if _YEAR_RE.fullmatch(tok):
+                continue
+            if ctx.is_model_code(tok):
+                payload["model_keyword"] = tok
+                payload["keyword_is_identity"] = True   # 真型号，放宽阶梯里不许丢
+                break
+            # 库外型号（规则层无世界知识，「字母+数字」是通用型号形状）：'宝马M760'
+            # 库里既无 M760 也无 M760* 前缀，is_model_code 判不出 → 在此按形状补成
+            # 身份关键词，与 LLM 路径**行为一致**（诚实 0 + 数字提示），不再退化成
+            # 品牌级 1,959 台（2026-09-29）。长度 ≥3 已过滤 'V6' 这类短词；字母 >3 的
+            # 'SDRIVE18IA' 天然不命中。
+            if _CODE_SHAPE_RE.fullmatch(tok):
+                payload["model_keyword"] = tok
+                payload["keyword_is_identity"] = True
+                break
+
     # --- 手数 ---
     # ⚠️ 先把「二手」整体剔掉，再匹配手数。
     # 「二手」是 used car 的**泛称**，不是「过户 2 次的车」—— 中文里没人用「二手」
@@ -805,7 +909,15 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             n = _cn_to_int(hand.group(1))
             if n is not None:
                 payload["hand_max"] = n
-        elif "一手" in hand_text or "一手車" in hand_text:
+        elif (
+            "一手" in hand_text or "一手車" in hand_text
+            # Fix-6（2026-09-28）：补「一部手」「首任車主」两种说法。
+            # 实测描述语料里 '一部手' 0 条、'首任' 1 条（'一手' 165 条），
+            # 所以这是**用户输入侧**的口语覆盖，不是提取侧的能力提升；
+            # 优先级最低，不与两个 P0 混批次（见方案文档 §7）。
+            or "一部手" in hand_text
+            or "首任車主" in hand_text or "首任车主" in hand_text
+        ):
             payload["hand_max"] = 1
 
     # --- 里程 ---
