@@ -304,8 +304,9 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
         "一句话可以同时找多台车（'找台14年威尔法，再找台14年埃尔法'、'阿尔法或者威尔法'），"
         "结果每条带 query 字段标注对应哪台车。口语车系名（'宝马7系/奔驰S级/Model 3'）"
         "也能理解，按整个车系家族检索。"
-        "查询里可以说「不要车行/只要私人车主」筛掉车行卖家（挂车 ≥4 台判车行，结果带「车行」标签）。"
-        "例：'五十萬以內的阿尔法'、'宝马7系'、'不要车行的七座MPV'。"
+        "**默认只返回个人卖家车源**（已排除车行，挂车 ≥4 台判车行）；库里没有个人车源时会自动放宽为"
+        "包含车行，结果带「车行」标签可辨识。说「要车行」则只看车行。"
+        "例：'五十萬以內的阿尔法'、'宝马7系'、'七座MPV'。"
         "价格均为港币。"
     ),
 )
@@ -344,10 +345,12 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
         "参数即下面函数签名里的那些。"
         "⚠️ 默认值不等于「不设限」，有两条隐式收窄："
         "① 只搜**私家车**（车型类别固定为私家车，不含客货车/货车/电单车/经典车）；"
-        "② **自动排除疑似问题车**（比同款行情低 50% 以上的）。"
-        "china_plate/swap/dealer 是三态：None=不筛；true=只要；false=排除。"
-        "dealer=false 表示**只要个人卖家**（不想碰车行/同行时用；判定依据=同一联系方式"
-        "在售挂车数 ≥4 台）；dealer=true 只要车行。"
+        "② **自动排除疑似问题车**（比同款行情低 50% 以上的）；"
+        "③ **默认只要个人卖家**（dealer=False，排除车行/同行：同一联系方式在售挂车数"
+        "≥4 台判车行）。"
+        "china_plate/swap/dealer 是三态：true=只要；false=排除；None=不筛。"
+        "dealer=true 只要车行；dealer=None 车行+个人都返回（要全部货时用）；"
+        "零命中时系统会自动放宽为含车行，结果仍带「车行」标签。"
         "签名里没列出的条件（变速箱、燃料、行水货、排量、关键词）则是真的不设限。"
     ),
 )
@@ -364,7 +367,7 @@ def search_by_spec(
     max_price_ratio: float | None = None,
     china_plate: bool | None = None,
     swap: bool | None = None,
-    dealer: bool | None = None,
+    dealer: bool | None = False,
     sort: str = "score",
     limit: int = 5,
 ) -> dict[str, Any]:

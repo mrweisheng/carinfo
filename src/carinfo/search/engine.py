@@ -1105,6 +1105,8 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     Step 2  【保身份放宽年份】精确年份 + 关键词同时在场 → 年份 ±3（现状保留）；
     Step 3  【丢噪声关键词】只允许丢**非身份码**的关键词（身份码丢了就是顶包）；
     Step 4  【精确年份 ±3】去掉已证实是噪声的关键词后再放宽年份；
+    Step 4.5【车行兜底】默认排除车行（dealer=False）且前面都没命中时，放宽为含车行
+            （结果仍带「车行」标签）；
     Step 5  【诚实 0 + 逐条件诊断】身份数字提示（现状）+ 逐条件探针的可决策数字。
 
     每一步都必须留下说明 —— 宁可明说查不到，不许静默顶包。
@@ -1187,6 +1189,19 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
             fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
                             f"以下为年份最接近的结果（±3 年内）")
             return r4, fb_notes
+
+    # ── Step 4.5：车行兜底 ── 个人车源确实没有（或都不符合其余条件）时，放宽为
+    #    「含车行」。这是默认排除车行后的**最后一档**：能查到个人就先返回个人，
+    #    实在没有才把车行拉出来，且结果仍带 is_dealer/「车行」标签，用户可辨识。
+    #    放在其余放宽之后（年份/关键词先试），因为放宽它们比引入车行更贴近原意。
+    if spec.dealer is False:
+        r5 = search(conn, replace(spec, dealer=None))
+        if r5.total_matched > 0:
+            fb_notes.append(
+                "**库里没有符合其余条件的个人卖家车源**，已放宽为包含车行；"
+                "以下结果已标注「车行」"
+            )
+            return r5, fb_notes
 
     # ── Step 5：没有可放宽的条件（或关键词是身份码，不许丢）→ 诚实 0。
     #    补上「库里到底有什么」的**数字**：只按身份算、忽略数值条件，让用户能改口。

@@ -1068,6 +1068,16 @@ class CarinfoService:
             except Exception as e:
                 self._log(f"LLM 字段提取入口异常(不影响调度): {e}", level="WARNING")
 
+            # 车名别名生成(增量):只给本轮新出现的车系补中文别名(如 步威→STEPWGN)。
+            # 放这里同理——生成失败不能阻止「今天已完成」标记;没生成的下轮自愈。
+            try:
+                from carinfo.search.aliases import run_incremental as alias_incremental
+
+                ok, msg = alias_incremental()
+                self._log(msg, level="INFO" if ok else "WARNING")
+            except Exception as e:
+                self._log(f"车名别名生成入口异常(不影响调度): {e}", level="WARNING")
+
         except Exception as e:
             self._log(f"任务执行异常: {e}", level="ERROR")
             import traceback

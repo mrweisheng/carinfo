@@ -82,17 +82,20 @@ def test_displacement_query_not_locked_out(real_ctx, db_fetch, query):
 # ⚠️ 本地库即线上服务库，正被爬虫**实时写入**，精确计数会随入库漂移
 # （实测 MODEL 3 在几分钟内 276→278→279）。用下界锁定「变体合并没退化」这个
 # 不变量即可：掉到历史值以下 = 过滤/归一坏了；高于它 = 正常新增车源。
+# ⚠️ 这几条锁的是「车型归一/变体合并」不变量，与「默认只出个人车源」（dealer=False）
+# 无关 —— 故显式 `dealer=None` 看全量池，否则计数会被车行过滤整体拉低（2026-09-29）。
 def test_snapshot_base_model_a6(real_ctx, db_fetch):
-    spec = SearchSpec(raw_query="奥迪A6", base_model="A6")
+    spec = SearchSpec(raw_query="奥迪A6", base_model="A6", dealer=None)
     assert db_fetch(lambda conn: search(conn, spec).total_matched) >= 30
 
 
 def test_snapshot_base_model_model3(real_ctx, db_fetch):
-    spec = SearchSpec(raw_query="特斯拉Model 3", base_model="MODEL 3")
+    spec = SearchSpec(raw_query="特斯拉Model 3", base_model="MODEL 3", dealer=None)
     assert db_fetch(lambda conn: search(conn, spec).total_matched) >= 276
 
 
 def test_snapshot_bmw740_2018_count(real_ctx, db_fetch):
     s = rule_based_parse("宝马740 2018年", real_ctx)
+    s.dealer = None            # 同上：锁车型解析，不看车行过滤
     r, _fb = _run(db_fetch, s)
     assert r.total_matched >= 6

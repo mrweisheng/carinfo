@@ -10,7 +10,11 @@ from __future__ import annotations
 import threading
 import time
 
+from carinfo.search.aliases import SEED_ALIASES, cjk_runs, load_rows, normalize_alias, to_pinyin
 from carinfo.search.normalize import Vocabulary
+
+#: 拼音匹配的最短长度（≥ 2 个汉字，如「步威」= buwei=5）。单字拼音歧义太大，不参与。
+_MIN_PINYIN_LEN = 4
 
 #: 车系变体尾缀白名单（同款车型的动力/驱动/写法后缀）。
 #: **数字尾缀一律不收**：A3→A35、GT→GT3 是不同功率级/不同车。
@@ -21,6 +25,35 @@ VARIANT_TAILS = frozenset({
     "H", "L", "A", "I", "D", "E", "S", "C", "V", "R",
     "HL", "IA", "DI", "CDI", "EV", "HYBRID", "SP", "SE", "TRD", "BT", "GT",
 })
+
+
+def _build_alias_maps(
+    rows: list[tuple[str, str, str, str]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """构建 (别名→车系, 拼音→车系) 两张映射。
+
+    - 静态种子 (`SEED_ALIASES`) 先入，`model_aliases` 表后入；同名时**种子优先**
+      （`setdefault`），避免生成结果覆盖人工确认条目。
+    - 拼音映射只保留**唯一**指向的：两个不同车系共用同一拼音时整条剔除
+      （如「赛瑞纳」与其它同音词 → 匹配会指向错误车系，宁可漏）。
+    """
+    alias_map: dict[str, str] = {}
+    for alias, base in SEED_ALIASES.items():
+        a = normalize_alias(alias)
+        if a:
+            alias_map.setdefault(a, base)
+    for alias, _py, base, _src in rows:
+        a = normalize_alias(alias)
+        if a:
+            alias_map.setdefault(a, base)
+
+    pinyin_bases: dict[str, set[str]] = {}
+    for a, base in alias_map.items():
+        py = to_pinyin(a)
+        if len(py) >= _MIN_PINYIN_LEN:
+            pinyin_bases.setdefault(py, set()).add(base)
+    pinyin_map = {py: next(iter(bases)) for py, bases in pinyin_bases.items() if len(bases) == 1}
+    return alias_map, pinyin_map
 
 
 def build_variant_map(rows: list[tuple[str, str, int]]) -> dict[str, list[str]]:
@@ -75,13 +108,21 @@ class SearchContext:
     TTL_SECONDS = 300.0
 
     def __init__(self, vocab: Vocabulary, models: set[str], brands: set[str],
-                 variant_map: dict[str, list[str]] | None = None):
+                 variant_map: dict[str, list[str]] | None = None,
+                 alias_map: dict[str, str] | None = None,
+                 pinyin_map: dict[str, str] | None = None):
         self.vocab = vocab
         self.models = models
         self.brands = brands
         #: base_model → 同款兄弟键（如 LM350 → [LM350H]）。命中精确车系时
         #: 解析层把它展开成列表一起查 —— 否则搜 LM350 会漏掉混动版 18 台。
         self.variant_map = variant_map or {}
+        #: 中文别名 → base_model（种子 + model_aliases 表）。静态种子先入、表后入，
+        #: 同别名时种子优先。
+        self.alias_map = alias_map or {}
+        #: 无调拼音 → base_model（同音错别字/繁简兜底）。**有歧义的拼音已剔除**
+        #: （两个不同车系共用同一拼音时不匹配，宁可漏不可错）。
+        self.pinyin_map = pinyin_map or {}
 
     @classmethod
     def load(cls, conn, force: bool = False) -> "SearchContext":
@@ -113,7 +154,11 @@ class SearchContext:
             variant_map = build_variant_map(cur.fetchall())
             cur.close()
 
-            cls._instance = cls(vocab, models, brands, variant_map)
+            # 别名表可能尚未建（首次部署）：load_rows 表不存在时返回 []，退回静态种子，
+            # 绝不让检索侧 500。
+            alias_map, pinyin_map = _build_alias_maps(load_rows(conn))
+
+            cls._instance = cls(vocab, models, brands, variant_map, alias_map, pinyin_map)
             cls._loaded_at = now
             return cls._instance
 
@@ -149,6 +194,47 @@ class SearchContext:
         if k in self.models or self.vocab.match_compact(k):
             return True
         return any(m.startswith(k) for m in self.models)
+
+    def resolve_model_alias(self, text: str | None) -> str | None:
+        """中文别名（含**同音错字/繁简差异**）→ 库内 base_model；命中不了返回 None。
+
+        两步：① 精确别名；② 无调拼音（`步威`↔`布威`、`阿爾法`↔`阿尔法`）。
+        两者都要求目标键确实在 `self.models` 里（库里没有的车系不能用别名硬指）。
+        """
+        key = normalize_alias(text)
+        if not key:
+            return None
+        bm = self.alias_map.get(key)
+        if bm and bm in self.models:
+            return bm
+        py = to_pinyin(key)
+        if len(py) >= _MIN_PINYIN_LEN:
+            bm = self.pinyin_map.get(py)
+            if bm and bm in self.models:
+                return bm
+        return None
+
+    def find_model_alias(self, text: str | None) -> str | None:
+        """从**整句**里找别名（规则路径用）。先精确子串，再对中文段做滑窗拼音匹配。
+
+        规则路径拿到的是整句（「我想搵布威」），要能定位其中的车名。滑窗限制 2-5 字，
+        既能覆盖「埃尔法」「陆地巡洋舰」，又不至于把整句当拼音去撞。
+        """
+        if not text:
+            return None
+        for alias, bm in self.alias_map.items():
+            if alias in text and bm in self.models:
+                return bm
+        for run in cjk_runs(text):
+            n = len(run)
+            for i in range(n):
+                for j in range(i + 2, min(i + 6, n) + 1):
+                    py = to_pinyin(run[i:j])
+                    if len(py) >= _MIN_PINYIN_LEN:
+                        bm = self.pinyin_map.get(py)
+                        if bm and bm in self.models:
+                            return bm
+        return None
 
     @classmethod
     def reset(cls) -> None:

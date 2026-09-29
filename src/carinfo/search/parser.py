@@ -295,6 +295,12 @@ def resolve_model_target(
                 base_model = alias_base
             if alias_brand and not raw_brand:
                 raw_brand = alias_brand
+        # 别名表（种子 + 生成）含**同音错字/繁简**兜底：模型把「步威」写成「布威」
+        # 时，静态表查不到，但这里能靠无调拼音命中。
+        if base_model is None:
+            ctx_base = ctx.resolve_model_alias(raw_model)
+            if ctx_base:
+                base_model = ctx_base
         if base_model is None and text in ctx.models:
             base_model = text
         # 排量后缀（'ALPHARD 3.5'）不影响车系，取首词元再试一次
@@ -764,6 +770,14 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         stripped = up.strip()
         if stripped in ctx.models:
             payload["base_model"] = stripped
+
+    # --- 别名表（种子 + LLM 生成）整句匹配 ---
+    # 含同音错字/繁简兜底：「布威」→（拼音 buwei）→ 步威 → STEPWGN。静态 MODEL_ALIASES
+    # 已在上面扫过；这里补上生成别名与拼音匹配。放在品牌之前，避免同一句里品牌抢先。
+    if not payload.get("base_model"):
+        bm = ctx.find_model_alias(query)
+        if bm:
+            payload["base_model"] = bm
 
     # --- 品牌：扫品牌别名 ---
     if not payload.get("base_model") and not payload.get("brand"):

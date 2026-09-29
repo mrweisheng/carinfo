@@ -4,7 +4,9 @@
 
 - normalize   车型/品牌归一（自由文本 → 稳定车系键）。四级路径：
               exact(98.1%) → compact(0.3%) → token(0.3%) → fallback(1.4%)
-- context     词表 + 库内真实键集合，带 5 分钟 TTL 缓存（给解析层判存在性）
+- aliases     中文/粤语别名表（model_aliases）+ 拼音兜底：把「步威/布威」映射到
+              STEPWGN。种子人工确认，长尾由 LLM 批量生成（严格校验闸），每轮爬完增量补
+- context     词表 + 库内真实键集合 + 别名表，带 5 分钟 TTL 缓存（给解析层判存在性）
 - features    行情基准与每车派生特征 → market_stats / vehicle_features 两张派生表
 - spec        SearchSpec：检索条件的唯一内部表示，所有入口都转成它
 - llm         MiniMax 国内版客户端（含"HTTP 200 里藏业务错误码"的处理）

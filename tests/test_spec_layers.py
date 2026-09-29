@@ -31,6 +31,22 @@ def test_keyword_is_identity_not_exposed_to_llm():
     assert "keyword_is_identity" not in ALLOWED_LLM_FIELDS
 
 
+@pytest.mark.parametrize(("raw", "expected"), [
+    (None, None),            # 显式 null = 不筛（车行+个人）
+    (True, True),            # 只要车行
+    (False, False),          # 只要个人
+])
+def test_dealer_three_state(raw, expected):
+    assert SearchSpec.from_dict({"dealer": raw}).dealer is expected
+
+
+def test_dealer_default_excludes_dealer():
+    """产品口径（2026-09-29）：不传 dealer = 只要个人卖家，默认排除车行。"""
+    assert SearchSpec().dealer is False
+    assert SearchSpec.from_dict({}).dealer is False
+    assert SearchSpec(raw_query="七座MPV").dealer is False
+
+
 def test_from_dict_drops_unknown_keys():
     s = SearchSpec.from_dict({"brand": "BMW", "order_by": "price", "raw_sql": "DROP"})
     assert s.brand == "BMW"

@@ -51,7 +51,8 @@ carinfo/
 │       ├── search/                 # 智能搜索（只读，与爬虫解耦；详见下方专节）
 │       │   ├── __init__.py         # 模块总览与设计铁律
 │       │   ├── normalize.py        # 车名归一（四级路径）
-│       │   ├── context.py          # 词表 + 库内真实键（TTL 缓存）
+│       │   ├── aliases.py          # 中文/粤语别名表（model_aliases）+ 拼音兜底（可执行）
+│       │   ├── context.py          # 词表 + 库内真实键 + 别名表（TTL 缓存）
 │       │   ├── features.py         # 重算 market_stats / vehicle_features（可执行）
 │       │   ├── spec.py             # SearchSpec
 │       │   ├── llm.py              # MiniMax 客户端
@@ -299,7 +300,8 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 | 模块 | 职责 | 关键约束 |
 |---|---|---|
 | `normalize.py` | 自由文本车名 → 稳定车系键 | 四级路径 exact/compact/token/fallback；词表脏条目必须过滤 |
-| `context.py` | 词表 + 库内真实键集合 | 5 分钟 TTL 缓存；`reset()` 在特征表重算后调 |
+| `aliases.py` | 中文/粤语别名 → base_model（`model_aliases` 表）+ 拼音兜底 | 见下方「车名别名表」专节；只写库的 CLI/增量入口用，检索侧只读 |
+| `context.py` | 词表 + 库内真实键集合 + 别名表 | 5 分钟 TTL 缓存；`reset()` 在特征表重算后调 |
 | `features.py` | 重算两张派生表 | 先 market_stats 再 vehicle_features（价格比依赖中位数） |
 | `spec.py` | `SearchSpec`：检索条件唯一表示 | `from_dict` 只认白名单字段，防模型幻觉字段穿透 SQL；`*_near` 是软偏好，不进 `build_query` |
 | `llm.py` | MiniMax 国内版客户端 | **失败也返回 HTTP 200**，错误码在 `base_resp.status_code` |
@@ -338,6 +340,32 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 - 跑法：`uv run python -m carinfo.search.extract --dry-run | --limit N | --fallback`。
   提取后**必须重算特征表**（condition/is_anomaly 依赖 hand_count/mileage_km/import_type）。
 
+### 车名别名表（`aliases.py`，2026-09-29 上线）
+
+**为什么不能只靠静态手工表**：中文车名成千上万，一一映射不可行。原设计把「中文名→
+英文车系」交给 LLM 世界知识（主路径），静态 `MODEL_ALIASES` 只作无 key 兜底。但实测
+LLM 对**生僻叫法会漏/会编**（不知道 STEPWGN 叫「步威」，甚至断言它没有中文名），于是
+「布威」被原样回填成关键词 → 因含中文匹配不到英文 `car_model` → 短词守卫丢弃 → **无车型
+条件 → 全库乱排**（比诚实 0 更糟）。别名表就是补这个洞。
+
+- **表 `model_aliases`**(`alias` PK, `alias_pinyin`, `base_model`, `source`)。来源分级、
+  先到先得：`seed`（静态种子 + 人工确认，最高优先级）> `llm`（批量生成）> `manual`。
+- **生成只针对库内真实车系**（`vehicle_features` 的键，~1100 个），规模天然可控，不枚举全网。
+  严格提示词（"不确定就空"）+ 温度 0 + **校验闸**：纯中文、长度 2-8、不与任何车系键重名、
+  **不落品牌名**（本田/丰田是品牌不是车型）、子串黑名单（拦「自由/飞度/双座/皮卡」等幻觉与
+  泛用词）、别名全局唯一。LLM 常把 base_model 回填成 `STEPWGN (HONDA)`，解析时剥尾部括号。
+- **拼音兜底（错别字/繁简）**：pypinyin 无调拼音。库里只要有「步威」，用户打「布威」(buwei)
+  也能命中；`阿爾法/阿尔法/阿尔发`(aerfa) 一并覆盖。**有歧义的拼音整条剔除**（两个车系
+  共用同一拼音时不用它，宁可漏不可错）。拼音长度 ≥4（≥2 汉字）才启用。
+- **检索侧只读**：`SearchContext.load` 读表构建 `alias_map`/`pinyin_map`（与静态种子合并，
+  种子优先）；表不存在时静默退回静态表，绝不 500。解析层两处接入：`resolve_model_target`
+  （LLM 路径，命中 `model_keyword` 时用别名救回）与 `rule_based_parse`（规则路径，整句子串/滑窗）。
+- **周期机制**：`service._run_one_job` 每轮爬完接 `aliases.run_incremental()`（在 `extract`
+  旁边），**只给新出现的车系生成**，无新车型时不调模型（零成本）。CLI：
+  `uv run python -m carinfo.search.aliases [--dry-run|--force|--limit N]`。
+- ⚠️ **别名表必须先存在**：首次部署跑一次 CLI（或 service 增量会自动建表+灌种子）。未建表时
+  检索侧退回静态种子，不报错。
+
 ### 解析层：模型输出的两道防线（`parser.py`）
 
 模型输出的键名**不能只靠 prompt 约束**。踩过的坑：`SYSTEM_PROMPT` 点明了 `brand 字段`，
@@ -364,6 +392,21 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 **单点在 `spec.DEFAULT_LIMIT = 5` / `spec.MAX_LIMIT = 50`。** 别处不许各写一个数
 （曾经 spec=20、config=20、MCP=10 三处不一致，config 里那份还是没人读的死配置）。
 `test_serving.py` 有断言锁住 spec 与 MCP 签名默认值一致。
+
+### 车行过滤口径（2026-09-29 起默认排除）
+
+**`SearchSpec.dealer` 默认 `False` = 只要个人卖家**（排除车行/同行）。三态：
+`True` 只要车行；`False`（默认）只要个人；显式 `None` = 不筛。判定单点在
+`features.DEALER_THRESHOLD=4`（同一联系方式在售挂车 ≥4 = 车行）。此前默认是
+`None`（不筛），但车行占在售 **74%** 且持续刷新，不排除时 TopN 基本被车行占满、
+个人车沉底 —— 故改为默认排除。
+
+- 入口一致：`/search`（NL，parser 不提即默认 false）、`/search/spec`（不带键即默认）、
+  MCP `search_by_spec(dealer=False)` 都默认排除。
+- **零命中降级**：`engine.search_with_fallback` 新增 Step 4.5 —— 前面所有放宽都没命中时，
+  放宽为含车行（`dealer=None`），并在 `fb_notes` 说明；结果仍带 `is_dealer`/「车行」标签，
+  用户可辨识。这是**最后一档**（在年份/关键词放宽之后），确实没有个人车源才拉车行。
+- 想一次拿到全部货（车行+个人）：显式传 `dealer=null`。
 
 ### 设计铁律
 
@@ -496,7 +539,9 @@ uv run python -m carinfo.search.features --dry-run  # 只算不写，打印分�
 **跟踪的 pytest 套件（首选；随代码版本化、全离线、CI 可跑）：**
 
 ```bash
-uv run pytest -q                              # 全部 139 例
+uv run pytest -q                              # 全部 173 例
+uv run pytest tests/test_aliases.py           # 别名：拼音/繁简归一 + 映射构建 + 解析 + 生成校验闸（离线）
+uv run pytest tests/test_spec_layers.py       # spec 值收敛 + **dealer 默认 False（只要个人）**（离线）
 uv run pytest tests/test_schedule_rules.py    # 调度：窗口解析/告警 + _pick_random_time 未来性(防忙循环) + 窗口命中分布 + 过期重排 + 重启不重跑 + 深扫/复核模式优先级/开关/缺省关闭 + **复核返回状态决定是否写 last_completed**（迁移自 _migration/test_schedule.py）
 uv run pytest tests/test_revalidator_rules.py # 复核：三态判据 + **反例(在售页含「已售」子串不许判已售)** + 判不出必 UNKNOWN + 执行器(dry-run/busy 中止) + **报告口径(判定 vs 落库分开)** + **写库器串行化/失败必 rollback** + **漂移探针** + **已售短路不请求详情** + **today_beijing 单点** + **日志不双打** + **rebuild_default 的 rc 口径**（迁移自 _migration/test_revalidator.py）
 ```
@@ -739,7 +784,7 @@ python -m carinfo
 1. **历史包袱：vehicle_id 不带 28car 前缀** —— 现存 11 万+ 行数据 vehicle_id 无前缀，且 `vehicle_images` 有 FK + `ON UPDATE RESTRICT`，无法批量改写。新站点统一用 `{site_name}_{native_id}` 前缀；详见 `core/base_spider.py:vehicle_id()` docstring。
 2. **BaseSpider 目前是空壳抽象**：4 个抽象方法定义了但调度流程没真正调用——`scrape_vehicle_type` 走的是 `get_html_1` / `get_date_code` / `extract_car_info`。接入第二站时需要把 HTTP/代理/反爬 等基础设施真的下沉到 core，并让 `scrape_vehicle_type` 改成基于 `spider.list_url()` / `spider.parse_list()` 的通用流程。
 3. **`os.environ` 传爬取统计**：已修复 —— `scrape_vehicle_type()` 返回统计 dict，由 `service.py` / `car28.main()` 聚合后经 `record_crawl_log()` 写入 `crawl_logs`；`importer.main()`（CSV 补导通道）已不再读写环境变量，也不再写爬取日志。
-4. **测试**：跟踪的 `tests/` 已有 139 例 pytest（离线为主，`@pytest.mark.db` 的真库黄金用例连不上自动 skip），由 `_migration/` 一次性脚本逐步迁移而来。仍需真库/联网的集成验证留在 `_migration/`（gitignored）。
+4. **测试**：跟踪的 `tests/` 已有 173 例 pytest（离线为主，`@pytest.mark.db` 的真库黄金用例连不上自动 skip），由 `_migration/` 一次性脚本逐步迁移而来。仍需真库/联网的集成验证留在 `_migration/`（gitignored）。
 5. **相对路径依赖**：`config.json`、状态文件、CSV 等都用相对路径，依赖 `run_service.py` 中的 `os.chdir(repo_root)`。
 6. **CSV 现在只是备份**：爬取结果逐页通过 `import_rows()` 直接入库；`data/csv/*.csv` 只写不读，供排查/审计/手动补导（`python -m carinfo.core.importer` 仍可从 CSV 补导）。入库失败时该页数据仍在 CSV 里可补救。
 7. **动态域名 BASE_URL**：28car 的真实域名（如 `dj1jklak2e.28car.com`）会变化，需手动更新 `sites/car28.py:BASE_URL`。
@@ -809,6 +854,15 @@ python -m carinfo
     「期望在售 → 实得已售/已删」这类**车本身状态变了的不算** —— 否则探针会天天
     误报、几天后就被无视。刻意**不做字节哈希/指纹文件**：只对语义，站点改个无关
     日期文案不会误报，也没有基线过期的运维负担。CLI 用 `--probe` 单独跑。
+25. **车名别名表（`model_aliases`）的部署与边界**：表由 `aliases.ensure_table()` 创建
+    + 灌种子；首次部署跑一次 `uv run python -m carinfo.search.aliases`（service 增量入口
+    也会自动建表+灌种子）。**未建表时检索侧静默退回静态 `MODEL_ALIASES`，不报错**。
+    LLM 生成对**生僻车名会漏/会编**（实测 STEPWGN 编出「阶梯」「大霸王」），故靠严格提示词
+    + 校验闸（纯中文/长度 2-8/不与车系键重名/不落品牌名/子串黑名单/全局唯一）兜底，且
+    **种子优先**（`步威→STEPWGN` 这类人工条目永不被生成覆盖）。新增中文叫法直接写进
+    `aliases.CURATED_SEED` 或 `normalize.MODEL_ALIASES`。拼音兜底依赖 `pypinyin`（已入依赖）。
+    检索侧读表在 `SearchContext.load`，5 分钟 TTL，新别名最迟 5 分钟生效。
+
 ## 加新站点的步骤
 
 > ⚠️ 目前 `BaseSpider` 的 4 个抽象方法实际未被调度流程调用（见已知问题 2）。真正接入第二站时，需要先把 `scrape_vehicle_type` 改造成通用流程，否则光实现 4 个方法跑不起来。
@@ -825,7 +879,8 @@ python -m carinfo
 - 修改爬虫字段时，确保 `sites/car28.py` 的 `extract_car_info` 与 `core/importer.py` 的 SQL 语句保持一致
 - 代理相关改动需同步 `core/proxy.py` 和 `sites/car28.py` 中的 `scrape_vehicle_type` 函数
 - 不要提交 `.env`（含真实密码）和 `config.json`（含代理配置）
-- 搜索子系统**只读**：不要在 `search/` 下加写操作；确需写入必须走 `core/importer.py` 的通道
+- 搜索子系统**只读**：不要在 `search/` 下加写操作；确需写入必须走 `core/importer.py` 的通道。
+  已知**例外**：`aliases.py` 写 `model_aliases` 表（CLI/`run_incremental` 专用，检索请求路径不写）
 - 改 `search/` 后必跑 `uv run pytest -q` + `eval_search.py`（见「验证与评测」），门禁绿灯才算改完
 - `search/**` 一律用 `db.fetch()` 借连接，**不要**自己 `psycopg2.connect()`（`features.py`
   的一次性 CLI 重算脚本是唯一例外）；写操作**绝不**走 `fetch()`（重试会写两次）

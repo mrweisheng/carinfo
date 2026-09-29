@@ -147,10 +147,14 @@ class SearchSpec:
     #: **刻意不进 NL 解析**——「换车」在自然语言里歧义太大(「我想换辆车」
     #: ≠「找换车帖」),只给 spec/API/MCP 的程序化调用。
     swap: bool | None = None
-    #: 车行/同行过滤。None=不筛;True=只要车行;**False=只要个人卖家**(
-    #: 「不想让同行看到」的主用法)。判定:同一电话(邮箱型用邮箱)在售挂车数
-    #: ≥4 台 = 车行(features.DEALER_THRESHOLD)。≤3 台不细分。
-    dealer: bool | None = None
+    #: 车行/同行过滤。**默认 False = 只要个人卖家**（2026-09-29 起，产品口径）。
+    #: True=只要车行;None=不筛（车行+个人都返回）。
+    #: 判定:同一联系方式(电话优先，邮箱型用邮箱)在售挂车数 ≥4 台 = 车行
+    #: (features.DEALER_THRESHOLD)。≤3 台不细分。
+    #: 默认排除的原因：车行占在售 74%、且持续刷新帖子，不排除时 TopN 基本被车行
+    #: 占满。个人车正是「车行霸占领之外」的目标。零命中时 engine 会放宽为含车行
+    #: （结果仍带「车行」标签，可辨识）。
+    dealer: bool | None = False
 
     # ---- 行情过滤 ----
     max_price_ratio: float | None = None   # 只要比同款便宜的：0.9 = 便宜 10% 以上

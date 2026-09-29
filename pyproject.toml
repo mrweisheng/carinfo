@@ -17,6 +17,7 @@ dependencies = [
   "fastapi>=0.141.1",
   "uvicorn>=0.53.0",
   "mcp>=2.2.0",
+  "pypinyin>=0.55.0",
 ]
 
 [tool.setuptools]

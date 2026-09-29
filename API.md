@@ -167,7 +167,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 | `mileage_max` | int | 里程上限(公里) |
 | `china_plate` | bool | 中港牌(兩地牌):`true` 只要有中港牌的 / `false` 排除 / 不传=不筛(库里约 400 台有) |
 | `swap` | bool | 换车帖:`true` 只要换车帖(**收购线索**:卖家想换车=好谈价)/ `false` 排除 / 不传=不筛 |
-| `dealer` | bool | 车行过滤:`false` **只要个人卖家**(不想碰同行/车行时用)/ `true` 只要车行 / 不传=不筛。判定=同一联系方式在售挂车数 ≥4(实测车行贡献 72% 盘源) |
+| `dealer` | bool | 车行过滤:**默认 `false` 只要个人卖家**(排除车行/同行) / `true` 只要车行 / 显式 `null`=不筛(车行+个人都返回)。判定=同一联系方式在售挂车数 ≥4(实测车行占在售 74%)。零命中时会自动放宽为含车行,结果带「车行」标签 |
 | `max_price_ratio` | number | 只要更便宜的:0.9 = 比同款行情便宜 10% 以上 |
 | `exclude_anomaly` | bool | 剔除疑似问题车,默认 `true` |
 | `sort` | string | `score`(默认综合)/ `price_asc` / `price_desc` / `newest` |
@@ -336,7 +336,8 @@ curl -sS -X POST -H "X-API-Key: $KEY" \
 
 参数即条件:`base_model / brand / price_min / price_max / year_min / year_max /
 seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默认 score) / limit(默认 5)`。
-`china_plate`/`swap` 三态:`None` 不筛;`true` 只要(中港牌车 / 换车帖);`false` 排除。
+`china_plate`/`swap`/`dealer` 三态:`None` 不筛;`true` 只要;`false` 排除。
+`dealer` **默认 `false`(只要个人卖家,排除车行)**;要看全部货显式传 `dealer=null`;零命中自动放宽为含车行。
 换车帖(`swap=true`)对收购场景是线索:卖家想换车=好谈价。
 调用方(或模型)已明确知道条件时用,跳过自然语言解析。
 
