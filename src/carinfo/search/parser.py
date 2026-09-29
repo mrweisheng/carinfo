@@ -665,6 +665,24 @@ _QUANTITY_RE = re.compile(r"\d+(?:\.\d+)?(?:CC|KW|HP|PS|NM|KM)")
 #: 'SDRIVE18IA' 天然不命中（2026-09-29，用户确认的可选项）。
 _CODE_SHAPE_RE = re.compile(r"[A-Z]{1,3}[0-9]{1,4}")
 
+#: 规则路径的排量提取（LLM 不可用时的降级）。**必须带排量专属线索**（L/升/T/cc
+#: 或前置「排量」字样），不能用裸 `\d\.\d` —— 那会把「3.5萬」的预算当成排量。
+#: 排量值是档位（3.5 / 2.0 / 3500），engine._displacement_liters 容差 ±0.25L 兜噪声。
+_DISP_RULE_RES = (
+    re.compile(r"排量[：:\s]*(\d{3,4})"),                                   # 排量3500 / 排量：3500
+    re.compile(r"(?<![\d.])(\d\.\d)\s*(?:[Ll]|升|T)(?![A-Za-z0-9])"),       # 3.5L / 2.0T / 3.5升
+    re.compile(r"(?<![\d.])(\d{3,4})\s*[cC][cC](?![A-Za-z0-9])"),           # 3500cc / 2000CC
+)
+
+
+def _rule_displacement(query: str) -> str | None:
+    """无 LLM 时从原文抽排量（'3.5L排量' / '3500cc' / '2.0T'）。抽不到返回 None。"""
+    for pat in _DISP_RULE_RES:
+        m = pat.search(query)
+        if m:
+            return m.group(1)
+    return None
+
 
 def _rule_near_anchor(query: str, kind: str) -> tuple[float | None, bool]:
     """从原文里按规则抽出模糊锚点。返回 `(锚点, 是否还有明确边界词)`。
@@ -753,6 +771,12 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             if alias in query and en in ctx.brands:
                 payload["brand"] = en
                 break
+
+    # --- 排量（降级路径；LLM 路径由 resolve_model_target 的 _DISP_RE 产出）---
+    # 没有这一步时，「3.5L排量」在无 key / LLM 失败时会静默丢掉排量条件。
+    _disp = _rule_displacement(query)
+    if _disp:
+        payload["displacement"] = _disp
 
     # --- 金额：明确边界 → 硬过滤；「左右」→ 软锚点（顺序不能反：说了"以内"就是
     #     硬边界，比模糊量优先；两者都不沾才轮不到金额条件）

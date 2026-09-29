@@ -520,21 +520,68 @@ def _count_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
 # ---------------------------------------------------------------------------
 
 
+#: 排量偏好容差（升）。**必须容忍登记噪声**：卖家上传时排量常不写标称值 ——
+#: 3.5L 实登 3456/3490/3498/3499cc、2.5L 实登 2493/2494/2498cc 都很常见。
+#: 判等用「|差| ≤ 容差」而不是精确相等：0.25L 能兜住 ±0.05L 级的登记误差，
+#: 又能把相邻档（2.5 vs 3.5 差 1.0、2.5 vs 3.0 差 0.5）稳稳分开。
+DISPLACEMENT_TOL = 0.25
+#: 排量**不符**时的 match 封顶分。命中保持满分、不符降到此处 → 排序上让命中排前。
+#: 仍**不是硬过滤**：不符的车照样留在结果里，只是排在后面。取 0.60 是因为 match 权重
+#: 0.28，0.4 的落差 ≈ 总分 0.112，足以压过 value/fresh 的自然波动，又不会把车打没。
+DISPLACEMENT_MISMATCH_CAP = 0.60
+#: 「只有排量目标（无车型/品牌/关键词）、且车排量判不出」时的 match 分：
+#: 排在命中(1.0)与不符(0.60)之间，中性偏上 —— 缺数据不重罚。
+DISPLACEMENT_UNKNOWN_SCORE = 0.70
+
+
+def _displacement_liters(text: str | None, require_decimal: bool = False) -> float | None:
+    """从排量文本里抽出「升」数：'3500cc'/'3.5L'/'3.5'/'3456cc' → 3.5/3.456。
+
+    数值 >= 100 视为 cc（除 1000）；否则视为升。超出 0.6~6.5L 的一律当抽不到。
+
+    `require_decimal=True` 只认带小数点的写法（用于 car_model **文本**兜底）：
+    车系名里的裸数字是代次/型号（'MODEL 3'→3、'A6'→6、'740'→0.74），当成排量
+    会误判；而排量在车名里一定写成 '3.5' 这种小数。engine_volume 是实测字段，
+    不受此限（它写 '3500cc' 也正确）。
+    """
+    if not text:
+        return None
+    s = str(text)
+    if require_decimal:
+        m = re.search(r"(?<![\d.])(\d\.\d)(?!\d)", s)
+        if not m:
+            return None
+        num = float(m.group(1))
+    else:
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        num = float(m.group(1))
+        if num >= 100:
+            num /= 1000.0
+    return num if 0.6 <= num <= 6.5 else None
+
+
 def score_match(
     spec: SearchSpec,
     car_model: str,
     base_model: str | None,
     brand_norm: str | None = None,
+    engine_volume: str | None = None,
 ) -> float | None:
-    """车型匹配分。**没有匹配目标时返回 None**（该维不参与，不是给 0 分也不给满分）。
+    """车型匹配分。**没有任何匹配目标（车型/品牌/关键词/排量）时返回 None**（该维不
+    参与，不是给 0 分也不给满分）。
 
     为什么不给满分：纯条件筛选（"50 万以内的 7 座 MPV"）时所有候选都"匹配"，
-    给满分等于给每条都加 0.35 的常数，只会把其他维度的区分度压扁。
+    给满分等于给每条都加 0.28 的常数，只会把其他维度的区分度压扁。
+    **排量算匹配目标**：「3.5L 排量的车」不给车型时也要能按排量排序（2026-09-29 修）。
     """
-    if not spec.has_model_target:
+    has_disp = bool(spec.displacement)
+    if not spec.has_model_target and not has_disp:
         return None
 
-    m = 0.30  # 理论上到不了这里（SQL 已过滤），留个兜底
+    m = 0.30  # 理论兜底（SQL 已过滤）
+    model_matched = False   # 是否有车型/品牌/关键词证据（决定「只有排量」时的基准）
     if spec.base_model:
         # 同款变体**同分**（Fix-5，2026-09-28）：LM350H 是刻意并入的同款混动
         # （context.build_variant_map 的三道约束认定它是变体，不是另一款车），
@@ -545,9 +592,11 @@ def score_match(
         # 是死代码（2026-09-28 审核指出），这里连判定带注释一起删掉。
         keys = spec.base_models or [spec.base_model]
         m = 1.00 if base_model in keys else 0.30
+        model_matched = True
     elif spec.brand:
         # 只指定品牌时，品牌确实命中才给 0.80（别因为 SQL 过滤了就想当然）
         m = 0.80 if brand_norm == spec.brand else 0.30
+        model_matched = True
     elif spec.model_keyword:
         cm = clean_text(car_model)
         kw = clean_text(spec.model_keyword)
@@ -555,13 +604,33 @@ def score_match(
             m = 0.90
         elif kw in cm:
             m = 0.70
+        model_matched = True
 
-    # 排量偏好只做加分不做硬过滤：搜"阿尔法 3.5"时 3.5 的排前面，2.5 的仍在
-    # （用户明确要求"匹配用宽"，但专项偏好要能在排序上体现出来）
-    if spec.displacement:
-        d = clean_text(spec.displacement)
-        if d and d in clean_text(car_model):
-            m = min(1.0, m + 0.10)
+    # 排量偏好：**只调排序，不做硬过滤**。命中保持满分、不符把 match 降到下限，
+    # 排量抽取不到（缺数据）不罚 —— 与「缺维不扣分」一致。
+    #
+    # ⚠️ 旧实现是 `m = min(1.0, m + 0.10)`，等于空操作：base_model 命中时 m 本就是
+    # 1.00，加 0.10 再封顶还是 1.00 —— 3.5L 与 2.5L 完全同分（2026-09-29 实测：
+    # 「18年埃尔法3.5L排量」返回清一色 2500cc）。而且它比的是 car_model **文本**
+    # 而不是真实排量，'ALPHARD EXECUTIVE LOUNGE'（实为 3456cc）根本比不到。
+    # 现在：优先用 engine_volume（真实排量），退回 car_model 文本里的 '3.5'。
+    #
+    # 「只有排量、没有车型目标」时（has_model_target=False，如「3.5L 的 7 座车」）：
+    # 没有车型证据可作基准，就用排量本身定 match —— 命中给顶格、未知给中性、
+    # 不符给低分，保证排量对的车排前面（否则这一维恒 None，排量偏好完全失效）。
+    if has_disp:
+        target = _displacement_liters(spec.displacement)
+        car_l = (_displacement_liters(engine_volume)
+                 or _displacement_liters(car_model, require_decimal=True))
+        if target is None or car_l is None:
+            if not model_matched:
+                m = DISPLACEMENT_UNKNOWN_SCORE   # 判不出排量 → 中性，不奖不重罚
+        elif abs(car_l - target) > DISPLACEMENT_TOL:
+            # 不符 → 降档（仍不过滤）。有车型证据时只压不抬（min）；只有排量目标时
+            # 没有车型基准分，直接取 CAP，保证 命中(1.0) > 未知(0.70) > 不符(0.60)。
+            m = DISPLACEMENT_MISMATCH_CAP if not model_matched else min(m, DISPLACEMENT_MISMATCH_CAP)
+        elif not model_matched:
+            m = 1.0                              # 只有排量目标且命中 → 顶格
     return m
 
 
@@ -753,7 +822,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
         row_year = int(year) if year and str(year).isdigit() else None
         row_price = float(price) if price is not None else None
         dims: dict[str, float | None] = {
-            "match": score_match(spec, car_model or "", base_model, brand_norm),
+            "match": score_match(spec, car_model or "", base_model, brand_norm, engine_volume),
             "value": score_value(ratio),
             "near": score_near(spec, row_price, row_year),
             "fresh": score_fresh(age_days),
