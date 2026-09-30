@@ -96,6 +96,9 @@ class ApiKeyMiddleware:
         if scope["type"] != "http":          # lifespan / websocket 原样放行
             await self.app(scope, receive, send)
             return
+        if scope.get("method") == "OPTIONS":  # CORS 预检不带自定义头，放行（由外层 CORS 中间件应答）
+            await self.app(scope, receive, send)
+            return
         ok, status, detail = decide(header_value(scope.get("headers") or []))
         if ok:
             await self.app(scope, receive, send)

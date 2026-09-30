@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from carinfo.search.auth import (
@@ -82,6 +83,15 @@ app = FastAPI(
 )
 #: 用中间件而不是 Depends：Depends 漏掉 /docs、/openapi.json 这类自动路由
 app.add_middleware(ApiKeyMiddleware)
+#: CORS 必须加在鉴权**之后**（Starlette 后加的先执行 → 在外层先接住浏览器的 OPTIONS
+#: 预检；预检按规范不带自定义头，不先接住就会被鉴权 401 拦死）。
+#: 放开所有来源：本服务的唯一门是 X-API-Key（见 auth.py），不按来源做访问控制。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _llm: LLMClient | None = None
 
