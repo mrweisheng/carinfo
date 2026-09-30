@@ -177,8 +177,11 @@ class ScoredVehicle:
     seats: str | None
     engine_volume: str | None
 
-    #: 首图(封面)URL。TopN 切片后由 `_attach_covers` 单独补上,不参与主扫描查询
+    #: 首图(封面)URL。TopN 切片后由 `_attach_images` 单独补上,不参与主扫描查询
     image_url: str | None = None
+    #: 全量图片(原图 URL 列表,按 image_order)。同样 TopN 切片后补齐;服务层会
+    #: 映射成代理 URL(`images`)并保留原链(`images_raw`)。实测每车 ≤5 张。
+    images: list[str] = field(default_factory=list)
 
     #: 联系人（找车的最终目的是联系车主，2026-09-25 起检索必带）。
     #: phone 与 email 至少有一个（无联系方式的已车被 SQL 硬过滤，不会出现在结果里）。
@@ -192,6 +195,8 @@ class ScoredVehicle:
     market_median: float | None = None
     market_p25: float | None = None
     market_p75: float | None = None
+    #: 比价所属的 5 年段起点（如 2015）。`market_level='near'` 时解释层用它报「邻近 X-X+4 年段」。
+    market_bucket: int | None = None
     market_level: str | None = None
     market_ref_n: int | None = None
 
@@ -246,6 +251,7 @@ class ScoredVehicle:
             "price": self.price,
             "car_url": self.car_url,
             "image_url": self.image_url,
+            "images": list(self.images),
             "contact_name": self.contact_name,
             "contact_phone": self.contact_phone,
             "contact_email": self.contact_email,
@@ -259,6 +265,7 @@ class ScoredVehicle:
             "market_median": self.market_median,
             "market_p25": self.market_p25,
             "market_p75": self.market_p75,
+            "market_bucket": self.market_bucket,
             "market_level": self.market_level,
             "market_ref_n": self.market_ref_n,
             "age_days": self.age_days,
@@ -312,7 +319,7 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
        v.seats, v.engine_volume, v.extra_fields,
        v.contact_name, v.phone_number, v.contact_email,
        f.base_model, f.brand_norm, f.price_ratio, f.market_median, f.market_p25,
-       f.market_p75, f.market_level, f.market_ref_n, f.age_days, f.condition_score,
+       f.market_p75, f.market_bucket, f.market_level, f.market_ref_n, f.age_days, f.condition_score,
        f.has_condition, f.heat_score, f.is_anomaly, f.dealer_listings, f.is_dealer,
        f.verify_age_days, f.is_unverified,
        COUNT(*) OVER () AS _total_matched
@@ -324,10 +331,10 @@ WHERE """
 """
 )
 
-#: TopN 的首图(封面)。DISTINCT ON 取每车 image_order 最小的一张 —— 不写死
-#: `image_order = 0`,首张非 0 的脏数据也能兜住。
-_COVER_SQL = """
-SELECT DISTINCT ON (vehicle_id) vehicle_id, image_url
+#: TopN 的全部图片。按 image_order 升序、每车一组 —— 首张作封面,整组作 images。
+#: 不写死 `image_order = 0`,首张非 0 的脏数据也能兜住。
+_IMAGES_SQL = """
+SELECT vehicle_id, image_url
 FROM vehicle_images
 WHERE vehicle_id = ANY(%s)
 ORDER BY vehicle_id, image_order
@@ -758,23 +765,28 @@ def _score_relaxed(names: list[str], spec: SearchSpec, ef: dict) -> float | None
     return hit / len(names)
 
 
-def _attach_covers(conn, items: list[ScoredVehicle]) -> None:
-    """给**已切片的 TopN** 补首图。列表语义只带一张,全量图片走详情接口。
+def _attach_images(conn, items: list[ScoredVehicle]) -> None:
+    """给**已切片的 TopN** 补封面(image_url)与全量图(images)。
 
     为什么不把 vehicle_images join 进 _SELECT:主查询要**全量拉候选进内存打分**
     (见 MAX_SCAN_ROWS 的注释),join 会让行数 × 每车图片数(库内 ≤5),还得
     GROUP BY 去重还原,全库扫描直接翻几倍;而真正需要图的只有 limit(≤50)条 ——
     切片后用 `= ANY(...)` 一次点查,走 (vehicle_id, image_order) 复合索引,毫秒级。
+    实测每车 ≤5 张(均 4.8),TopN ≤50 → 最多 250 行,代价可忽略。
     API 与 MCP 共用 `search()`,这里补一次,两个入口同时受益。
     """
     if not items:
         return
     cur = conn.cursor()
-    cur.execute(_COVER_SQL, ([it.vehicle_id for it in items],))
-    covers = dict(cur.fetchall())
+    cur.execute(_IMAGES_SQL, ([it.vehicle_id for it in items],))
+    by_id: dict[str, list[str]] = {}
+    for vid, url in cur.fetchall():
+        by_id.setdefault(vid, []).append(url)
     cur.close()
     for it in items:
-        it.image_url = covers.get(it.vehicle_id)
+        urls = by_id.get(it.vehicle_id) or []
+        it.image_url = urls[0] if urls else None
+        it.images = urls
 
 
 def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
@@ -813,7 +825,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
         (
             vid, car_model, car_brand, year, price, car_url, seats, engine_volume, extra,
             contact_name, phone_number, contact_email,
-            base_model, brand_norm, ratio, med, p25, p75, level, ref_n, age_days, cond,
+            base_model, brand_norm, ratio, med, p25, p75, bucket, level, ref_n, age_days, cond,
             has_cond, heat, is_anomaly, dealer_listings, is_dealer,
             verify_age_days, is_unverified, _total,
         ) = row
@@ -852,6 +864,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
                 market_median=float(med) if med is not None else None,
                 market_p25=float(p25) if p25 is not None else None,
                 market_p75=float(p75) if p75 is not None else None,
+                market_bucket=int(bucket) if bucket is not None else None,
                 market_level=level,
                 market_ref_n=ref_n,
                 age_days=age_days,
@@ -875,7 +888,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
 
     _sort_items(items, spec)
     items = items[: spec.limit]
-    _attach_covers(conn, items)
+    _attach_images(conn, items)
     elapsed = int((time.perf_counter() - t0) * 1000)
     return SearchResult(
         spec=spec, items=items, total_matched=total_matched, scanned=scanned,

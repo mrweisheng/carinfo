@@ -156,6 +156,8 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
                 "url": it["car_url"],
                 "image_url": proxied_cover_url(it["vehicle_id"]) if it.get("vehicle_id") else it["image_url"],
                 "image_url_raw": it["image_url"],
+                "images": ([proxied_image_url(it["vehicle_id"], i) for i in range(len(it.get("images") or []))]
+                           if it.get("vehicle_id") else []),
                 "contact": it["contact_display"],
                 "query": label or None,
             })
@@ -204,7 +206,7 @@ LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1
 """
 
-#: 详情图片:全量按页面原始顺序。列表首图由 engine._attach_covers 负责
+#: 详情图片:全量按页面原始顺序。列表的图由 engine._attach_images 负责
 _IMAGES_SQL = """
 SELECT image_url FROM vehicle_images WHERE vehicle_id = %s ORDER BY image_order
 """
@@ -285,6 +287,8 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
                 "price": it["price"],
                 "price_ratio": it["price_ratio"],
                 "image_url": proxied_cover_url(it["vehicle_id"]) if it.get("vehicle_id") else it["image_url"],
+                "images": ([proxied_image_url(it["vehicle_id"], i) for i in range(len(it.get("images") or []))]
+                           if it.get("vehicle_id") else []),
                 "labels": it["labels"],
                 "contact": it["contact_display"],
             }
@@ -298,7 +302,7 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
     name="search_cars",
     description=(
         "按中文/粤语自然语言或英文车系名检索香港二手车源，返回按综合分排序的候选，"
-        "含比价依据（与同款同年段中位价的比值）与首图 image_url。"
+        "含比价依据（与同款同年段中位价的比值）；每条带首图 image_url 与全量图 images（≤5 张）。"
         "每条结果带 contact 字段（车主联系方式，电话优先展示），可直接联系车主，"
         "无需再查详情；仅留邮箱的卖家排在有电话的车源之后。"
         "一句话可以同时找多台车（'找台14年威尔法，再找台14年埃尔法'、'阿尔法或者威尔法'），"

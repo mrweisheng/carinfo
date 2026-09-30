@@ -256,7 +256,7 @@ LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
 WHERE v.vehicle_id = %s AND v.vehicle_status = 1
 """
 
-#: 详情图片:全量按页面原始顺序(image_order)。列表的首图由 engine._attach_covers 负责
+#: 详情图片:全量按页面原始顺序(image_order)。列表的图由 engine._attach_images 负责
 _IMAGES_SQL = """
 SELECT image_url FROM vehicle_images WHERE vehicle_id = %s ORDER BY image_order
 """
@@ -343,13 +343,23 @@ def _do_cover_url(conn, vehicle_id: str) -> str | None:
 
 
 def _proxy_items(items) -> None:
-    """把列表项的首图换成我们的代理 URL（原链保留在 image_url_raw）。"""
+    """把列表项的图换成我们的代理 URL（原链保留在 *_raw）。
+
+    封面 image_url 单列（兼容旧调用方）；images 为全量代理图（实测每车 ≤5 张，
+    由 engine._attach_images 补出原链，这里按下标映射到 /vehicle/{id}/image/{i}）。
+    """
     for it in items or []:
         raw = it.get("image_url")
         vid = it.get("vehicle_id")
         if raw and vid:
             it["image_url_raw"] = raw
             it["image_url"] = proxied_cover_url(vid)
+        raw_list = it.get("images") or []
+        if vid and raw_list:
+            it["images_raw"] = list(raw_list)
+            it["images"] = [proxied_image_url(vid, i) for i in range(len(raw_list))]
+        else:
+            it["images"] = []
 
 
 def _do_models(conn, limit: int) -> list[dict[str, Any]]:
