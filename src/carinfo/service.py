@@ -858,8 +858,8 @@ class CarinfoService:
             # market_stats / vehicle_features 都是从 vehicles 派生的：复核把车
             # 写成已售/已删之后，不重算的话行情基准里还混着死车、`is_unverified`
             # 标签也停在旧值（刚核实过的车当天仍显示「久未核实」）。
-            # 爬取路径有 _rebuild_features_after_crawl，复核路径此前**完全没有**
-            # 任何重算触发点 —— 而 extract.py 里写明了那是"全链路唯一一处"。
+            # 爬取路径的重算在 _run_one_job 尾部（total>0 触发，2026-09-30 补回），
+            # 复核路径在这里触发 —— 两条写库路径各有自己的重算触发点。
             # 条件用 wrote > 0：没写进任何行就是什么都没变，不必白跑 8 秒。
             # 位置放在 mark_completed 之前：重算途中挂掉 → last_completed 没写 →
             # 下次启动会重跑（复核是幂等的，成本只是再扫一遍候选）。
@@ -1077,6 +1077,21 @@ class CarinfoService:
                 self._log(msg, level="INFO" if ok else "WARNING")
             except Exception as e:
                 self._log(f"车名别名生成入口异常(不影响调度): {e}", level="WARNING")
+
+            # 派生表重算（2026-09-30 补回爬取路径的触发点）：
+            # vehicle_features 是检索的 INNER JOIN 对象，爬取写库后不重算的话
+            # **新车连派生行都没有**——不止缺 body_type，是整个不可搜，要等
+            # 下一次复核路径（interval_days=7 天）触发重算才进检索池。
+            # _run_revalidation_job 里的注释声称"爬取路径有
+            # _rebuild_features_after_crawl"，该函数在后续演进中已丢失。
+            # 放在 extract/alias **之后**：本轮 LLM 提取的 hand/mileage 当轮即
+            # 进 condition_score；放在 last_run_date 之后：重算失败只告警，
+            # 不阻止「今天已完成」标记（与 extract/alias 同模式），下轮自愈。
+            if total > 0:
+                try:
+                    self._rebuild_features(f"爬取写入 {total} 条")
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"派生表重算入口异常(不影响调度): {e}", level="WARNING")
 
         except Exception as e:
             self._log(f"任务执行异常: {e}", level="ERROR")
