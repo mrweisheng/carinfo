@@ -60,6 +60,42 @@ def test_nonzero_copy_mentions_count_and_rank():
 
 
 # ---------------------------------------------------------------------------
+# target 名号拼装（2026-09-30：补 family + body_type）
+# ---------------------------------------------------------------------------
+def test_target_includes_family_with_brand():
+    """「特斯拉 Model 3」走 family，摘要不能再显示成光秃秃的 TESLA。"""
+    from carinfo.search.explain import target_name
+    assert target_name(SearchSpec(raw_query="q", brand="TESLA",
+                                  family="MODEL 3")) == "TESLA MODEL 3"
+
+
+def test_target_body_type_when_no_model():
+    """只有类型条件时，名号用香港标签（房車/七人車…），不再落到「全部车型」。"""
+    from carinfo.search.explain import target_name
+    assert target_name(SearchSpec(raw_query="q", body_type="SEDAN")) == "房車"
+    assert target_name(SearchSpec(raw_query="q", body_type="MPV")) == "七人車"
+
+
+def test_target_brand_plus_body_type():
+    from carinfo.search.explain import target_name
+    assert target_name(SearchSpec(raw_query="q", brand="MERCEDES-BENZ",
+                                  body_type="SUV")) == "MERCEDES-BENZ SUV"
+
+
+def test_target_specific_model_does_not_double_type():
+    """已有精确车系/型号时，不再叠类型标签（同义冗余）。"""
+    from carinfo.search.explain import target_name
+    assert target_name(SearchSpec(raw_query="q", base_model="ALPHARD",
+                                  body_type="MPV")) == "ALPHARD"
+
+
+def test_nonzero_copy_shows_body_type_label():
+    it = _vehicle(price_ratio=0.9, market_median=222_000.0)
+    s = _result(SearchSpec(raw_query="q", body_type="SUV"), items=[it], total=6)
+    assert "SUV" in summarize(s)
+
+
+# ---------------------------------------------------------------------------
 # 缺维叙述 / 明细（核心六维 vs 第七维）
 # ---------------------------------------------------------------------------
 def test_missing_dim_narrative_excludes_relaxed():

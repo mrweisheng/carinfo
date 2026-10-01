@@ -71,6 +71,30 @@ curl -H "X-API-Key: <你的43位key>" https://searchcar.eazycar.top/health
 - 图片是 28car CDN 的直链,**没有热链防盗**(无 Referer 也能访问)。在售车源的图基本
   可用;车下架久了原图可能被 CDN 清理(404),前端/客户端要做好图片挂掉的兜底。
 
+### 1.6 车身类型 `body_type`（7 码 + 留白）
+
+车身类型是**独立维度**（不等于座位数,也不等于 `car_category`）。码只来自解析层/程序
+调用方,返回项带 `body_type`（英文码）与 `body_type_label`（香港叫法）。
+
+| 码 | 香港标签 | 简中 | 用户可能说 | 代表车系 |
+|---|---|---|---|---|
+| `SEDAN` | 房車 | 轿车 | 房车、轿车、轎車 | CROWN、E-CLASS、5 SERIES |
+| `HATCHBACK` | 掀背（揭背） | 两厢 | 掀背、揭背、两厢 | FIT、JAZZ、GOLF |
+| `WAGON` | 旅行車 | 旅行车 | 旅行车、旅行版 | AVANT、VARIANT、TOURING |
+| `SUV` | 越野車 | SUV | 越野车、吉普、SUV | X5、GLE、CAYENNE、RAV4 |
+| `MPV` | 七人車 | 商务车 | 七人车、保姆车、商务车 | ALPHARD、VELLFIRE、STEPWGN |
+| `CONVERTIBLE` | 開篷車 | 敞篷车 | 开篷、敞篷、開蓬 | SL、BOXSTER、CABRIOLET |
+| `COUPE` | 跑車 | 轿跑 | 跑车、轿跑、双门 | SUPRA、911、GR86 |
+| （留白/null） | — | — | — | 未命中规则的车系（`body_type` 为空,搜索时被硬条件排除） |
+
+要点：
+- **「七人車」= `MPV`（车型类别）**,**「七座」= `seats=7`（座位数）** —— 两者不同,
+  也不互相替代;说「七座的SUV」时 `body_type=SUV` 且 `seats=7` 同时生效。
+- 留白车会被硬条件挡在外面,所以 `body_type` 生效的响应会额外带
+  `body_type_unclassified_count`（同条件下尚未分类的车数）——**这是静默漏检的提示**,
+  UI 建议在结果数旁显示「另有 N 台未分类,未计入」。
+- 码**不做中文翻译**:传 `"房车"` 会被静默收敛为不限（查宽而非猜错）。
+
 ---
 
 ## 2. HTTP API
@@ -129,7 +153,8 @@ curl -s -H "X-API-Key: $KEY" \
 | 三十万以下 / 五十萬以內 / 不要超过八十万 | 价格上限(硬过滤) |
 | **五十万左右 / 大约三十萬** | **软偏好**:按贴近度排序,不会删掉 39 万/62 万的车 |
 | 2015年打後 / 以後 / 以內 / 左右 | 年份下限/上限/软偏好 |
-| 七座 / **七人车** | 座位数 |
+| 七座 / 7座 | **座位数**(与车身无关) |
+| **七人车 / 房车 / SUV / 跑车 / 旅行车 / 開篷 / 掀背** | **车身类型**(硬过滤,见 §1.6 对照表)。「七人车」是**车型类别**(MPV),不是座位数;说「七座的SUV」则两个条件都生效 |
 | 一手车 / 零手 / 3手 | 手数上限 |
 | 五万公里以内 | 里程上限 |
 | 行货 / 水货 | 进口类型 |
@@ -160,6 +185,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 | `price_min` / `price_max` | number | 价格硬过滤(港币) |
 | `price_near` / `year_near` | number | 「50万左右」软锚点:参与贴合度排序,**不删候选** |
 | `seats` | int | 座位数(库里写法脏,服务端已兼容) |
+| `body_type` | string | **车身类型硬过滤**,只认 7 个英文码(见 §1.6 对照表):`SEDAN`/`HATCHBACK`/`WAGON`/`SUV`/`MPV`/`CONVERTIBLE`/`COUPE`。**不做中文翻译** —— 传 `"房车"` 会被收敛为不限,而不是替你翻成 `SEDAN`(翻译在解析层)。库内尚未分类的车(留白)会被排除,此时响应额外带 `body_type_unclassified_count` 提示「另有 N 台未分类未计入」 |
 | `vehicle_type` | int | 1私家车 2客货车 3货车 4电单车 5经典车;**默认 1**,传 `null` 放开 |
 | `transmission` / `fuel_type` | string | 如 `自動`/`手動`;`汽油`/`柴油`/`混能`/`電動`(包含匹配) |
 | `import_type` | string | `行貨` / `水貨` |
@@ -335,7 +361,9 @@ curl -sS -X POST -H "X-API-Key: $KEY" \
 #### `search_by_spec(...)` — 结构化检索
 
 参数即条件:`base_model / brand / price_min / price_max / year_min / year_max /
-seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默认 score) / limit(默认 5)`。
+seats / body_type / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默认 score) / limit(默认 5)`。
+`body_type` 只认 7 个英文码(`SEDAN/HATCHBACK/WAGON/SUV/MPV/CONVERTIBLE/COUPE`,见 §1.6);
+传了就返回 `body_type_unclassified_count`(同条件下未分类的车数)。
 `china_plate`/`swap`/`dealer` 三态:`None` 不筛;`true` 只要;`false` 排除。
 `dealer` **默认 `false`(只要个人卖家,排除车行)**;要看全部货显式传 `dealer=null`;零命中自动放宽为含车行。
 换车帖(`swap=true`)对收购场景是线索:卖家想换车=好谈价。
@@ -360,6 +388,8 @@ seats / hand_max / mileage_max / max_price_ratio / china_plate / swap / sort(默
 | `china_plate` / `is_swap` | 中港牌 / 换车帖(可作检索条件,见 spec 字段表) |
 | `is_dealer` / `dealer_listings` | 车行判定 / 该卖家在售挂车数。同一联系方式(电话或邮箱)挂 ≥4 台 = 车行;实测车行贡献 72% 在售盘源,结果里打「车行(挂N台)」标签。检索条件 `dealer`(见 spec 表) |
 | `age_days` | 挂牌天数 |
+| `body_type` / `body_type_label` | 车身类型(英文码 / 香港叫法,如 `MPV` / `七人車`;未分类为 null,见 §1.6) |
+| `body_type_unclassified_count` | **仅当** spec 传了 `body_type` 时出现:同条件下尚未分类的车数(留白车,未能计入结果)。静默漏检提示,建议 UI 显示 |
 | `image_url` | 搜索候选的**首图(封面)**URL，指向本服务(`/vehicle/{id}/cover`)；28car 原链在 `image_url_raw`（见 §2.7） |
 | `images` | 详情接口返回的该车**全部图片** URL 数组(按原页顺序,≤5 张)，指向本服务；原链在 `images_raw` |
 | `contact_display` / MCP 列表的 `contact` | 卖家联系方式一行式:电话型 `Chan · 98524136`;仅邮箱型 `趙生 · 電郵 xxx@yahoo.com.hk`。检索结果只含在售且带联系方式的车源,仅邮箱的排在有电话的之后 |

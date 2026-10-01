@@ -71,6 +71,9 @@ CURATED_SEED: dict[str, str] = {
     "赛瑞纳": "SERENA", "赛丽娜": "SERENA",
     "得利卡": "DELICA", "德利卡": "DELICA",
     "君爵": "ELGRAND", "贵士": "QUEST",
+    # 「开曼」= Porsche **Cayman**（硬顶跑车）。LLM 生成时错安到了 BOXSTER 上
+    # （2026-09-30 压测抓到：开曼→BOXSTER），种子固化正确映射；错行已在库里删除。
+    "开曼": "CAYMAN",
 }
 
 #: 别名 → base_model 的静态种子（合并 MODEL_ALIASES 与人工条目）。
@@ -106,6 +109,12 @@ _ALIAS_BLACKLIST: frozenset[str] = frozenset({
     # 泛用/座位/车型类别词 —— 不是某个车系的名字，命中会大面积劫持查询
     # （「双座」「皮卡」「五系」被安到某一台车上）。
     "四座", "双座", "五座", "皮卡", "五系", "七系", "三系", "一系",
+    # 「类目词复合别名」实测回归（2026-09-30 车身类型上线压测）：「野马跑车→MUSTANG」
+    # 「小跑车→ROADSTER」这类**别名里已经含类目词**的条目，在规则兜底路径会与
+    # body_type 扫描叠加成矛盾条件（MUSTANG 车身未分类、ROADSTER 是 CONVERTIBLE，
+    # 再 AND body_type=COUPE 全部 0 命中）。类目词一律走 parser 的 body 词表，
+    # 不许进车系别名表。
+    "跑车", "小跑车",
 })
 
 

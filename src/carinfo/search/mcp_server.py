@@ -279,6 +279,8 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
         "summary": summary,
         "total_matched": out.total_matched,
         "relaxed": out.relaxed,
+        # 传了 body_type 才有值（否则 None）：留白车进不来，这是「另有 N 台未分类」提示
+        "body_type_unclassified_count": out.body_type_unclassified_count,
         "items": [
             {
                 "vehicle_id": it["vehicle_id"],
@@ -290,6 +292,8 @@ def _do_search_by_spec(conn, spec: SearchSpec) -> dict[str, Any]:
                 "images": ([proxied_image_url(it["vehicle_id"], i) for i in range(len(it.get("images") or []))]
                            if it.get("vehicle_id") else []),
                 "labels": it["labels"],
+                "body_type": it.get("body_type"),
+                "body_type_label": it.get("body_type_label"),
                 "contact": it["contact_display"],
             }
             for it in out.items
@@ -355,6 +359,12 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
         "china_plate/swap/dealer 是三态：true=只要；false=排除；None=不筛。"
         "dealer=true 只要车行；dealer=None 车行+个人都返回（要全部货时用）；"
         "零命中时系统会自动放宽为含车行，结果仍带「车行」标签。"
+        "body_type 是**车身类型硬过滤**（不做中文翻译，只认 7 个英文码）："
+        "SEDAN(房車/轿车) HATCHBACK(掀背/揭背/两厢) WAGON(旅行車/旅行版) "
+        "SUV(越野车/吉普) MPV(七人車/商务车/保姆车) CONVERTIBLE(開篷/敞篷) COUPE(跑車/轿跑)。"
+        "⚠️「七人車」是车型类别 → body_type=\"MPV\"；「七座」是座位数 → seats=7，两者不同。"
+        "传入了 body_type 时，返回额外带 body_type_unclassified_count（同条件下尚未分类的"
+        "车数）——留白车进不来，这个数是「另有 N 台未分类」的提示。"
         "签名里没列出的条件（变速箱、燃料、行水货、排量、关键词）则是真的不设限。"
     ),
 )
@@ -366,6 +376,7 @@ def search_by_spec(
     year_min: int | None = None,
     year_max: int | None = None,
     seats: int | None = None,
+    body_type: str | None = None,
     hand_max: int | None = None,
     mileage_max: int | None = None,
     max_price_ratio: float | None = None,
@@ -384,6 +395,7 @@ def search_by_spec(
             "year_min": year_min,
             "year_max": year_max,
             "seats": seats,
+            "body_type": body_type,
             "hand_max": hand_max,
             "mileage_max": mileage_max,
             "max_price_ratio": max_price_ratio,

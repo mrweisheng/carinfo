@@ -42,7 +42,7 @@ ALLOWED_LLM_FIELDS = {
     "base_model", "brand", "model_keyword", "family", "displacement",
     "year_min", "year_max", "year_near",
     "price_min", "price_max", "price_near",
-    "seats", "vehicle_type", "transmission", "fuel_type",
+    "seats", "body_type", "vehicle_type", "transmission", "fuel_type",
     "import_type", "hand_max", "mileage_max", "china_plate",
     "dealer", "max_price_ratio", "exclude_anomaly",
     "sort", "limit", "label",
@@ -78,7 +78,12 @@ year_near       年份**模糊锚点**（"2015年左右"）→ 2015。只影响�
 price_min       价格下限，港币整数
 price_max       价格上限，港币整数
 price_near      价格**模糊锚点**（"五十万左右"）→ 500000。只影响排序，不是筛选
-seats           座位数，整数（"七人车/七座" → 7）
+seats           座位数，整数（**只认「七座 / N座」**；「七人车」是车型，见 body_type）
+body_type       车身类型，枚举（只准写这 7 个英文码，中文一律翻译成码）：
+                SEDAN(房車/轿车)  HATCHBACK(掀背/揭背/两厢)  WAGON(旅行車/旅行版)
+                SUV(越野车/吉普)  MPV(七人車/商务车/保姆车)  CONVERTIBLE(開篷/敞篷)
+                COUPE(跑車/轿跑)
+                ⚠️「七人車」是**车型类别** → body_type=MPV；「七座」才是座位数 → seats=7
 hand_max        手数上限，整数
 mileage_max     里程上限（公里），整数
 import_type     "行貨" 或 "水貨"
@@ -111,6 +116,10 @@ limit           整数，返回条数
   理由：写死区间会把 39 万、62 万的车直接删掉；"左右"的本意是"离得近的排前面"，
   不是"超出的不要"。
 - "七座" → {"seats": 7}；"一手车" → {"hand_max": 1}；"零手" → {"hand_max": 0}
+- 车身类型：**只有用户明确说了车型类别词才填 body_type**（"SUV"/"房车"/"七人车"/
+  "跑车"/"旅行车"/"敞篷"/"掀背"）。用户没提类型，**绝对不要**替他填 —— 例如
+  「找台 14 年威尔法」只填 base_model+年份，不许补 body_type。
+  "七人车" → {"body_type": "MPV"}（**不是 seats**）；"七座的 SUV" → 两个都要
 - "五万公里以內" → {"mileage_max": 50000}
 - "性价比高" → {"max_price_ratio": 0.9}；"捡漏 / 超值 / 特别便宜" → {"max_price_ratio": 0.8}
 - vehicle_type：用户明确说"客货车 / 货车 / 电单车"才填；说"车"或没说就不填
@@ -129,6 +138,9 @@ limit           整数，返回条数
                        → {"queries":[{"label":"14年威尔法","base_model":"VELLFIRE","year_min":2014,"year_max":2014},
                                         {"label":"14年埃尔法","base_model":"ALPHARD","year_min":2014,"year_max":2014}]}
 "三十万以下的七座车"       → {"queries":[{"price_max": 300000, "seats": 7}]}
+"找台七人车"             → {"queries":[{"body_type": "MPV"}]}
+"15万左右的SUV"          → {"queries":[{"price_near": 150000, "body_type": "SUV"}]}
+"七座的SUV"             → {"queries":[{"body_type": "SUV", "seats": 7}]}
 "最便宜的平治"            → {"queries":[{"brand": "MERCEDES-BENZ", "sort": "price_asc"}]}
 "捡漏阿尔法"              → {"queries":[{"base_model": "ALPHARD", "max_price_ratio": 0.8}]}
 
@@ -187,6 +199,13 @@ LLM_KEY_ALIASES: dict[str, str] = {
     # 其它
     "seat": "seats",
     "seat_count": "seats",
+    # 车身类型：模型爱把车型类别写成 body/type/car_type，同样要归一 ——
+    # 漏了就被白名单当幻觉字段丢掉，"SUV/房车"这类条件静默消失。
+    "body": "body_type",
+    "bodytype": "body_type",
+    "body_style": "body_type",
+    "car_type": "body_type",
+    "vehicle_body": "body_type",
     "keyword": "model_keyword",
     "mileage": "mileage_max",
     "mileage_limit": "mileage_max",
@@ -225,6 +244,69 @@ def normalize_llm_keys(data: dict) -> dict:
 
 
 SOFT_HINT = "（用户只是随口问问，不要替他加任何筛选条件。）"
+
+
+# ---------------------------------------------------------------------------
+# 车身类型类目词（规则兜底路径 + 「七人車」口径兜底共用）
+# ---------------------------------------------------------------------------
+#: (词, 码)。长词优先由下面的正则保证（按长度降序拼 alternation）。
+#: **刻意不收** 「客貨車 / van仔」—— §三 已定：与既有车系别名（客貨車→HIACE）打架，
+#: 且那本就不是私家车业务范畴，混进来只会制造语义倒退。
+#: 「越野車/越野车」**必须带车字后缀**：不然会命中品牌别名「越野路華」(LAND ROVER)，
+#: 把品牌查询误判成车型查询。
+_BODY_WORD_RULES: tuple[tuple[str, str], ...] = (
+    ("七人車", "MPV"), ("七人车", "MPV"),
+    ("保姆車", "MPV"), ("保姆车", "MPV"),
+    ("商務車", "MPV"), ("商务车", "MPV"),
+    ("MPV", "MPV"),
+    ("越野車", "SUV"), ("越野车", "SUV"),
+    ("吉普", "SUV"),
+    ("SUV", "SUV"),
+    ("房車", "SEDAN"), ("房车", "SEDAN"),
+    ("轎車", "SEDAN"), ("轿车", "SEDAN"),
+    ("掀背", "HATCHBACK"), ("揭背", "HATCHBACK"),
+    ("兩廂", "HATCHBACK"), ("两厢", "HATCHBACK"),
+    ("旅行車", "WAGON"), ("旅行车", "WAGON"), ("旅行版", "WAGON"),
+    ("開篷", "CONVERTIBLE"), ("开篷", "CONVERTIBLE"),
+    ("開蓬", "CONVERTIBLE"), ("开蓬", "CONVERTIBLE"),
+    ("敞篷", "CONVERTIBLE"),
+    ("轎跑", "COUPE"), ("轿跑", "COUPE"),
+    ("跑車", "COUPE"), ("跑车", "COUPE"),
+)
+
+#: 全词扫描正则：按词长降序拼 alternation（长词优先），ASCII 词不区分大小写。
+_BODY_WORD_RE = re.compile(
+    "|".join(re.escape(w) for w, _ in
+             sorted(_BODY_WORD_RULES, key=lambda kv: -len(kv[0]))),
+    re.IGNORECASE,
+)
+_BODY_WORD_MAP: dict[str, str] = {w.upper(): code for w, code in _BODY_WORD_RULES}
+
+#: 「七人車」专用（粤语口语，含繁简）。用于口径兜底：它是车型类别，不是座位数。
+_SEVEN_SEATER_RE = re.compile(r"七人\s*[車车]")
+
+
+def _mentions_7seater_car(text: str) -> bool:
+    """原文是否出现「七人車 / 七人车」（车型类别语义）。"""
+    return bool(_SEVEN_SEATER_RE.search(text or ""))
+
+
+def _scan_body_type(text: str) -> str | None:
+    """从原文扫出车身类型码（长词优先，命中即返回）。
+
+    同时只命中一个词是常态；万一原文含两个类型词（"SUV 还是 房车"），
+    取**最靠前出现**的那个 —— 第一诉求优先，跟「左右」锚点取最靠前同一口径。
+    """
+    if not text:
+        return None
+    best: tuple[int, str] | None = None
+    for m in _BODY_WORD_RE.finditer(text):
+        code = _BODY_WORD_MAP.get(m.group(0).upper())
+        if code is None:
+            continue
+        if best is None or m.start() < best[0]:
+            best = (m.start(), code)
+    return best[1] if best else None
 
 
 @dataclass
@@ -564,13 +646,27 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
         payload["family"] = data["family"]
     for k in (
         "year_min", "year_max", "year_near", "price_min", "price_max", "price_near",
-        "seats", "vehicle_type", "transmission", "fuel_type", "import_type",
+        "seats", "body_type", "vehicle_type", "transmission", "fuel_type", "import_type",
         "hand_max", "mileage_max", "max_price_ratio", "china_plate", "dealer",
     ):
         if data.get(k) is not None:
             payload[k] = data[k]
     if data.get("exclude_anomaly") is not None:
         payload["exclude_anomaly"] = bool(data["exclude_anomaly"])
+
+    # ── 「七人車」口径兜底（2026-09-30，09-24 P0 规矩：prompt 是软约束）──────
+    # 香港语义里「七人車」是**车型类别**(MPV)，不是座位数。模型完全可能同时吐
+    # {"body_type":"MPV","seats":7}（字面「七人」就是 7）—— 那样会叠一层 seats=7，
+    # 把 7 座 SUV 一起卷进来，正是本次要修的错。故以**原文**为准：原文出现
+    # 「七人車/七人车」且最终 body_type 是 MPV 时，丢掉 seats。
+    # **只丢 seats，不丢其它条件**（"七人车 3.5 排量" 里的排量照留）。
+    # 不碰「七座」：那是真座位数诉求（"七座的 SUV" 里 seats=7 必须保留）。
+    if _mentions_7seater_car(query) and payload.get("body_type") == "MPV" \
+            and payload.get("seats") is not None:
+        dropped_seats = payload.pop("seats")
+        notes.append(
+            f"「七人車」是车型类别（MPV），已忽略模型多写的座位数 seats={dropped_seats}"
+        )
 
     return SearchSpec.from_dict(payload)
 
@@ -881,9 +977,17 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
             payload["year_min"] = y
             payload["year_max"] = y
 
-    # --- 座位数 ---（"七座"与"七人车"同义：粤语口语常说 N 人车）
-    seat = re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*[座坐]", query) \
-        or re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*人\s*車?车?", query)
+    # --- 车身类型类目词（规则兜底；放在车系/品牌之后，独立写 body_type）---
+    # 与座位数**分开**：「七人車」是车型类别(MPV)，不是座位数(见下条)。
+    # 不写 payload 时不动；命中即写 7 码之一（spec.__post_init__ 再收敛一次）。
+    _body = _scan_body_type(query)
+    if _body:
+        payload["body_type"] = _body
+
+    # --- 座位数 ---（只认「七座/N座/N坐」；「七人车」已在上面的 body 段消费，
+    #     这里**不再**匹配 N人車 —— 否则「找台七人车」会 seats=7 + body_type=MPV
+    #     双写，把 7 座 SUV 一起卷进来，正是本次要修的错。）
+    seat = re.search(r"([0-9]+|[零一二两三四五六七八九十]+)\s*[座坐]", query)
     if seat:
         n = _cn_to_int(seat.group(1))
         if n and 2 <= n <= 30:

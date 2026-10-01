@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from carinfo.search.body_types import label_of
 from carinfo.search.engine import CORE_DIMS, DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
 from carinfo.search.llm import LLMClient, LLMError
 from carinfo.search.spec import SearchSpec
@@ -195,6 +196,10 @@ class ExplainedResult:
     #: 被放宽掉的条件名（如 ["import_type"]），空 = 没有放宽。给前端做徽标/
     #: 一键收紧；人话说明在 summary 首句（由 API/MCP 从 fb_notes 拼入）。
     relaxed: list[str] = field(default_factory=list)
+    #: 同条件下未分类（body_type IS NULL）的车数 —— 只在 spec.body_type 生效时非 None。
+    #: 留白车会被硬条件挡在外面，这个数是「另有 N 台未分类，未能计入」的提示，
+    #: 防**部分命中的静默漏检**（搜「SUV」命中 200 台，用户不知道还有一批没进来）。
+    body_type_unclassified_count: int | None = None
 
 
 def build_result_dict(item: ScoredVehicle, spec: SearchSpec | None = None) -> dict:
@@ -221,6 +226,38 @@ def build_result_dict(item: ScoredVehicle, spec: SearchSpec | None = None) -> di
     }
 
 
+def target_name(spec: SearchSpec) -> str:
+    """摘要里「在 N 台『___』里筛出 M 台」的那个名号。
+
+    点名顺序：车系 > 关键词型号 > 家族（配品牌）> 品牌 > 车身类型 > 全部车型。
+
+    为什么补 `family`：口语车系名（「特斯拉 Model 3」）走的是 family，base_model
+    为空 —— 旧写法会一路掉到 brand，摘要显示成光秃秃的「TESLA」，用户看不出
+    系统按哪个系列在找（2026-09-30 补）。
+
+    为什么补 `body_type`：「20 万左右的房车」这类查询只有类型条件，没有名号 ——
+    旧写法落到「全部车型」，摘要就成了「在 N 台『全部车型』里筛出 5 台」，
+    对用户零信息（2026-09-30 补）。
+    只在**没有具体车型**时把类型当限定词拼上（「平治 SUV」）；已有精确车系/
+    型号时不叠（「ALPHARD 七人車」是同义冗余）。
+    """
+    if spec.base_model:
+        name: str | None = spec.base_model
+    elif spec.model_keyword:
+        name = spec.model_keyword
+    elif spec.family:
+        name = f"{spec.brand} {spec.family}".strip() if spec.brand else spec.family
+    elif spec.brand:
+        name = spec.brand
+    else:
+        name = None
+    # 类型限定词：仅在没有具体车型/型号时拼（避免与精确车系同义冗余）
+    if spec.body_type and not (spec.base_model or spec.model_keyword):
+        lbl = label_of(spec.body_type, "hk")
+        name = f"{name} {lbl}" if name else lbl
+    return name or "全部车型"
+
+
 def summarize(result: SearchResult) -> str:
     """确定性摘要。不调模型 —— 摘要里的每个数字都必须可核对。"""
     spec = result.spec
@@ -229,7 +266,8 @@ def summarize(result: SearchResult) -> str:
     # 按旧顺序会拼出「在 6 台『BMW』里筛出 5 台」—— 用户问的是 740，
     # 说「BMW」既不精确也没告诉用户"我按 740 找的"。
     # （Fix-2b 让规则路径也开始产出关键词，这条路径从少见变成常见，2026-09-28）
-    target = spec.base_model or spec.model_keyword or spec.brand or "全部车型"
+    # 名号拼装已抽到 `target_name()`（2026-09-30：补 family + body_type）。
+    target = target_name(spec)
     n = len(result.items)
     if not result.items:
         # 诚实 0 必须优先点名**用户说的型号**：`target` 在 model_keyword='M760' +
@@ -326,4 +364,5 @@ def explain(result: SearchResult, llm: LLMClient | None = None, use_llm: bool = 
         spec=result.spec.to_dict(),
         source_query=result.spec.raw_query,
         relaxed=list(result.relaxed),
+        body_type_unclassified_count=result.body_type_unclassified_count,
     )

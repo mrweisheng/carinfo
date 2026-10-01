@@ -34,6 +34,7 @@ class ScanTooWide(RuntimeError):
     """
 from typing import Any
 
+from carinfo.search.body_types import label_of
 from carinfo.search.normalize import clean_text
 from carinfo.search.spec import SORT_NEWEST, SORT_PRICE_ASC, SORT_PRICE_DESC, SearchSpec
 
@@ -221,11 +222,21 @@ class ScoredVehicle:
     license_until: str | None = None
     china_plate: bool = False
     is_swap: bool = False
+    #: 车身类型码（7 码之一，见 search/body_types.py）；None = 未分类（留白）。
+    #: **硬过滤维度**，不参与打分。
+    body_type: str | None = None
+    #: 判定来源：'rule'=R1/R2 词命中；'series'=R3 车系字典；None=未分类
+    body_source: str | None = None
 
     scores: dict[str, float] = field(default_factory=dict)
     score: float = 0.0
     #: 实际参与的维度（缺维不在其中），让上游能如实说"这条没车况数据"
     used_dims: list[str] = field(default_factory=list)
+
+    @property
+    def body_type_label(self) -> str | None:
+        """车身类型的香港标签（七人車/房車/跑車…）；未分类 → None（前端显示「其他」）。"""
+        return label_of(self.body_type, "hk")
 
     @property
     def has_phone(self) -> bool:
@@ -281,6 +292,9 @@ class ScoredVehicle:
             "license_until": self.license_until,
             "china_plate": self.china_plate,
             "is_swap": self.is_swap,
+            "body_type": self.body_type,
+            "body_type_label": self.body_type_label,
+            "body_source": self.body_source,
             "score": round(self.score, 4),
             "scores": {k: round(v, 4) for k, v in self.scores.items()},
         }
@@ -298,6 +312,11 @@ class SearchResult:
     #: 由 `search_with_fallback` 的 L3 松绑填写；API/MCP 并入每组 payload，
     #: 给前端/Agent 做结构化消费（徽标、一键按原条件收紧）。人话说明另走 fb_notes。
     relaxed: list[str] = field(default_factory=list)
+    #: **同条件下未分类（body_type IS NULL）的车数** —— 只在 spec.body_type 生效时非 None。
+    #: 用来提示「另有 N 台车辆尚未分类，未能计入」：留白车会造成**部分命中的静默漏检**
+    #: （搜「SUV」命中 200 台时，用户不知道还有一批 SUV 因未分类没进来），
+    #: 这比零命中更危险 —— 零命中至少还有提示。算法见 `_unclassified_count_sql`。
+    body_type_unclassified_count: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +340,7 @@ SELECT v.vehicle_id, v.car_model, v.car_brand, v.year, v.current_price, v.car_ur
        f.base_model, f.brand_norm, f.price_ratio, f.market_median, f.market_p25,
        f.market_p75, f.market_bucket, f.market_level, f.market_ref_n, f.age_days, f.condition_score,
        f.has_condition, f.heat_score, f.is_anomaly, f.dealer_listings, f.is_dealer,
-       f.verify_age_days, f.is_unverified,
+       f.verify_age_days, f.is_unverified, f.body_type, f.body_source,
        COUNT(*) OVER () AS _total_matched
 FROM vehicles v
 JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
@@ -480,6 +499,12 @@ def _where_clause(spec: SearchSpec) -> tuple[str, list[Any]]:
         )
         params.append(spec.mileage_max)
 
+    if spec.body_type:
+        # 车身类型（7 码）：**硬过滤**，不参与打分 —— 用户说了类型就是明确诉求。
+        # 码已由 spec.__post_init__ 收敛为大写白名单（脏值 → None）。
+        clauses.append(" AND f.body_type = %s")
+        params.append(spec.body_type)
+
     if spec.max_price_ratio is not None:
         clauses.append(" AND f.price_ratio IS NOT NULL AND f.price_ratio <= %s")
         params.append(spec.max_price_ratio)
@@ -520,6 +545,43 @@ def _count_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
         + _VISIBILITY_WHERE + where,
         params,
     )
+
+
+def _unclassified_count_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
+    """「同条件下的未分类车数」COUNT —— 用来提示「另有 N 台未分类，未能计入」。
+
+    ⚠️ **必须保留其余全部条件，只把 body_type 那句换成 `IS NULL`**。
+    不能图省事写成「去掉 body_type 条件再 COUNT」：那数出来的是**所有类型**的车，
+    搜「SUV」会得到「另有 12,000+ 台未分类」的荒谬提示（真实未分类约 5,500 台，
+    而且里面大部分是轿车）。这是 2026-09-30 审核抓出的 v2 实现错误。
+
+    语义是「同条件未分类车数的**上界**」—— 未分类车里哪些真是用户要的类型无从知道，
+    所以文案只能说「另有 N 台车辆尚未分类，未能计入」，不能声称它们都是 SUV。
+    """
+    probe = replace(spec, body_type=None)
+    where, params = _where_clause(probe)
+    return (
+        "SELECT count(*) FROM vehicles v "
+        "JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id WHERE "
+        + _VISIBILITY_WHERE + where + " AND f.body_type IS NULL",
+        params,
+    )
+
+
+def count_unclassified(conn, spec: SearchSpec) -> int | None:
+    """body_type 生效时返回「同条件未分类车数」，否则 None。失败一律返回 None
+    （提示是锦上添花，绝不能把一次正常查询变成 500）。"""
+    if not spec.body_type:
+        return None
+    try:
+        sql, params = _unclassified_count_sql(spec)
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        n = cur.fetchone()[0]
+        cur.close()
+        return int(n) if n is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -790,13 +852,19 @@ def _attach_images(conn, items: list[ScoredVehicle]) -> None:
 
 
 def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
-           relaxed_source: SearchSpec | None = None) -> SearchResult:
+           relaxed_source: SearchSpec | None = None,
+           unclassified_count: int | None = None) -> SearchResult:
     """主入口。conn 由调用方给（API 层用连接池，MCP 用单连接）。
 
     `relaxed` / `relaxed_source`：仅由 `search_with_fallback` 在 **L3 松绑后重查**时
     传入 —— 前者是被放宽的条件名（透出到 `SearchResult.relaxed` 并触发第七维），
     后者是**放宽前**的原始 spec（阈值在它身上，用于算松绑补偿分）。
     两者默认都不传 = 常规硬查，行为与历史完全一致。
+
+    `unclassified_count`：调用方**已经算过**的未分类车数。零命中协议会用同一个
+    spec 反复重查，而 body_type 从不被放宽 → 这个数在整轮里恒等，所以由
+    `search_with_fallback` 算一次、后续传入复用，避免每次重查都付一次 COUNT
+    （实测 48–109ms）。默认 None = 本函数自己算（仅在 spec.body_type 生效时）。
     """
     t0 = time.perf_counter()
     sql, params = build_query(spec)
@@ -827,7 +895,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
             contact_name, phone_number, contact_email,
             base_model, brand_norm, ratio, med, p25, p75, bucket, level, ref_n, age_days, cond,
             has_cond, heat, is_anomaly, dealer_listings, is_dealer,
-            verify_age_days, is_unverified, _total,
+            verify_age_days, is_unverified, body_type, body_source, _total,
         ) = row
         ef = extra if isinstance(extra, dict) else {}
         # year/price 提前解析：near 维度要按原始数值算偏差，不能再从字符串现取
@@ -880,6 +948,8 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
                 license_until=(ef.get("license_until") or None) if isinstance(ef.get("license_until"), str) else None,
                 china_plate=bool(ef.get("china_plate")),
                 is_swap=bool(ef.get("is_swap")),
+                body_type=body_type,
+                body_source=body_source,
                 scores={k: float(v) for k, v in dims.items() if v is not None},
                 score=total,
                 used_dims=used,
@@ -890,9 +960,12 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
     items = items[: spec.limit]
     _attach_images(conn, items)
     elapsed = int((time.perf_counter() - t0) * 1000)
+    if unclassified_count is None:
+        unclassified_count = count_unclassified(conn, spec)
     return SearchResult(
         spec=spec, items=items, total_matched=total_matched, scanned=scanned,
         elapsed_ms=elapsed, notes=notes, relaxed=list(relaxed or []),
+        body_type_unclassified_count=unclassified_count,
     )
 
 
@@ -1094,6 +1167,14 @@ def _relax_diagnostics(conn, spec: SearchSpec) -> list[str]:
         n = _probe_count(conn, replace(spec, **{name: None}))
         if n:
             msgs.append(f"去掉{_l3_label(name, spec)}还有 {n} 台")
+    # 车身类型是**硬条件**，且从不被放宽 —— 它最可能是零命中的成因。
+    # 探一次「不限类型还有 N 台」：跟下面的「不限预算还有 N 台」并排，用户就能
+    # 分辨是「这个类型真的没车」还是「有车但都不在你说的价格/年份范围」——
+    # 这正是 price_near(软) 与 body_type(硬) 的口径要分家的原因（方案 §5.5）。
+    if spec.body_type is not None and len(msgs) < 4:
+        n = _probe_count(conn, replace(spec, body_type=None))
+        if n:
+            msgs.append(f"不限车身类型还有 {n} 台")
     if spec.price_max is not None and len(msgs) < 4:
         n = _probe_count(conn, replace(spec, price_max=None))
         if n:
@@ -1141,6 +1222,16 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     if result.total_matched > 0:
         return result, []
 
+    #: 未分类车数在整轮放宽里**恒等**（body_type 从不被放宽），Step 0 已算过一次，
+    #: 后续每次重查都把同一个数传下去复用 —— 否则最坏一轮要多付 5 次 COUNT。
+    uncls = result.body_type_unclassified_count
+
+    def _re(new_spec: SearchSpec, **kw):
+        """零命中后的重查：复用 Step 0 的未分类数，并把结果盖回去。"""
+        r = search(conn, new_spec, unclassified_count=uncls, **kw)
+        r.body_type_unclassified_count = uncls
+        return r
+
     fb_notes: list[str] = []
     exact_year = (spec.year_min
                   if spec.year_min is not None and spec.year_min == spec.year_max
@@ -1157,7 +1248,7 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
             probe = replace(spec, **{k: None for k in dropped})
             if not _probe_exists(conn, probe):
                 continue
-            r1 = search(conn, probe, relaxed=list(dropped), relaxed_source=spec)
+            r1 = _re(probe, relaxed=list(dropped), relaxed_source=spec)
             if r1.total_matched > 0:
                 labels = "、".join(_l3_label(n, spec) for n in dropped)
                 if len(dropped) == 1:
@@ -1177,8 +1268,8 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
 
     # ── Step 2：保车型关键词，放宽年份（现状步骤 1 保留）──────────────────
     if spec.model_keyword and exact_year is not None:
-        r2 = search(conn, replace(spec, year_min=exact_year - 3,
-                                  year_max=exact_year + 3))
+        r2 = _re(replace(spec, year_min=exact_year - 3,
+                         year_max=exact_year + 3))
         if r2.total_matched > 0:
             fb_notes.append(f"**没有 {exact_year} 年的「{spec.model_keyword}」**"
                             f"（该车型/条件下），以下为年份最接近的结果（±3 年内）")
@@ -1186,7 +1277,7 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
 
     # ── Step 3：只允许丢**噪声**关键词；身份码跳过（丢了就是顶包）────────
     if spec.model_keyword and identity_kw is None:
-        r3 = search(conn, replace(spec, model_keyword=None))
+        r3 = _re(replace(spec, model_keyword=None))
         if r3.total_matched > 0:
             fb_notes.append(f"关键词「{spec.model_keyword}」没有命中任何车，"
                             f"已忽略它重新检索（该关键词可能是解析噪声）")
@@ -1195,9 +1286,9 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     if exact_year is not None and identity_kw is None:
         # ── Step 4：到这里说明关键词已证实是噪声（或本来就没有），放宽时一并去掉，
         #    避免「噪声关键词 + 放宽年份」双重放水 ────────────────────────────
-        r4 = search(conn, replace(spec, model_keyword=None,
-                                  year_min=exact_year - 3,
-                                  year_max=exact_year + 3))
+        r4 = _re(replace(spec, model_keyword=None,
+                         year_min=exact_year - 3,
+                         year_max=exact_year + 3))
         if r4.total_matched > 0:
             fb_notes.append(f"**没有 {exact_year} 年的车**（该车型/条件下），"
                             f"以下为年份最接近的结果（±3 年内）")
@@ -1208,7 +1299,7 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     #    实在没有才把车行拉出来，且结果仍带 is_dealer/「车行」标签，用户可辨识。
     #    放在其余放宽之后（年份/关键词先试），因为放宽它们比引入车行更贴近原意。
     if spec.dealer is False:
-        r5 = search(conn, replace(spec, dealer=None))
+        r5 = _re(replace(spec, dealer=None))
         if r5.total_matched > 0:
             fb_notes.append(
                 "**库里没有符合其余条件的个人卖家车源**，已放宽为包含车行；"
@@ -1255,6 +1346,14 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
     diag = _relax_diagnostics(conn, spec)
     if diag:
         fb_notes.append("；".join(diag))
+
+    # 未分类留白提示：body_type 是硬条件，留白车一律进不来。零命中时如果说
+    # 「没有 SUV」，用户会以为库里真没有 —— 必须把「还有 N 台没分类」说出来。
+    if spec.body_type and uncls:
+        fb_notes.append(
+            f"另有 {uncls} 台车辆**尚未分类**，未能计入本次结果（它们未必包含"
+            f"你要的「{label_of(spec.body_type)}」）"
+        )
 
     return result, fb_notes
 

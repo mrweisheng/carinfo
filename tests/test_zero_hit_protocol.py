@@ -28,7 +28,9 @@ def patch(monkeypatch):
     def _install(total_fn, exists=None, counts=None):
         seen: list[tuple] = []
 
-        def fake_search(conn, spec, *, relaxed=None, relaxed_source=None):
+        def fake_search(conn, spec, *, relaxed=None, relaxed_source=None, **kw):
+            # `**kw`：`search()` 新增了 `unclassified_count`，零命中协议会把 Step 0
+            # 的未分类数透传下来复用；替身必须吃得下这个 kwarg（否则协议一调用就崩）。
             seen.append((tuple(relaxed or []), spec.year_min, spec.year_max))
             return _res(spec, total_fn(spec, relaxed), relaxed=relaxed)
 

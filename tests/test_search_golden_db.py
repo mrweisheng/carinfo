@@ -99,3 +99,72 @@ def test_snapshot_bmw740_2018_count(real_ctx, db_fetch):
     s.dealer = None            # 同上：锁车型解析，不看车行过滤
     r, _fb = _run(db_fetch, s)
     assert r.total_matched >= 6
+
+
+# ---------------------------------------------------------------------------
+# 车身类型（2026-09-30 新增）—— 真库口径
+# ---------------------------------------------------------------------------
+def test_body_type_classified_rate_ge_70pct(db_fetch):
+    """可判率 ≥70%（目标 75%）。掉下来 = R3 字典 / R1 规则退化，或重算没跑。
+
+    ⚠️ 这是**数据质量**断言，不是性能断言。表被爬虫实时写入，只锁下界。
+    """
+    def _q(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FILTER (WHERE body_type IS NOT NULL), "
+                    "count(*) FROM vehicle_features")
+        return cur.fetchone()
+
+    classified, total = db_fetch(_q)
+    assert total > 0, "vehicle_features 是空的 —— features 重算没跑？"
+    rate = classified / total
+    assert rate >= 0.70, f"可判率仅 {classified}/{total} = {rate:.1%}"
+
+
+def test_index_vf_body_type_exists_after_rebuild(db_fetch):
+    """**防影子表机制回归**：`idx_vf_body_type` 在第 2 次重算后仍必须存在。
+
+    `_shadow_ddl()` 的 `index_map` 是**硬编码白名单**（features.py:580-587）：
+    新索引没登记进去的话，影子表建索引时 `IF NOT EXISTS` 撞名 → 索引不建 →
+    换名时随旧表 DROP，业务索引带着静默消失（查询不报错、只是全表扫）。
+    这条断言专抓那类回归 —— **不是性能断言**（见方案 §四）。
+    """
+    def _q(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('idx_vf_body_type')")
+        return cur.fetchone()[0]
+
+    assert db_fetch(_q) is not None, "idx_vf_body_type 消失了（影子表 index_map 漏登记？）"
+
+
+def test_body_type_filter_hits_and_reports_unclassified(db_fetch):
+    """端到端：body_type 生效 → 命中集全是该类型，且带未分类数（静默漏检提示）。"""
+    spec = SearchSpec(raw_query="SUV", body_type="SUV", limit=10)
+    r = db_fetch(lambda conn: search(conn, spec))
+    assert r.total_matched > 0
+    assert all(it.body_type == "SUV" for it in r.items)
+    # 静默漏检断言：body_type 生效时未分类数必须出现（None = 没算，用户看不到漏掉了什么）
+    assert r.body_type_unclassified_count is not None
+    assert r.body_type_unclassified_count >= 0
+
+
+@pytest.mark.parametrize(("query", "code"), [
+    ("15万左右的SUV", "SUV"),
+    ("20万左右的房车", "SEDAN"),
+    ("找台七人车", "MPV"),
+    ("七座的SUV", "SUV"),
+])
+def test_body_type_full_chain_rule_path(real_ctx, db_fetch, query, code):
+    """4 条全链路（规则路径）：解析 → SQL → 真数据。"""
+    s = rule_based_parse(query, real_ctx)
+    assert s.body_type == code, f"{query!r} → {s.body_type!r}（应 {code}）"
+    r, _fb = _run(db_fetch, s)
+    assert r.total_matched > 0, f"{query!r} 命中 0 台（类型条件把候选砍空了？）"
+    assert all(it.body_type == code for it in r.items)
+
+
+def test_seven_seater_chain_drops_seats(real_ctx, db_fetch):
+    """七人車兜底断言（全链路）：body_type=MPV 且 seats 必须为 None。"""
+    s = rule_based_parse("找台七人车", real_ctx)
+    assert s.body_type == "MPV"
+    assert s.seats is None

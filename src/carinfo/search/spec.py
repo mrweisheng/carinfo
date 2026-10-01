@@ -16,6 +16,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from carinfo.search.body_types import VALID_BODY_TYPES
+
 #: 返回条数：默认 5，上限 50（导航形态下给太多反而选不动）
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 50
@@ -135,6 +137,14 @@ class SearchSpec:
     #: `car_model ~ '^family[0-9 ]'` 前缀匹配（后跟数字/空格排除 SL 混入 S 级），
     #: 通常与 brand 联用。具体型号（「730」）不走这里，走 model_keyword 模糊。
     family: str | None = None
+    #: 车身类型（7 码：SEDAN/HATCHBACK/WAGON/SUV/MPV/CONVERTIBLE/COUPE）。
+    #: **硬过滤，不参与打分** —— 用户说了类型就是明确诉求。
+    #: 码只来自解析层（parser 负责中文词归一）；本层只做大写化 + 白名单收敛，
+    #: **不做中文翻译**（'跑车' 不是码 → 置 None，而不是替你翻成 COUPE）：
+    #: 翻译放在解析层，否则 `/search/spec` 就绕过了解析层那道口子。
+    #: 留白（body_type 为 NULL）的车按硬条件排除，另有 `unclassified_count`
+    #: 提示「还有 N 台未分类没能计入」。
+    body_type: str | None = None
     #: 同款变体键列表（2026-09-27 变体合并）：base_model 命中时由解析层展开，
     #: 如 LM350 → [LM350, LM350H]（燃油/混动同款，漏并会少 18 台）。构建规则
     #: 见 context.build_variant_map（同品牌+尾缀白名单+数量门槛+跨品牌防线）。
@@ -212,12 +222,21 @@ class SearchSpec:
             if isinstance(self.displacement, (int, float)) and not isinstance(self.displacement, bool):
                 self.displacement = str(self.displacement)
 
-        # 字符串字段：非字符串的（数字/列表/dict）一律置 None，别让它们进 ILIKE 参数
+        # 字符串字段：非字符串的（数字/列表/dict）一律置 None，别让它们进 ILIKE 参数。
+        # ⚠️ body_type 也必须在这个循环里：程序化调用方传 `{"body_type": 5}` 时，
+        # int 会绑进 `f.body_type = %s`（varchar 列），PostgreSQL 抛
+        # `operator does not exist: character varying = integer` → **500**。
         for fname in ("base_model", "brand", "model_keyword", "displacement",
-                      "transmission", "fuel_type", "import_type"):
+                      "transmission", "fuel_type", "import_type", "body_type"):
             val = getattr(self, fname)
             if val is not None and not isinstance(val, str):
                 setattr(self, fname, None)
+
+        # body_type 白名单：大写化后只认 7 码，脏值（'跑车'/'VAN'/乱写）置 None。
+        # `VALID_BODY_TYPES` 是单点 —— 加了新码只改 body_types.py 一处。
+        if self.body_type is not None:
+            code = self.body_type.strip().upper()
+            self.body_type = code if code in VALID_BODY_TYPES else None
 
         # model_keyword 的底线长度（2026-09-27，程序直传入口的防线）：
         # /search/spec 与 MCP search_by_spec 不经过 parser 的截断防呆（那里有

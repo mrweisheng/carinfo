@@ -43,6 +43,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from carinfo.core.revalidator import VERIFY_WINDOW_DAYS
+from carinfo.search.body_types import classify
 from carinfo.search.normalize import Vocabulary, clean_text, normalize_brand, normalize_model
 
 # ---------------------------------------------------------------------------
@@ -119,6 +120,8 @@ CREATE TABLE IF NOT EXISTS vehicle_features (
   last_verified   date,
   verify_age_days integer,
   is_unverified   boolean NOT NULL DEFAULT FALSE,
+  body_type       varchar(12),
+  body_source     varchar(8),
   updated_at      timestamptz DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vf_base_model ON vehicle_features (base_model);
@@ -126,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_vf_base_bucket ON vehicle_features (base_model, y
 CREATE INDEX IF NOT EXISTS idx_vf_ratio ON vehicle_features (price_ratio);
 CREATE INDEX IF NOT EXISTS idx_vf_is_dealer ON vehicle_features (is_dealer);
 CREATE INDEX IF NOT EXISTS idx_vf_is_unverified ON vehicle_features (is_unverified);
+CREATE INDEX IF NOT EXISTS idx_vf_body_type ON vehicle_features (body_type);
 """
 
 
@@ -158,6 +162,9 @@ class RawRow:
     import_type: str | None
     phone_number: str | None
     contact_email: str | None
+    #: 完整车型串（**未归一**）。车身类型判定要用它——变体词（COUPE/TOURING/
+    #: AVANT/CROSS…）只写在 car_model 里，归一后就丢了（2026-09-30 车身类型方案）。
+    car_model: str | None = None
     #: 复核事实（2026-09-27「久未核实」治理）：
     #: last_verified = 最后一次被证实**仍在售**的日期（写库口径见 core/revalidator）；
     #: verify_age_days = 距今多少天，None = 从未核实过（老数据）。
@@ -268,6 +275,7 @@ def load_rows(conn, vocab: Vocabulary) -> list[RawRow]:
                 import_type=(clean_text(ef.get("import_type")) or None),
                 phone_number=(phone or "").strip() or None,
                 contact_email=(email or "").strip() or None,
+                car_model=(car_model or None),
                 last_verified=lv_date,
                 verify_age_days=int(verify_age) if verify_age is not None else None,
             )
@@ -478,6 +486,8 @@ def build_features(
     lvl_counter: dict[str, int] = defaultdict(int)
     n_dealer = 0
     n_unverified = 0
+    body_counter: dict[str, int] = defaultdict(int)
+    body_src_counter: dict[str, int] = defaultdict(int)
     for r in rows:
         ref = pick_reference(stats, r.base_model, r.year)
         ratio = level = None
@@ -500,6 +510,10 @@ def build_features(
                          or r.verify_age_days > VERIFY_WINDOW_DAYS)
         if is_unverified:
             n_unverified += 1
+        # 车身类型（7 码 + 留白）：确定性规则，见 search/body_types.py
+        body, body_src = classify(r.car_model, r.base_model, r.brand_norm)
+        body_counter[body or "未分类"] += 1
+        body_src_counter[body_src or "none"] += 1
         lvl_counter[level or "none"] += 1
         out.append(
             (
@@ -524,8 +538,15 @@ def build_features(
                 r.last_verified,
                 r.verify_age_days,
                 is_unverified,
+                body,
+                body_src,
             )
         )
+    n_classified = len(rows) - body_counter.get("未分类", 0)
+    print(f"    车身类型: 已判 {n_classified}/{len(rows)} "
+          f"({100.0 * n_classified / max(len(rows), 1):.1f}%)，来源 {dict(body_src_counter)}")
+    print(f"    车身类型分布: "
+          + "、".join(f"{k} {v}" for k, v in sorted(body_counter.items(), key=lambda x: -x[1])))
     print(f"    行情降级分布: {dict(lvl_counter)}")
     print(f"    久未核实标识: {n_unverified} 台 "
           f"({100.0 * n_unverified / max(len(rows), 1):.1f}%)"
@@ -584,6 +605,12 @@ def _shadow_ddl() -> str:
         "idx_vf_ratio": "idx_vf_ratio_new",
         "idx_vf_is_dealer": "idx_vf_is_dealer_new",
         "idx_vf_is_unverified": "idx_vf_is_unverified_new",
+        # ⚠️ **CREATE_SQL 里新增的索引必须同步加到这里**，一行都不能省：
+        # 不进来的话影子表上会建出一个**不带 _new 后缀**的同名索引 →
+        # 第 2 轮重算 `CREATE INDEX IF NOT EXISTS` 撞上正式表的同名索引而跳过 →
+        # 影子表没有这个索引 → swap 时 DROP 正式表把索引一起删掉 → **索引静默消失**，
+        # 查询不报错、只是全表扫。实测踩过（`vehicle_features` 的业务索引全没）。
+        "idx_vf_body_type": "idx_vf_body_type_new",
     }
     mapping = {**index_map, **table_map}   # 索引名较长，优先命中（regex alternation 顺序）
 
@@ -625,7 +652,7 @@ def write_all(conn, stats: dict, feats: list[tuple]) -> None:
             market_median, market_p25, market_p75, market_bucket, market_ref_n,
             market_level, condition_score, has_condition, age_days, heat_score,
             is_anomaly, dealer_listings, is_dealer, last_verified, verify_age_days,
-            is_unverified, updated_at)
+            is_unverified, body_type, body_source, updated_at)
            VALUES %s""",
         [f + (_now(conn),) for f in feats],
         page_size=2000,

@@ -95,3 +95,35 @@ def test_base_models_only_backfills_base_model():
 def test_year_near_upper_bound_matches_parser():
     assert SearchSpec(raw_query="q", year_near=2040).year_near == 2040
     assert SearchSpec(raw_query="q", year_near=2050).year_near is None
+
+
+# ---------------------------------------------------------------------------
+# body_type：白名单 + 脏值收敛（本地图 /search/spec 直传的唯一防线）
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("code", ["SEDAN", "HATCHBACK", "WAGON", "SUV",
+                                  "MPV", "CONVERTIBLE", "COUPE"])
+def test_body_type_valid_codes_kept(code):
+    assert SearchSpec(raw_query="q", body_type=code).body_type == code
+
+
+def test_body_type_uppercased():
+    assert SearchSpec(raw_query="q", body_type="mpv").body_type == "MPV"
+    assert SearchSpec(raw_query="q", body_type="  suv  ").body_type == "SUV"
+
+
+@pytest.mark.parametrize("bad", ["跑车", "房車", "VAN", "客貨車", "unknown", ""])
+def test_body_type_dirty_string_becomes_none(bad):
+    """中文/未收录码一律置 None，**不替用户翻译** —— 翻译在解析层，
+    否则 /search/spec 会绕过那道口子（不存在的码当没提，而不是猜一个）。"""
+    assert SearchSpec(raw_query="q", body_type=bad).body_type is None
+
+
+def test_body_type_int_dirty_value_not_500():
+    """{"body_type": 5} 不能 int 绑进 varchar 列比较（否则 PostgreSQL 抛 500）。"""
+    assert SearchSpec.from_dict({"body_type": 5}).body_type is None
+
+
+def test_body_type_from_dict_roundtrip():
+    s = SearchSpec.from_dict({"raw_query": "q", "body_type": "SUV"})
+    assert s.body_type == "SUV"
+    assert s.to_dict()["body_type"] == "SUV"
