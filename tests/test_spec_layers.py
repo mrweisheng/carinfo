@@ -127,3 +127,26 @@ def test_body_type_from_dict_roundtrip():
     s = SearchSpec.from_dict({"raw_query": "q", "body_type": "SUV"})
     assert s.body_type == "SUV"
     assert s.to_dict()["body_type"] == "SUV"
+
+
+# ---------------------------------------------------------------------------
+# brands（同向多品牌，多目标方案 §4.2）
+# ---------------------------------------------------------------------------
+def test_brands_normalize_and_backfill():
+    """大写化、去重、脏项丢弃；代表品牌回填 brand（has_model_target 依赖它）。"""
+    s = SearchSpec.from_dict({"brands": ["bmw", "BMW ", "mercedes-benz", 5, ""]})
+    assert s.brands == ["BMW", "MERCEDES-BENZ"]
+    assert s.brand == "BMW"
+    assert s.has_model_target is True
+
+
+def test_brands_non_list_dropped():
+    s = SearchSpec.from_dict({"brands": "BMW"})     # 字符串不是列表 → 整段丢弃
+    assert s.brands == []
+    s2 = SearchSpec.from_dict({"brands": ["BMW", "BENZ?"]})   # 非法字符项剔除
+    assert s2.brands == ["BMW"]
+
+
+def test_brands_empty_keeps_explicit_brand():
+    s = SearchSpec.from_dict({"brand": "BMW"})
+    assert s.brands == [] and s.brand == "BMW"

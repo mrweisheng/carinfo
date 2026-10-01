@@ -28,7 +28,7 @@ from typing import Any
 from carinfo.search.context import SearchContext
 from carinfo.search.llm import LLMClient, LLMError
 from carinfo.search.normalize import BRAND_ALIASES, MODEL_ALIASES, resolve_alias
-from carinfo.search.spec import DEFAULT_LIMIT, SearchSpec
+from carinfo.search.spec import DEFAULT_LIMIT, MAX_LIMIT, SearchSpec
 
 #: LLM 允许输出的字段白名单（跟 SearchSpec 对齐）。
 #: **刻意不给它 sort / limit 之外的呈现字段**：返回多少条、怎么排是产品口径，
@@ -39,7 +39,8 @@ from carinfo.search.spec import DEFAULT_LIMIT, SearchSpec
 #: 之所以必须有它们：把"五十万左右"写成 price_max=500000 会把 39 万、62 万的好车
 #: 直接从结果里删掉，而用户的本意只是"离 50 万近的排前面"。
 ALLOWED_LLM_FIELDS = {
-    "base_model", "brand", "model_keyword", "family", "displacement",
+    "base_model", "base_models", "brands", "brand", "model_keyword", "family",
+    "displacement",
     "year_min", "year_max", "year_near",
     "price_min", "price_max", "price_near",
     "seats", "body_type", "vehicle_type", "transmission", "fuel_type",
@@ -63,6 +64,14 @@ SYSTEM_PROMPT = """你是香港二手车平台的查询解析器。把用户的�
 【字段清单】未提到的条件一律不输出该键；不要给 null，也不要猜。
 label           这组的人话短标签（≤12字，如"14年威尔法"），给结果分组展示用
 base_model      车型，英文大写正式名（库里有的精确车系，如 ALPHARD / VELLFIRE）
+base_models     车系**数组**。用户说「阿尔法或者威尔法都可以」这类**同向多车系**
+                （其余条件相同）时，只输出**一组**：base_models:["ALPHARD","VELLFIRE"]。
+                单车型仍用 base_model，不要给数组
+brands          品牌**数组**。用户说「奔驰或者宝马都可以」这类**同向多品牌**
+                （其余条件相同）时，只输出**一组**：brands:["MERCEDES-BENZ","BMW"]。
+                单品牌仍用 brand。⚠️ 判断标准：几句话里只有品牌/车型不同、年份价格
+                等其它条件全相同 → 合并成一组；条件有实质差异（年份/价格不同）
+                才拆成多组
 family          **车系家族前缀**：口语车系名（"宝马7系"→"7"、"奔驰S级"→"S"、
                 "Model 3"→"MODEL 3"、"A6"→"A6"）。用户说的不是某个精确车型而是一
                 个系列时用这个，通常配 brand。用户说了具体型号（"730"）则不用 family，
@@ -141,6 +150,10 @@ limit           整数，返回条数
 "找台七人车"             → {"queries":[{"body_type": "MPV"}]}
 "15万左右的SUV"          → {"queries":[{"price_near": 150000, "body_type": "SUV"}]}
 "七座的SUV"             → {"queries":[{"body_type": "SUV", "seats": 7}]}
+"15万左右的SUV，奔驰或者宝马都可以"
+                         → {"queries":[{"brands":["MERCEDES-BENZ","BMW"],"body_type":"SUV","price_near":150000}]}
+"18万左右的阿尔法、威尔法都可以"
+                         → {"queries":[{"base_models":["ALPHARD","VELLFIRE"],"price_near":180000}]}
 "最便宜的平治"            → {"queries":[{"brand": "MERCEDES-BENZ", "sort": "price_asc"}]}
 "捡漏阿尔法"              → {"queries":[{"base_model": "ALPHARD", "max_price_ratio": 0.8}]}
 
@@ -313,6 +326,29 @@ def _scan_body_type(text: str) -> str | None:
     return best[1] if best else None
 
 
+def _family_prefix(text: str | None, ctx: SearchContext) -> str | None:
+    """「奔驰 GLC 200」→ 'GLC'：原文 ASCII 词的字母前缀是 **≥2 个库内键**的公共
+    前缀、且它本身不是键 —— 这类「家族+子型号」写法按家族处理。
+
+    为什么必须有它：库里只有 GLC250/300/43/63S 分键，没有 GLC200。不认家族的话，
+    「GLC 200」会两种错目标（2026-10-01 实测）：①整词模糊 0 命中后关键词被零命中
+    协议整个丢弃，退化为全品牌混排；②尾部子型号撞上 '200' 垃圾键（丰田 200），
+    再被品牌过滤成 0。认出家族 → 兄弟车 GLC250/300 全部命中，正是用户要的。
+    """
+    if not text:
+        return None
+    for grp in re.findall(r"[A-Z][A-Z0-9]+", str(text).upper()):
+        m = re.match(r"[A-Z]{2,}", grp)
+        if not m:
+            continue
+        head = m.group()
+        if head in ctx.models:
+            continue                       # 本身就是键，不构成「家族」
+        if sum(1 for k in ctx.models if k.startswith(head)) >= 2:
+            return head
+    return None
+
+
 @dataclass
 class ParseResult:
     spec: SearchSpec
@@ -330,6 +366,53 @@ class ParseResult:
             self.specs = [self.spec]
         if len(self.labels) < len(self.specs):
             self.labels += [""] * (len(self.specs) - len(self.labels))
+
+
+#: 同向合组时**不参与比较**的字段：品牌/车系本来就是各组间的差异项；limit 参与
+#: 比较会让「模型给了不同 limit」的同向查询拒绝合并（limit 由合并时求和接管）；
+#: raw_query 各组相同无意义。其余字段（年份/价格/车身/座位…）任一不同 = 异向，
+#: 保持多组。
+_MERGE_COMPARE_EXCLUDE = frozenset(
+    {"brand", "base_model", "base_models", "limit", "raw_query"}
+)
+
+
+def _merge_same_direction(specs: list[SearchSpec],
+                          notes: list[str]) -> list[SearchSpec]:
+    """同向多组合并（多目标方案 §4.2）：各组除品牌/车系外**条件全同**时合成
+    一组单池检索 —— 排名跨品牌可比，全局 limit 天然生效。
+
+    「15万左右的SUV，奔驰或者宝马都可以」→ 2 组 → 1 组 brands=[奔驰,宝马]；
+    「14年威尔法，再找台18年埃尔法」→ 年份不同 = 异向，原样多组。
+
+    limit 取各组之和（默认 5+5=10）：用户要的总条数不该因为合并而缩水。
+    """
+    if len(specs) < 2:
+        return specs
+    first = {k: v for k, v in specs[0].to_dict().items()
+             if k not in _MERGE_COMPARE_EXCLUDE}
+    for s in specs[1:]:
+        d = {k: v for k, v in s.to_dict().items() if k not in _MERGE_COMPARE_EXCLUDE}
+        if d != first:
+            return specs
+    brands = sorted({s.brand for s in specs if s.brand})
+    base_models = sorted({b for s in specs for b in (s.base_models or [])})
+    limit = min(sum(s.limit for s in specs), MAX_LIMIT)
+    merged = SearchSpec.from_dict({
+        **first,
+        "brands": brands,
+        "base_models": base_models,
+        "limit": limit,
+        # 品牌/车系代表键由 from_dict → __post_init__ 回填（brands[0]/base_models[0]）
+        "brand": None,
+        "base_model": None,
+    })
+    notes.append(
+        "同向多目标已合并为一次检索（"
+        + ("品牌 " + "+".join(brands) if brands else "车系 " + "+".join(base_models))
+        + f"，共 {limit} 条额度）"
+    )
+    return [merged]
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +519,26 @@ def resolve_model_target(
 # ---------------------------------------------------------------------------
 
 
+def _brand_series_evidence(query: str, ctx: SearchContext) -> tuple[list[str], list[str]]:
+    """从原文挖品牌/车系证据（确定性兜底：LLM 漏报时的最后一道网）。
+
+    实测（2026-10-01）：「15万左右的SUV，奔驰或者宝马都可以」模型会漏掉两个
+    品牌只回 body_type+price（→ 返回丰田/奥迪，答非所问）；「阿尔法、威尔法
+    都可以」模型漏掉威尔法只回阿尔法。原文里的品牌/车系词是**确定性证据**，
+    优先于模型的遗漏。只扫静态别名表（模型主力叫法都在），命中即收、按 base
+    去重。
+    """
+    brands: list[str] = []
+    for alias, en in BRAND_ALIASES.items():
+        if alias in query and en in ctx.brands and en not in brands:
+            brands.append(en)
+    series: list[str] = []
+    for alias, base in MODEL_ALIASES.items():
+        if alias in query and base in ctx.models and base not in series:
+            series.append(base)
+    return sorted(brands), series
+
+
 def parse_query(
     query: str,
     ctx: SearchContext,
@@ -499,6 +602,36 @@ def parse_query(
     if not specs:                     # 每组都空 → 与历史行为一致：降级规则
         return ParseResult(spec=rule_based_parse(query, ctx), source="fallback",
                            notes=notes, raw_llm=raw_llm)
+
+    # 同向多组合并（多目标方案 §4.2）：条件除品牌/车系外全同 → 单池检索。
+    specs = _merge_same_direction(specs, notes)
+
+    # 原文证据兜底（§4.4 的「prompt 是软约束」）：单组时把原文里出现过的
+    # 品牌/车系词收回来 —— 模型漏报不该变成答非所问。
+    # · ≥2 个车系证据 → 无条件升级为 base_models 单池（证据强于单点别名覆盖：
+    #   「阿尔法、威尔法都可以」模型漏掉威尔法、别名覆盖又把 ALPHARD 定死，
+    #   两层错叠加的结果是只搜了一半）；
+    # · 完全没有车型/品牌目标时，补回品牌条件（「奔驰SUV或者宝马」模型漏掉
+    #   两个品牌 → 补 brands）。
+    if len(specs) == 1:
+        _s = specs[0]
+        _brands_ev, _series_ev = _brand_series_evidence(query, ctx)
+        _no_target = not any((_s.brand, _s.brands, _s.base_model, _s.base_models,
+                              _s.family, _s.model_keyword))
+        if len(_series_ev) >= 2:
+            specs = [SearchSpec.from_dict({
+                **_s.to_dict(),
+                "base_models": _series_ev, "base_model": None, "brand": None,
+            })]
+            notes.append(f"原文出现多个车系（{'、'.join(_series_ev)}），"
+                         f"已合并为同向多车系单池检索")
+        elif _no_target and _brands_ev:
+            _patch = {"brands": _brands_ev, "brand": None} if len(_brands_ev) >= 2 \
+                else {"brand": _brands_ev[0]}
+            specs = [SearchSpec.from_dict({**_s.to_dict(), **_patch})]
+            notes.append(f"按原文补回品牌条件（{'、'.join(_brands_ev)}）")
+
+    labels = labels[:len(specs)]
     return ParseResult(spec=specs[0], specs=specs, labels=labels,
                        source="llm", notes=notes, raw_llm=raw_llm)
 
@@ -518,12 +651,14 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
     # miss 时再拿 keyword 去归一 —— 只取第一个会把正确的那个丢掉
     # （2026-09-27 审核实测：脏 base_model='LM' + 对 keyword='LM350' 的组合）。
     bm_raw, kw_raw = data.get("base_model"), data.get("model_keyword")
+    _kw_resolved = False       # 车系是否由 keyword 二次解析得出（LM350 正路）
     base_model, brand, keyword, displacement = resolve_model_target(
         bm_raw or kw_raw, data.get("brand"), ctx)
     if bm_raw and kw_raw and base_model is None:
         base_model, brand2, keyword, displacement = resolve_model_target(
             kw_raw, data.get("brand") or brand, ctx)
         if base_model:
+            _kw_resolved = True
             brand = brand or brand2
             kw_raw = None
             notes.append(f"模型给的车型 {bm_raw!r} 在库里找不到，已用关键词 "
@@ -601,6 +736,36 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
                     notes.append(f"已按规则从原文重新识别出车型 {rescue.base_model!r}")
             except Exception:   # noqa: BLE001 —— 补救失败不影响主流程（最多查宽）
                 pass
+
+    # ── 家族前缀兜底（多目标方案 §4.5）：「奔驰 GLC 200」─────────────────
+    # 库内只有 GLC250/300/43/63S 分键、没有 GLC200。「家族+子型号」写法有两种
+    # 错目标（2026-10-01 实测）：①keyword 整词模糊 0 命中后被零命中协议整个
+    # 丢弃 → 全品牌混排；②尾部子型号撞上 '200' 垃圾键（丰田 200）→ 被品牌
+    # 过滤成 0。原文含「≥2 个库内键的公共字母前缀」时按 family 处理，兄弟车
+    # 全部可见 —— 这正是用户要的「GLC200 没有 → 看 GLC 系」。
+    # 触发面刻意收窄（两道保险）：
+    #   · 只在 keyword 二次解析落到**纯数字键**（'200'）或压根没落上车系时；
+    #     LM350 这类 keyword 正路（_kw_resolved 且非纯数字）绝不插手；
+    #   · query_alias 已命中（中文别名是确定性证据）时不插手。
+    # 位置在**短词防呆+rescue 之后**：'LM 350' 截成 '350' 的残缺关键词由防呆
+    # 丢弃、rescue 从原文救回 'LM350' —— 家族检查晚于它，_fam_src 因
+    # base_model 已非空而为空，天然不触发（回归实测钉死）。
+    if (not _kw_resolved or (base_model or "").isdigit()) and not query_alias:
+        _fam_src = None
+        if bm_raw and str(bm_raw).strip().upper() not in ctx.models:
+            _fam_src = bm_raw
+        elif base_model is None and kw_raw:
+            _fam_src = kw_raw
+        _fam = _family_prefix(_fam_src, ctx) if _fam_src else None
+        if _fam and _fam != base_model:
+            _sibs = "/".join(sorted(k for k in ctx.models if k.startswith(_fam))[:4])
+            notes.append(
+                f"库里没有「{str(_fam_src).strip()}」这个精确车系，已按家族 "
+                f"{_fam!r} 匹配兄弟车系（{_sibs} 等）"
+            )
+            base_model = None
+            keyword = None
+            data = dict(data, family=_fam)   # family 在 payload 组装处透传
 
     # 模糊量守卫：原文说"左右"时，不许让区间溜进来，也不许让偏好丢掉。
     # 以**原文**为准而不是模型 —— 模型把"五十万左右"写成 price_max=500000 的话，
@@ -897,6 +1062,20 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         if stripped in ctx.models:
             payload["base_model"] = stripped
 
+    # --- 家族前缀兜底（多目标方案 §4.5）：「奔驰 GLC 200」-----------------
+    # 英文键扫描会把 '200' 这种尾部子型号垃圾键（丰田 200）当车系。原文的
+    # ASCII 词含「≥2 个库内键的公共字母前缀」（GLC → GLC250/GLC300/…）且该
+    # 前缀不是键本身时，按 family 处理 —— 命中全部兄弟车系。仅当已命中的
+    # 车系是**纯数字**（'911' 这类真键不受影响——原文不含字母家族信号）或
+    # 没命中车系时启用。
+    _fam = _family_prefix(query, ctx)
+    if _fam and payload.get("base_model") and str(payload["base_model"]).isdigit():
+        payload.pop("base_model")
+        payload.pop("base_models", None)
+    if _fam and not payload.get("base_model"):
+        payload["family"] = _fam
+        payload.pop("model_keyword", None)
+
     # --- 别名表（种子 + LLM 生成）整句匹配 ---
     # 含同音错字/繁简兜底：「布威」→（拼音 buwei）→ 步威 → STEPWGN。静态 MODEL_ALIASES
     # 已在上面扫过；这里补上生成别名与拼音匹配。放在品牌之前，避免同一句里品牌抢先。
@@ -905,12 +1084,16 @@ def rule_based_parse(query: str, ctx: SearchContext) -> SearchSpec:
         if bm:
             payload["base_model"] = bm
 
-    # --- 品牌：扫品牌别名 ---
+    # --- 品牌：扫品牌别名（收集**全部**命中：「奔驰或者宝马都可以」是同向多品牌）---
     if not payload.get("base_model") and not payload.get("brand"):
+        _brand_hits: list[str] = []
         for alias, en in sorted(BRAND_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
-            if alias in query and en in ctx.brands:
-                payload["brand"] = en
-                break
+            if alias in query and en in ctx.brands and en not in _brand_hits:
+                _brand_hits.append(en)
+        if len(_brand_hits) >= 2:
+            payload["brands"] = _brand_hits       # 同向多品牌单池（方案 §4.2）
+        elif _brand_hits:
+            payload["brand"] = _brand_hits[0]
 
     # --- 排量（降级路径；LLM 路径由 resolve_model_target 的 _DISP_RE 产出）---
     # 没有这一步时，「3.5L排量」在无 key / LLM 失败时会静默丢掉排量条件。

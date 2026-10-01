@@ -186,6 +186,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
 | `price_near` / `year_near` | number | 「50万左右」软锚点:参与贴合度排序,**不删候选** |
 | `seats` | int | 座位数(库里写法脏,服务端已兼容) |
 | `body_type` | string | **车身类型硬过滤**,只认 7 个英文码(见 §1.6 对照表):`SEDAN`/`HATCHBACK`/`WAGON`/`SUV`/`MPV`/`CONVERTIBLE`/`COUPE`。**不做中文翻译** —— 传 `"房车"` 会被收敛为不限,而不是替你翻成 `SEDAN`(翻译在解析层)。库内尚未分类的车(留白)会被排除,此时响应额外带 `body_type_unclassified_count` 提示「另有 N 台未分类未计入」 |
+| `brands` / `base_models` | string[] | **同向多品牌 / 同向多车系**:`["MERCEDES-BENZ","BMW"]` 单池 OR 检索,统一按综合分排序。自然语言里的「A 或者 B 都可以」由解析层自动合并成这个形态。多车系/多品牌池下**同车系最多返回 2 台**(多样性上限;单车系查询不裁)。零命中时逐品牌/逐车系探针诊断(「宝马还有 N 台」) |
 | `vehicle_type` | int | 1私家车 2客货车 3货车 4电单车 5经典车;**默认 1**,传 `null` 放开 |
 | `transmission` / `fuel_type` | string | 如 `自動`/`手動`;`汽油`/`柴油`/`混能`/`電動`(包含匹配) |
 | `import_type` | string | `行貨` / `水貨` |

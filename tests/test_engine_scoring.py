@@ -161,3 +161,77 @@ def test_only_displacement_ranks_by_displacement():
     assert score_match(s, "SOME CAR", None, None, "3500cc") == 1.0
     assert score_match(s, "SOME CAR", None, None, "2500cc") == DISPLACEMENT_MISMATCH_CAP
     assert score_match(s, "SOME CAR", None, None, None) == DISPLACEMENT_UNKNOWN_SCORE
+
+
+# ---------------------------------------------------------------------------
+# 多样性选材（多目标方案 §4.3：同车系最多 2 台）
+# ---------------------------------------------------------------------------
+from carinfo.search.engine import (  # noqa: E402
+    ScoredVehicle, _cap_bucket, _multi_series, _select_diverse,
+)
+
+
+def _dv(bm: str, score: float, brand: str | None = None) -> ScoredVehicle:
+    return ScoredVehicle(vehicle_id=f"{bm}-{score}", car_model=bm, car_brand=brand,
+                         year=None, price=None, car_url=None, seats=None,
+                         engine_volume=None, base_model=bm, score=score, brand_norm=brand)
+
+
+def test_cap_bucket_strips_variant_suffix():
+    assert _cap_bucket("VELLFIREH") == "VELLFIRE"
+    assert _cap_bucket("320IA") == "320I"
+    assert _cap_bucket("ALPHARD") == "ALPHARD"
+    assert _cap_bucket("AQUA") == "AQU"      # 桶键只求一致性，不求真名
+    assert _cap_bucket(None) == ""
+
+
+def test_multi_series_triggers():
+    assert _multi_series(SearchSpec.from_dict({"brands": ["BMW", "AUDI"]}))
+    assert _multi_series(SearchSpec.from_dict({"base_models": ["ALPHARD", "VELLFIRE"]}))
+    assert not _multi_series(SearchSpec.from_dict({"base_models": ["VELLFIRE", "VELLFIREH"]}))
+    assert not _multi_series(SearchSpec.from_dict({"base_models": ["ALPHARD"]}))
+
+
+def test_select_diverse_caps_and_backfills():
+    """同桶 2 台封顶；被裁的高分车在名额富余时回填。"""
+    items = [_dv("GLC300", 0.9), _dv("GLC300", 0.85), _dv("GLC300", 0.8),
+             _dv("X3", 0.7), _dv("X3", 0.6), _dv("X5", 0.5)]
+    spec = SearchSpec.from_dict({"brands": ["MERCEDES-BENZ", "BMW"], "limit": 5})
+    out = _select_diverse(items, spec)
+    assert [i.base_model for i in out] == ["GLC300", "GLC300", "X3", "X3", "X5"]
+
+
+def test_select_diverse_single_series_never_capped():
+    """单车系查询绝不裁 —— 池子里本来就只有它。"""
+    items = [_dv("ALPHARD", 0.9), _dv("ALPHARD", 0.8), _dv("ALPHARD", 0.7)]
+    spec = SearchSpec.from_dict({"base_models": ["ALPHARD"], "limit": 5})
+    assert len(_select_diverse(items, spec)) == 3
+
+
+def test_select_diverse_variant_family_one_bucket():
+    """威尔法+混动是同桶 → 池子单家族，不裁。"""
+    items = [_dv("VELLFIRE", 0.9), _dv("VELLFIREH", 0.8),
+             _dv("VELLFIRE", 0.7), _dv("VELLFIREH", 0.6)]
+    spec = SearchSpec.from_dict({"base_models": ["VELLFIRE", "VELLFIREH"], "limit": 5})
+    assert len(_select_diverse(items, spec)) == 4
+
+
+def test_select_diverse_brand_quota():
+    """说「奔驰宝马都可以」但宝马分数碾压时，品牌配额保证两家都上榜。"""
+    from collections import Counter
+    items = [_dv("X3", 0.9 - i * 0.01, "BMW") for i in range(6)]      # 宝马 6 台高分
+    items += [_dv("GLC300", 0.5 - i * 0.01, "MERCEDES-BENZ") for i in range(3)]
+    spec = SearchSpec.from_dict({"brands": ["MERCEDES-BENZ", "BMW"], "limit": 8})
+    out = _select_diverse(items, spec)
+    brands = Counter(i.brand_norm for i in out)
+    assert brands["MERCEDES-BENZ"] >= 2 and brands["BMW"] >= 1, brands
+    # X3 车系多样性仍生效：纯宝马段最多 2 台连排后被配额打断
+    assert Counter(i.base_model for i in out)["GLC300"] >= 2
+
+
+def test_select_diverse_narrow_pool_never_shortens():
+    """池子车系耗尽时按分数回填 —— 配额是偏好，条数是契约。"""
+    items = [_dv("X3", 0.9 - i * 0.01, "BMW") for i in range(6)]
+    items += [_dv("GLC300", 0.5 - i * 0.01, "MERCEDES-BENZ") for i in range(3)]
+    spec = SearchSpec.from_dict({"brands": ["MERCEDES-BENZ", "BMW"], "limit": 8})
+    assert len(_select_diverse(items, spec)) == 8

@@ -168,3 +168,48 @@ def test_seven_seater_chain_drops_seats(real_ctx, db_fetch):
     s = rule_based_parse("找台七人车", real_ctx)
     assert s.body_type == "MPV"
     assert s.seats is None
+
+
+# ---------------------------------------------------------------------------
+# 多目标同向对比（2026-10-01 方案 §4.2/§4.3/§4.5）
+# ---------------------------------------------------------------------------
+def test_glc200_family_fallback(real_ctx, db_fetch):
+    """「奔驰 GLC 200」：库内只有 GLC250/300/43/63S 分键，必须按家族 GLC 兜底。
+
+    旧路径两种错目标（2026-10-01 实测）：落 '200' 垃圾键（丰田 200）→ 0 台；
+    keyword 整词模糊 0 命中 → 被零命中协议丢弃 → 全品牌混排。修复后兄弟车
+    GLC 系全部可见，且每台都以 GLC 开头。
+    """
+    s = rule_based_parse("帮我找奔驰 GLC 200", real_ctx)
+    assert s.family == "GLC" and s.base_model is None
+    r, _fb = _run(db_fetch, s)
+    assert r.total_matched > 0
+    for it in r.items:
+        assert (it.car_model or "").upper().startswith("GLC"), it.car_model
+
+
+def test_multi_brand_pool_diversity_cap(real_ctx, db_fetch):
+    """多品牌池同车系最多 2 台（拍板项②），且两个品牌都能出现。"""
+    from collections import Counter
+    s = SearchSpec.from_dict({
+        "brands": ["MERCEDES-BENZ", "BMW"], "body_type": "SUV", "limit": 12,
+    })
+    r, _fb = _run(db_fetch, s)
+    assert r.total_matched > 0
+    c = Counter(it.base_model for it in r.items)
+    assert all(n <= 2 for n in c.values()), c          # 多样性上限生效
+    assert len({it.brand_norm for it in r.items}) >= 2  # 两品牌都有车上榜
+
+
+def test_multi_brand_parse_and_search_chain(real_ctx, db_fetch):
+    """「15万左右的SUV，奔驰宝马都可以」全链路（规则路径不合并——合并只在
+    LLM 路径做，这里验证 spec 直传形态的检索正确性）。"""
+    s = SearchSpec.from_dict({
+        "brands": ["MERCEDES-BENZ", "BMW"], "body_type": "SUV",
+        "price_near": 150000, "limit": 5,
+    })
+    r, _fb = _run(db_fetch, s)
+    assert r.total_matched > 0
+    for it in r.items:
+        assert it.brand_norm in ("MERCEDES-BENZ", "BMW")
+        assert it.body_type == "SUV"

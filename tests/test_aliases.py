@@ -122,7 +122,12 @@ def test_query_alias_overrides_llm_guess(monkeypatch):
 
 
 def test_query_alias_not_applied_to_multigroup(monkeypatch):
-    """多车混输时不做整句别名覆盖（会把同一个别名错配到别的组）。"""
+    """多车混输时不做整句别名覆盖；同向两组按方案 §4.2 合并为单池 base_models。
+
+    原断言（保持 2 组）是 2026-09-27 的行为——2026-10-01 多目标方案落地后，
+    「A 或者 B 都可以」这种**条件全同**的多组合并为单池（base_models=ANY），
+    排名跨车系可比。本测试保留原意：别名不得错配污染（STEPWGN 不得出现）。
+    """
     from carinfo.search.parser import parse_query
 
     alias_map, pinyin_map = _build_alias_maps([])
@@ -130,4 +135,6 @@ def test_query_alias_not_applied_to_multigroup(monkeypatch):
                         {}, alias_map, pinyin_map)
     llm = _FakeLLM({"queries": [{"base_model": "ALPHARD"}, {"base_model": "VELLFIRE"}]})
     pr = parse_query("阿尔法或者威尔法", ctx, llm=llm)
-    assert [s.base_model for s in pr.specs] == ["ALPHARD", "VELLFIRE"]
+    assert len(pr.specs) == 1
+    assert pr.specs[0].base_models == ["ALPHARD", "VELLFIRE"]
+    assert "STEPWGN" not in pr.specs[0].base_models

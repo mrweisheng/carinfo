@@ -363,6 +363,9 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
         "SEDAN(房車/轿车) HATCHBACK(掀背/揭背/两厢) WAGON(旅行車/旅行版) "
         "SUV(越野车/吉普) MPV(七人車/商务车/保姆车) CONVERTIBLE(開篷/敞篷) COUPE(跑車/轿跑)。"
         "⚠️「七人車」是车型类别 → body_type=\"MPV\"；「七座」是座位数 → seats=7，两者不同。"
+        "brands 是**同向多品牌**数组（如 [\"MERCEDES-BENZ\",\"BMW\"]）：条件相同、只要品牌不止一个时用，"
+        "单池检索统一排序；base_models 是同向多车系数组（[\"ALPHARD\",\"VELLFIRE\"]）。"
+        "同车系在结果里最多 2 台（多样性上限，多车系/多品牌池才生效）。"
         "传入了 body_type 时，返回额外带 body_type_unclassified_count（同条件下尚未分类的"
         "车数）——留白车进不来，这个数是「另有 N 台未分类」的提示。"
         "签名里没列出的条件（变速箱、燃料、行水货、排量、关键词）则是真的不设限。"
@@ -371,6 +374,7 @@ def list_hot_models(limit: int = 30) -> dict[str, Any]:
 def search_by_spec(
     base_model: str | None = None,
     brand: str | None = None,
+    brands: list[str] | None = None,
     price_min: float | None = None,
     price_max: float | None = None,
     year_min: int | None = None,
@@ -380,6 +384,7 @@ def search_by_spec(
     hand_max: int | None = None,
     mileage_max: int | None = None,
     max_price_ratio: float | None = None,
+    base_models: list[str] | None = None,
     china_plate: bool | None = None,
     swap: bool | None = None,
     dealer: bool | None = False,
@@ -390,6 +395,8 @@ def search_by_spec(
         {
             "base_model": base_model,
             "brand": brand,
+            "brands": brands,
+            "base_models": base_models,
             "price_min": price_min,
             "price_max": price_max,
             "year_min": year_min,

@@ -97,6 +97,10 @@ class SearchSpec:
     # ---- 匹配（宽：只到车系，不带年份/排量）----
     base_model: str | None = None      # 归一后的车系键，如 'ALPHARD'
     brand: str | None = None           # 归一后的品牌，如 'TOYOTA'
+    #: 同向多品牌（2026-10-01 多目标方案 §4.2）：「15万左右的SUV，奔驰或者宝马
+    #: 都可以」→ brands=['MERCEDES-BENZ','BMW']，引擎 `brand_norm = ANY` 单池检索。
+    #: 只在解析层同向合组（各组除品牌/车系外条件全同）或程序化调用方直传时产出。
+    brands: list[str] = field(default_factory=list)
     model_keyword: str | None = None   # 归一失败的原始关键词，走 car_model 模糊匹配
     #: 排量偏好（'3.5'）—— 只调排序，不做硬过滤（engine.score_match 用 ±0.25L 容差
     #: 比 engine_volume，兜住 3456/3490 几/2494 这类登记噪声；不符仅降 match，车仍在）
@@ -279,6 +283,25 @@ class SearchSpec:
         # 做 `= ANY(...)` 过滤，base_model 只作代表/判空用。
         if not self.base_model and self.base_models:
             self.base_model = self.base_models[0]
+
+        # brands（同向多品牌）：镜像 base_models 的收敛 —— 只收 [A-Z -]（品牌键含
+        # 连字符 'MERCEDES-BENZ'）、大写、去重排序；非列表/脏项整段丢弃。brands
+        # 非空时给 brand 一个代表值：引擎 `_where_clause` 以 brands 为准（elif
+        # 单品牌），brand 只作 has_model_target 判定与展示代表。
+        if self.brands is None:
+            self.brands = []
+        if not isinstance(self.brands, (list, tuple)):
+            self.brands = []
+        else:
+            cleaned: list[str] = []
+            for b in self.brands:
+                if isinstance(b, str):
+                    b = b.strip().upper()
+                    if b and len(b) <= 30 and re.fullmatch(r"[A-Z -]+", b):
+                        cleaned.append(b)
+            self.brands = sorted(set(cleaned))
+        if self.brands and not self.brand:
+            self.brand = self.brands[0]
 
         # exclude_anomaly 只接受真布尔/可判真假的标量
         self.exclude_anomaly = bool(self.exclude_anomaly)

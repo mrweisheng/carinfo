@@ -400,7 +400,12 @@ def _where_clause(spec: SearchSpec) -> tuple[str, list[Any]]:
         else:
             clauses.append(" AND f.base_model = ANY(%s)")
             params.append(keys)
-    if spec.brand:
+    if spec.brands:
+        # 同向多品牌（多目标方案 §4.2）：单池 OR 检索。brands 与 brand 同时存在时
+        # （spec 回填了代表 brand）以 brands 为准，绝不双过滤。
+        clauses.append(" AND f.brand_norm = ANY(%s)")
+        params.append(list(spec.brands))
+    elif spec.brand:
         clauses.append(" AND f.brand_norm = %s")
         params.append(spec.brand)
     if spec.model_keyword:
@@ -851,6 +856,83 @@ def _attach_images(conn, items: list[ScoredVehicle]) -> None:
         it.images = urls
 
 
+# ---------------------------------------------------------------------------
+# 多样性选材（多目标方案 §4.3，2026-10-01 拍板：同车系最多 M 台）
+# ---------------------------------------------------------------------------
+
+#: 多车系池里同一车系最多占的名额 —— 防「12 条里 8 条 GLC300」，让客户一眼
+#: 看到多种不同的车。**只在池子天然跨车系时生效**（brands 多品牌 / base_models
+#: 跨车系）；单车系查询（搜「阿尔法」「威尔法」）绝不裁 —— 池子里本来就只有它。
+SERIES_CAP = 2
+
+
+def _cap_bucket(base_model: str | None) -> str:
+    """多样性分桶键：剥掉燃油/变速箱变体尾缀（VELLFIREH/320IA → VELLFIRE/320I），
+    让混动版与燃油版共享名额 —— 对客户它们就是同一台车。
+
+    桶键只要求**一致性**，不要求是真实车名（AQUA→AQU 无害：没有别的键映射到
+    AQU，它自成一组）。"""
+    bm = (base_model or "").upper().strip()
+    if len(bm) > 2 and bm[-1] in ("H", "A"):
+        return bm[:-1]
+    return bm
+
+
+def _multi_series(spec: SearchSpec) -> bool:
+    """该查询的候选池是否天然跨车系（多样性上限只对它们生效）。"""
+    if spec.brands or spec.family:
+        # family 前缀池（GLC 系）天然跨分键；单键家族（MODEL 3）会被回填还原
+        return True
+    return len({_cap_bucket(b) for b in (spec.base_models or [])}) > 1
+
+
+def _select_diverse(items: list[ScoredVehicle], spec: SearchSpec) -> list[ScoredVehicle]:
+    """多样性选材（多目标方案 §4.3）：按分序遍历，两级配额——
+
+    · 同车系最多 SERIES_CAP 台（防「12 条里 8 条 GLC300」）；
+    · 同向多品牌时每品牌最多 ceil(limit/品牌数) 台（防「说奔驰宝马都可以，
+      12 条全是宝马」——实测真会发生：宝马 SUV 便宜量大，纯分数排序会整池
+      碾压）。某品牌候选不足时名额让给其他品牌（回填只放松品牌配额，
+      车系多样性不放松）；池子实际只有一个车系/品牌时等价于不裁。
+    """
+    limit = spec.limit
+    if SERIES_CAP < 1 or not _multi_series(spec):
+        return items[:limit]
+    brand_cap = None
+    if spec.brands and len(spec.brands) > 1:
+        brand_cap = max(1, -(-limit // len(spec.brands)))   # ceil 除法
+    counts: dict[str, int] = {}
+    bcounts: dict[str, int] = {}
+    picked: list[ScoredVehicle] = []
+    overflow: list[ScoredVehicle] = []
+    for it in items:
+        k = _cap_bucket(it.base_model)
+        ok_series = counts.get(k, 0) < SERIES_CAP
+        ok_brand = brand_cap is None or bcounts.get(it.brand_norm or "", 0) < brand_cap
+        if ok_series and ok_brand:
+            picked.append(it)
+            counts[k] = counts.get(k, 0) + 1
+            bcounts[it.brand_norm or ""] = bcounts.get(it.brand_norm or "", 0) + 1
+            if len(picked) >= limit:
+                return picked
+        else:
+            overflow.append(it)
+    if len(picked) < limit and overflow:
+        # 回填第一道：品牌配额放开（某品牌耗尽是常态），车系配额保持
+        for it in overflow:
+            if len(picked) >= limit:
+                break
+            k = _cap_bucket(it.base_model)
+            if counts.get(k, 0) < SERIES_CAP:
+                picked.append(it)
+                counts[k] = counts.get(k, 0) + 1
+    if len(picked) < limit and overflow:
+        # 回填第二道：池子种类耗尽（车系数 < limit/2 的窄池）——配额是偏好，
+        # 条数是契约，宁可少多样也不给用户短结果。
+        picked += overflow[: limit - len(picked)]
+    return picked
+
+
 def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
            relaxed_source: SearchSpec | None = None,
            unclassified_count: int | None = None) -> SearchResult:
@@ -957,7 +1039,7 @@ def search(conn, spec: SearchSpec, *, relaxed: list[str] | None = None,
         )
 
     _sort_items(items, spec)
-    items = items[: spec.limit]
+    items = _select_diverse(items, spec)
     _attach_images(conn, items)
     elapsed = int((time.perf_counter() - t0) * 1000)
     if unclassified_count is None:
@@ -1183,6 +1265,47 @@ def _relax_diagnostics(conn, spec: SearchSpec) -> list[str]:
         n = _probe_count(conn, replace(spec, year_min=None, year_max=None, year_near=None))
         if n:
             msgs.append(f"不限年份还有 {n} 台")
+
+    # 同向多目标（多目标方案 §4.4）：逐品牌/逐车系探针 —— 「宝马在该条件下 0 台，
+    # 奔驰还有 N 台」。销售场景刚需：当场知道该换哪句话术。全部为 0 时这些探针
+    # 也全 0，由通用放宽阶梯接手。
+    if spec.brands and len(spec.brands) > 1:
+        for b in spec.brands:
+            if len(msgs) >= 4:
+                break
+            n = _probe_count(conn, replace(spec, brands=[b], brand=b))
+            if n:
+                msgs.append(f"{b} 在该条件下还有 {n} 台")
+    elif spec.base_models and len({_cap_bucket(b) for b in spec.base_models}) > 1:
+        for bm in spec.base_models:
+            if len(msgs) >= 4:
+                break
+            n = _probe_count(conn, replace(spec, base_models=[bm], base_model=bm))
+            if n:
+                msgs.append(f"{bm} 在该条件下还有 {n} 台")
+
+    # 家族缺货降级建议（多目标方案 §4.5）：family 前缀零命中、且该家族车系的
+    # body_type 唯一时，提示按「品牌+车身类型」看 —— 车身字典让这个推导不需要
+    # 任何硬编码（GLC 系全是 SUV → 「奔驰的 SUV 还有 N 台」）。family 有车时
+    # 不触发（兄弟车命中本身就是用户要的推荐）。
+    if spec.family and len(msgs) < 4:
+        try:
+            _cur = conn.cursor()
+            _cur.execute(
+                "SELECT DISTINCT f.body_type FROM vehicle_features f "
+                "WHERE f.base_model LIKE %s AND f.body_type IS NOT NULL",
+                (spec.family + "%",),
+            )
+            _codes = [r[0] for r in _cur.fetchall()]
+            _cur.close()
+        except Exception:   # noqa: BLE001 —— 探针失败只少一句提示
+            _codes = []
+        if len(_codes) == 1:
+            n = _probe_count(conn, replace(spec, family=None, body_type=_codes[0]))
+            if n:
+                msgs.append(
+                    f"「{spec.family}」系没有车源；按{label_of(_codes[0])}还有 {n} 台"
+                )
     return msgs
 
 

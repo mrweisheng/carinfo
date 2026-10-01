@@ -234,3 +234,71 @@ def test_llm_seven_seater_corrects_wrong_body(synth_ctx, fake_llm):
     r = parse_query("找台七人车", synth_ctx, llm=fake_llm({"body_type": "SEDAN"}))
     assert r.spec.body_type == "MPV"
     assert any("兜底" in n for n in r.notes)
+
+
+# ---------------------------------------------------------------------------
+# 同向多目标合并（多目标方案 §4.2）
+# ---------------------------------------------------------------------------
+def test_llm_same_direction_brand_merge(synth_ctx, fake_llm):
+    """「奔驰SUV或者宝马都可以」→ 同向合并单池（brands 数组）。"""
+    r = parse_query("15万左右的SUV，奔驰或者宝马的都可以", synth_ctx, llm=fake_llm({
+        "queries": [
+            {"brand": "MERCEDES-BENZ", "body_type": "SUV", "price_near": 150000},
+            {"brand": "BMW", "body_type": "SUV", "price_near": 150000},
+        ]}))
+    assert len(r.specs) == 1
+    assert r.spec.brands == ["BMW", "MERCEDES-BENZ"]
+    assert r.spec.body_type == "SUV" and r.spec.price_near == 150000
+    assert r.spec.limit == 10                       # 两组额度求和，总量不缩水
+    assert any("合并" in n for n in r.notes)
+
+
+def test_llm_same_direction_series_merge(synth_ctx, fake_llm):
+    """「阿尔法、威尔法都可以」→ base_models 单池（引擎既有 ANY 能力）。"""
+    r = parse_query("18万左右的宝马M3或者X5都可以", synth_ctx, llm=fake_llm({
+        "queries": [
+            {"base_model": "M3", "price_near": 180000},
+            {"base_model": "X5", "price_near": 180000},
+        ]}))
+    assert len(r.specs) == 1
+    assert r.spec.base_models == ["M3", "X5"]
+    assert r.spec.base_model == "M3"
+
+
+def test_llm_different_direction_stays_multi(synth_ctx, fake_llm):
+    """年份不同 = 异向，绝不合并（§4.1 判定标准）。"""
+    r = parse_query("14年威尔法，再找台20年埃尔法", synth_ctx, llm=fake_llm({
+        "queries": [
+            {"base_model": "VELLFIRE", "year_min": 2014, "year_max": 2014},
+            {"base_model": "ALPHARD", "year_min": 2020, "year_max": 2020},
+        ]}))
+    assert len(r.specs) == 2
+
+
+# ---------------------------------------------------------------------------
+# 家族前缀兜底（多目标方案 §4.5：「奔驰 GLC 200」）
+# ---------------------------------------------------------------------------
+def test_llm_lm300_family_fallback(synth_ctx, fake_llm):
+    """复现形态：bm='LM'(非键) + kw='300'(纯数字键) → 必须落到家族 LM，
+    不许撞 '300' 垃圾键（HINO 300）。"""
+    r = parse_query("雷克萨斯 LM 300", synth_ctx, llm=fake_llm({
+        "brand": "LEXUS", "base_model": "LM", "model_keyword": "300"}))
+    assert r.spec.base_model is None and r.spec.model_keyword is None
+    assert r.spec.family == "LM"
+    assert r.spec.brand == "LEXUS"
+    assert any("家族" in n for n in r.notes)
+
+
+def test_rule_lm300_family_fallback(synth_ctx):
+    """规则路径同样兜底：'300' 被键扫描命中后由家族守卫接管。"""
+    s = rule_based_parse("雷克萨斯 LM 300", synth_ctx)
+    assert s.family == "LM"
+    assert s.base_model is None
+
+
+def test_llm_lm350_keyword_path_unaffected(synth_ctx, fake_llm):
+    """keyword 正路（'LM350' 是真键）绝不插手 —— 既有 Fix 不许回退。"""
+    r = parse_query("雷克萨斯 LM 350", synth_ctx, llm=fake_llm({
+        "brand": "LEXUS", "base_model": "LM", "model_keyword": "LM350"}))
+    assert r.spec.base_model == "LM350"
+    assert r.spec.family is None
