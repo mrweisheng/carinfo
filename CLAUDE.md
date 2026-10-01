@@ -61,6 +61,7 @@ carinfo/
 │       │   ├── explain.py          # 标签与解释
 │       │   ├── db.py               # 进程内连接池（自研）+ fetch() 重试
 │       │   ├── auth.py             # X-API-Key 鉴权中间件
+│       │   ├── detail.py           # 单车详情取数（API/MCP 共用）
 │       │   ├── api.py              # FastAPI
 │       │   └── mcp_server.py       # MCP 工具
 │       └── sites/                  # 各站点业务实现
@@ -137,7 +138,6 @@ HTTP 请求 / 代理 / 反爬退避 / CSV 写出 / DB 导入等基础设施**当
 
 ### core/importer.py — 数据导入
 
-- DataValidator：校验 vehicle_id、价格、电话、年份、座位数（**注意：当前未被调用，接入时二选一：接入或删除**）
 - ImportHistory：`import_history` 表（表结构会自动创建，`record_import` 当前未接线）
 - CrawlLogManager：记录爬取统计到 `crawl_logs` 表（爬取主通道每类型记录一条）
 - FastCSVImporter：批量 INSERT IGNORE + 分批 UPDATE；`import_rows(rows, type)` 是爬取主通道入口（懒连接 + 断线重连），`import_csv()` 是手动补导 CSV 的独立通道
@@ -301,7 +301,7 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 |---|---|---|
 | `normalize.py` | 自由文本车名 → 稳定车系键 | 四级路径 exact/compact/token/fallback；词表脏条目必须过滤 |
 | `aliases.py` | 中文/粤语别名 → base_model（`model_aliases` 表）+ 拼音兜底 | 见下方「车名别名表」专节；只写库的 CLI/增量入口用，检索侧只读 |
-| `context.py` | 词表 + 库内真实键集合 + 别名表 | 5 分钟 TTL 缓存；`reset()` 在特征表重算后调 |
+| `context.py` | 词表 + 库内真实键集合 + 别名表 | 5 分钟 TTL 缓存自动过期（无手动 reset） |
 | `features.py` | 重算两张派生表 | 先 market_stats 再 vehicle_features（价格比依赖中位数） |
 | `spec.py` | `SearchSpec`：检索条件唯一表示 | `from_dict` 只认白名单字段，防模型幻觉字段穿透 SQL；`*_near` 是软偏好，不进 `build_query` |
 | `llm.py` | MiniMax 国内版客户端 | **失败也返回 HTTP 200**，错误码在 `base_resp.status_code` |
@@ -310,6 +310,7 @@ data/csv/car_data_{type}.csv   core/importer.py:import_rows()（逐页直接入�
 | `explain.py` | 标签 + 人话解释 | 模板给事实，模型只润色；**每个数字都要能核对** |
 | `db.py` | 进程内连接池 + `fetch()` 重试 | **自己写的池**，不用 `psycopg2.pool`（三条实测缺陷，详见「连接池」一节）；只读，归还前一律 rollback |
 | `auth.py` | `X-API-Key` 请求头鉴权（中间件） | 三态 **fail-closed**；API 与 MCP-over-HTTP 共用同一中间件 |
+| `detail.py` | 单车详情取数（API/MCP 共用） | 唯一实现；两端只保留「不存在时如何回」的差异包装（API 404 / MCP error） |
 | `api.py` | FastAPI 薄壳 | `/search`（NL）、`/search/spec`、`/vehicle/{id}`、`/models`、`/health` |
 | `mcp_server.py` | MCP 薄壳（4 工具） | mcp 2.x：`from mcp.server.mcpserver import MCPServer` |
 | `extract.py` | LLM 描述字段提取（存量+增量） | 见下方「LLM 字段提取」专节；M3 **关思考**跑，四道闸，merge-only |

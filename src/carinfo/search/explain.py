@@ -17,18 +17,10 @@ from carinfo.search.body_types import label_of
 from carinfo.search.engine import CORE_DIMS, DIM_LABELS, WEIGHTS, ScoredVehicle, SearchResult
 from carinfo.search.llm import LLMClient, LLMError
 from carinfo.search.spec import SearchSpec
+from carinfo.utils import fmt_money
 
 #: 比价达到这个幅度才值得单独打标签（低于此值属于正常市场波动）
 NOTABLE_RATIO = 0.85
-
-
-def fmt_money(amount: float | None) -> str:
-    """香港习惯的金额写法：万位以上用「萬」。"""
-    if amount is None:
-        return "—"
-    if amount >= 10_000:
-        return f"HK${amount / 10_000:.1f} 萬"
-    return f"HK${amount:,.0f}"
 
 
 def fmt_km(km: int | None) -> str:

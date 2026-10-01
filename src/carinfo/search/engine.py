@@ -37,6 +37,7 @@ from typing import Any
 from carinfo.search.body_types import label_of
 from carinfo.search.normalize import clean_text
 from carinfo.search.spec import SORT_NEWEST, SORT_PRICE_ASC, SORT_PRICE_DESC, SearchSpec
+from carinfo.utils import contact_display_of, fmt_money
 
 #: 六维权重(2026-09-25 第二次定标,依据外部审核报告 docs/搜索排序审核报告.md 的
 #: D-1/D-2 及实测数字)。改这里就等于改产品口径,务必同步改 test_search [9] 的锁。
@@ -246,12 +247,7 @@ class ScoredVehicle:
     @property
     def contact_display(self) -> str | None:
         """一行式联系方式，Agent 可直接念给用户（如 `Chan · 98524136`）。"""
-        if self.contact_phone:
-            return f"{self.contact_name} · {self.contact_phone}" if self.contact_name else self.contact_phone
-        if self.contact_email:
-            prefix = f"{self.contact_name} · " if self.contact_name else ""
-            return f"{prefix}電郵 {self.contact_email}"
-        return None
+        return contact_display_of(self.contact_name, self.contact_phone, self.contact_email)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1091,14 +1087,6 @@ def _identity_keyword(spec: SearchSpec) -> str | None:
     return None
 
 
-def _money(x: float | None) -> str:
-    """香港习惯金额写法（提示文案用）。与 `explain.fmt_money` 同口径 —— engine 不能
-    反向依赖 explain，故此处保留一份最小实现。"""
-    if x is None:
-        return "—"
-    return f"HK${x / 10_000:.1f} 萬" if x >= 10_000 else f"HK${x:,.0f}"
-
-
 def _fmt_year_ranges(years: list[int]) -> str:
     """把分散的年份压成连续区间： [2010,2011,2012,2018] → '2010-2012、2018'。"""
     ys = sorted(set(years))
@@ -1439,7 +1427,7 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
         if years:
             line = (f"「{identity_kw}」库里有 {_fmt_year_ranges(years)} 年的车")
             if cheap is not None:
-                line += f"，最便宜约 {_money(cheap)}"
+                line += f"，最便宜约 {fmt_money(cheap)}"
                 # Fix-8：超预算幅度 —— 比「没有符合的」更可决策
                 # （用户据此判断「加点预算」还是「换型号」）。
                 if spec.price_max and cheap > spec.price_max:
@@ -1450,7 +1438,7 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
         else:
             # 型号确实不在库 → 退一步给同品牌最低价，好歹给个可改口的数字
             _, brand_cheap = _target_hint_safe(conn, spec, None) if spec.brand else ([], None)
-            extra = f"；库里最便宜的{spec.brand}约 {_money(brand_cheap)}" if brand_cheap else ""
+            extra = f"；库里最便宜的{spec.brand}约 {fmt_money(brand_cheap)}" if brand_cheap else ""
             fb_notes.append(f"库里没有「{identity_kw}」这款车源{extra}")
     elif spec.base_models:
         label = spec.base_model or spec.base_models[0]
@@ -1458,12 +1446,12 @@ def search_with_fallback(conn, spec: SearchSpec) -> tuple[SearchResult, list[str
         if years:
             fb_notes.append(
                 f"「{label}」库里有 {_fmt_year_ranges(years)} 年的车"
-                + (f"，最便宜约 {_money(cheap)}" if cheap is not None else "")
+                + (f"，最便宜约 {fmt_money(cheap)}" if cheap is not None else "")
                 + "；但没有符合你其余条件的")
     elif spec.brand:
         _, cheap = _target_hint_safe(conn, spec, None)
         if cheap is not None:
-            fb_notes.append(f"库里最便宜的{spec.brand}约 {_money(cheap)}")
+            fb_notes.append(f"库里最便宜的{spec.brand}约 {fmt_money(cheap)}")
 
     # 逐条件诊断：把「去掉哪个条件还有多少台」直接给用户（可决策数字）
     diag = _relax_diagnostics(conn, spec)

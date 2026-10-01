@@ -95,7 +95,6 @@ SYSTEM_PROMPT = """这些是**香港**二手车卖家手写的车源描述:粤�
 #: ---- 闸 1:字段白名单 / 类型 / 范围 ----
 _INT_FIELDS = {"hand_count": (0, 12), "mileage_km": (100, 1_000_000)}
 _ENUM_FIELDS = {"import_type": ("行貨", "水貨")}
-_STR_FIELDS = ("license_until",)
 _BOOL_FIELDS = ("china_plate", "is_swap")
 
 #: ---- 闸 3:布尔/枚举字段的语义哨兵(evidence 必须命中强模式) ----

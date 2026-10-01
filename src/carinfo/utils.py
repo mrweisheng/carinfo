@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-通用工具函数：价格 / 联系人解析。
+通用工具函数：价格解析 / 金额格式化 / 联系人解析与展示。
 
 只保留实际被调用的函数。其余历史函数（parse_extra_fields /
 validate_vehicle_data / sanitize_filename / parse_json_safe /
@@ -58,6 +58,35 @@ def extract_number(price_str: str) -> Optional[float]:
         return float(clean_str)
     except (ValueError, TypeError):
         return None
+
+
+def fmt_money(amount: Optional[float]) -> str:
+    """香港习惯的金额写法：万位以上用「萬」（如 HK$129,000 → "HK$12.9 萬"）。
+
+    单点定义：engine 的提示文案、explain 的解释、API/MCP 的详情文案共用一份，
+    避免同一个金额在不同出口写出不同格式。
+    """
+    if amount is None:
+        return "—"
+    if amount >= 10_000:
+        return f"HK${amount / 10_000:.1f} 萬"
+    return f"HK${amount:,.0f}"
+
+
+def contact_display_of(name: Optional[str], phone: Optional[str], email: Optional[str]) -> Optional[str]:
+    """联系人一行式展示串（电话优先，仅邮箱带「電郵」前缀）。
+
+    单点定义：engine 的 `ScoredVehicle.contact_display`、API/MCP 的详情共用，
+    三处曾各写一份，口径必须一致。
+    """
+    name = (name or "").strip()
+    phone = (phone or "").strip()
+    email = (email or "").strip()
+    if phone:
+        return f"{name} · {phone}" if name else phone
+    if email:
+        return f"{name} · 電郵 {email}" if name else f"電郵 {email}"
+    return None
 
 
 def parse_contact_info(contact_str: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:

@@ -38,6 +38,7 @@ from carinfo.search.auth import (
 from carinfo.search.config import load_llm_config, load_search_config
 from carinfo.search.context import SearchContext
 from carinfo.search.db import fetch
+from carinfo.search.detail import fetch_vehicle_detail
 from carinfo.search.engine import search_with_fallback
 from carinfo.search.explain import explain
 from carinfo.search.image_proxy import proxied_cover_url, proxied_image_url
@@ -192,25 +193,6 @@ def _do_search_cars(query: str, limit: int) -> dict[str, Any]:
     return payload
 
 
-_DETAIL_SQL = """
-SELECT v.vehicle_id, v.car_brand, v.car_model, v.year, v.current_price,
-       v.original_price, v.seats, v.engine_volume, v.transmission, v.fuel_type,
-       v.car_url, v.car_category, v.extra_fields,
-       v.contact_name, v.phone_number, v.contact_email, v.contact_info,
-       f.base_model, f.price_ratio, f.market_median, f.market_p25, f.market_p75,
-       f.market_bucket, f.market_level, f.market_ref_n, f.condition_score,
-       f.has_condition, f.age_days, f.heat_score, f.is_anomaly,
-       f.dealer_listings, f.is_dealer, f.is_unverified, f.verify_age_days
-FROM vehicles v
-LEFT JOIN vehicle_features f ON f.vehicle_id = v.vehicle_id
-WHERE v.vehicle_id = %s AND v.vehicle_status = 1
-"""
-
-#: 详情图片:全量按页面原始顺序。列表的图由 engine._attach_images 负责
-_IMAGES_SQL = """
-SELECT image_url FROM vehicle_images WHERE vehicle_id = %s ORDER BY image_order
-"""
-
 _HOT_MODELS_SQL = """
 SELECT f.base_model, count(*) AS n,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY v.current_price) AS median
@@ -219,41 +201,6 @@ WHERE f.base_model IS NOT NULL
 GROUP BY f.base_model HAVING count(*) >= 5
 ORDER BY n DESC LIMIT %s
 """
-
-
-def _do_car_detail(conn, vehicle_id: str) -> dict[str, Any]:
-    cur = conn.cursor()
-    cur.execute(_DETAIL_SQL, (vehicle_id,))
-    row = cur.fetchone()
-    cols = [d[0] for d in cur.description]
-    if row is None:
-        cur.close()
-        return {"error": "车源不存在或已下架", "vehicle_id": vehicle_id}
-    cur.execute(_IMAGES_SQL, (vehicle_id,))
-    images = [r[0] for r in cur.fetchall()]
-    cur.close()
-
-    data = dict(zip(cols, row))
-    # 图片走我们的代理 URL（调用方不直接接触 28car）；原链保留在 images_raw
-    data["images"] = [proxied_image_url(vehicle_id, i) for i in range(len(images))]
-    data["images_raw"] = images
-
-    # 联系人展示串：找车的最终目的是联系车主，详情必带（电话优先，仅邮箱带「電郵」前缀）
-    name = (data.get("contact_name") or "").strip()
-    phone = (data.get("phone_number") or "").strip()
-    email = (data.get("contact_email") or "").strip()
-    if phone:
-        data["contact_display"] = f"{name} · {phone}" if name else phone
-    elif email:
-        data["contact_display"] = f"{name} · 電郵 {email}" if name else f"電郵 {email}"
-    else:
-        data["contact_display"] = None
-
-    for k in ("current_price", "original_price", "market_median", "market_p25", "market_p75",
-              "price_ratio", "condition_score", "heat_score"):
-        if data.get(k) is not None:
-            data[k] = float(data[k])
-    return data
 
 
 def _do_hot_models(conn, limit: int) -> dict[str, Any]:
@@ -332,7 +279,10 @@ def search_cars(query: str, limit: int = 5) -> dict[str, Any]:
     ),
 )
 def get_car_detail(vehicle_id: str) -> dict[str, Any]:
-    return fetch(lambda conn: _do_car_detail(conn, vehicle_id))
+    data = fetch(lambda conn: fetch_vehicle_detail(conn, vehicle_id))
+    if data is None:
+        return {"error": "车源不存在或已下架", "vehicle_id": vehicle_id}
+    return data
 
 
 @server.tool(

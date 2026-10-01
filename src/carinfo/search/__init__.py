@@ -13,6 +13,7 @@
 - parser      自然语言 → SearchSpec（有模型走模型，无模型走别名+正则降级）
 - engine      SQL 硬过滤 + 五维确定性打分 + TopN
 - explain     标签与"为什么是它"的人话解释（模板为主，模型只做可选润色）
+- detail      单车详情取数（api 与 mcp_server 共用，唯一实现）
 - api         FastAPI 薄壳（GET /search 自然语言、POST /search/spec、/vehicle/{id}、/models）
 - mcp_server  MCP 薄壳（4 个工具，与 api 共用 engine.search）
 

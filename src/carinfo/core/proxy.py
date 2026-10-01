@@ -395,44 +395,6 @@ class ProxyManager:
             logger.error(f"获取统计信息失败: {e}")
             return {}
 
-    def refresh(self, new_pool_size=None):
-        """
-        强制重新加载代理池
-
-        Args:
-            new_pool_size: 新的代理池大小，如果为None则保持当前大小
-        """
-        if new_pool_size:
-            self.pool_size = new_pool_size
-
-        logger.info(f"强制刷新代理池（pool_size={self.pool_size}）...")
-        self.load_proxies_from_db()
-
-    def reset_all_fail_counts(self):
-        """重置所有代理的失败计数（管理功能）"""
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor()
-
-            sql = """
-                UPDATE proxies
-                SET fail_count = 0,
-                    is_healthy = TRUE
-            """
-            cursor.execute(sql)
-            affected_rows = cursor.rowcount
-            conn.commit()
-
-            cursor.close()
-            conn.close()
-
-            logger.info(f"✓ 已重置 {affected_rows} 个代理的失败计数")
-            return True
-
-        except Exception as e:
-            logger.error(f"重置失败计数错误: {e}")
-            return False
-
     def close(self):
         """停止后台回写线程并释放常驻连接。"""
         self._writer.stop()
@@ -538,18 +500,6 @@ def get_proxy_manager(pool_size=2000):
                 _proxy_manager_instance = ProxyManager(pool_size)
 
     return _proxy_manager_instance
-
-
-def reset_proxy_manager():
-    """
-    重置代理管理器单例（强制重新创建）
-    """
-    global _proxy_manager_instance
-    with _proxy_manager_lock:
-        if _proxy_manager_instance:
-            _proxy_manager_instance.close()
-        _proxy_manager_instance = None
-    logger.info("代理管理器已重置")
 
 
 if __name__ == "__main__":

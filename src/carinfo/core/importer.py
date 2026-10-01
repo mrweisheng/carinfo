@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 高性能CSV数据导入PostgreSQL脚本
-包含数据校验、去重、历史记录等功能
+包含数据导入、去重、历史记录等功能
 """
 
 import csv
 import glob
 import json
 import os
-import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_batch, execute_values
@@ -47,118 +46,6 @@ try:
     load_dotenv()
 except ImportError:
     pass  # 如果没有python-dotenv，使用系统环境变量
-
-
-class DataValidator:
-    """数据校验器"""
-    
-    @staticmethod
-    def validate_vehicle_id(vehicle_id: str) -> Tuple[bool, str]:
-        """验证车辆ID"""
-        if not vehicle_id or vehicle_id.strip() == '':
-            return False, "车辆ID不能为空"
-        if len(vehicle_id) > 100:
-            return False, "车辆ID过长"
-        return True, ""
-    
-    @staticmethod
-    def validate_price(price_str: str) -> Tuple[bool, str]:
-        """验证价格格式"""
-        if not price_str:
-            return True, ""  # 价格可以为空
-        
-        price_str = str(price_str).replace('HKD$', '').replace('HKD', '').strip()
-        
-        if '[' in price_str and '原價' in price_str:
-            current_part = price_str.split('[')[0].strip()
-            original_part = price_str.split('原價')[1].split(']')[0].strip()
-            
-            current_clean = current_part.replace(',', '').replace('$', '').strip()
-            original_clean = original_part.replace(',', '').replace('$', '').strip()
-            
-            try:
-                current = float(current_clean) if current_clean else None
-                original = float(original_clean) if original_clean else None
-                if current is not None and current < 0:
-                    return False, f"价格不能为负数: {price_str}"
-            except ValueError:
-                return False, f"价格格式无效: {price_str}"
-        else:
-            clean = price_str.replace(',', '').replace('$', '').strip()
-            try:
-                price = float(clean) if clean else None
-                if price is not None and price < 0:
-                    return False, f"价格不能为负数: {price_str}"
-            except ValueError:
-                return False, f"价格格式无效: {price_str}"
-        
-        return True, ""
-    
-    @staticmethod
-    def validate_phone(phone: str) -> Tuple[bool, str]:
-        """验证电话号码"""
-        if not phone:
-            return True, ""  # 电话可以为空
-        
-        phone = str(phone).strip()
-        if not re.match(r'^\d{8}$', phone):
-            return False, f"电话号码格式无效: {phone}"
-        return True, ""
-    
-    @staticmethod
-    def validate_year(year: str) -> Tuple[bool, str]:
-        """验证年份"""
-        if not year:
-            return True, ""  # 年份可以为空
-        
-        try:
-            year_val = int(year)
-            current_year = now_beijing().year
-            if year_val < 1900 or year_val > current_year + 1:
-                return False, f"年份超出合理范围: {year_val}"
-        except ValueError:
-            return False, f"年份格式无效: {year}"
-        return True, ""
-    
-    @staticmethod
-    def validate_seats(seats: str) -> Tuple[bool, str]:
-        """验证座位数"""
-        if not seats:
-            return True, ""
-        
-        try:
-            seats_val = int(seats)
-            if seats_val < 1 or seats_val > 50:
-                return False, f"座位数超出合理范围: {seats}"
-        except ValueError:
-            return False, f"座位数格式无效: {seats}"
-        return True, ""
-    
-    def validate_row(self, row: dict) -> List[str]:
-        """验证整行数据"""
-        errors = []
-        
-        valid, msg = self.validate_vehicle_id(row.get('vehicle_id', ''))
-        if not valid:
-            errors.append(msg)
-        
-        valid, msg = self.validate_price(row.get('price', ''))
-        if not valid:
-            errors.append(msg)
-        
-        valid, msg = self.validate_phone(row.get('phone_number', ''))
-        if not valid:
-            errors.append(msg)
-        
-        valid, msg = self.validate_year(row.get('year', ''))
-        if not valid:
-            errors.append(msg)
-        
-        valid, msg = self.validate_seats(row.get('seats', ''))
-        if not valid:
-            errors.append(msg)
-        
-        return errors
 
 
 class ImportHistory:
@@ -360,7 +247,6 @@ class FastCSVImporter:
         """初始化数据库连接"""
         self.connection = None
         self.cursor = None
-        self.validator = DataValidator()
         self.history = None
         
     def connect(self):

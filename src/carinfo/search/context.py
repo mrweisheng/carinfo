@@ -235,10 +235,3 @@ class SearchContext:
                         if bm and bm in self.models:
                             return bm
         return None
-
-    @classmethod
-    def reset(cls) -> None:
-        """特征表重算后调用，强制下次重新加载。"""
-        with cls._lock:
-            cls._instance = None
-            cls._loaded_at = 0.0

@@ -75,9 +75,6 @@ LABELS_CN: dict[str, str] = {
     COUPE: "轿跑",
 }
 
-#: 未分类的展示词（前端「其他」）
-UNCLASSIFIED_LABEL = "未分类"
-
 
 def label_of(code: str | None, lang: str = "hk") -> str | None:
     """码 → 展示标签；None/未知码 → None（调用方决定显示「其他」还是留空）。"""
@@ -334,12 +331,3 @@ def classify(
 
     # ── R4 留白 ──
     return None, None
-
-
-def classify_row(row) -> tuple[str | None, str | None]:
-    """`features.RawRow` 适配层（避免 features 依赖具体字段名拼装）。"""
-    return classify(
-        getattr(row, "car_model", None),
-        row.base_model,
-        row.brand_norm,
-    )

@@ -48,7 +48,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, Iterable, Optional
@@ -78,17 +78,12 @@ PROTECTED_MARKERS = (
 #: 详情表格的选择器类名（extract_car_info 靠这两个类定位车辆信息表）
 TABLE_CLASS_MARKERS = ("frm_l", "frm_t")
 
-#: 浏览器伪装参数（与爬虫主路径保持一致）
-IMPERSONATE = "chrome"
-
 #: 新增的「已下架/已删」状态值。现有代码只 switch 1/2，3 是惰性扩展：
 #: engine / features 均硬过滤 ``vehicle_status = 1``，所以 3 自动从检索里消失。
-STATUS_ON_SALE = 1
 STATUS_SOLD = 2
 STATUS_REMOVED = 3
 
 _HVID_RE = re.compile(r"h_vid=(\d+)")
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def today_beijing() -> str:
@@ -184,16 +179,6 @@ class RevalidationReport:
     def skipped(self) -> int:
         """判定不出来的台数（UNKNOWN + busy 放弃）。写库失败不计入这里。"""
         return self.unknown + self.busy_gave_up
-
-    def as_dict(self) -> dict:
-        return {
-            "considered": self.considered, "alive": self.alive,
-            "sold": self.sold, "deleted": self.deleted,
-            "unknown": self.unknown, "busy_gave_up": self.busy_gave_up,
-            "wrote": self.wrote, "write_failed": self.write_failed,
-            "busy_retries": self.busy_retries, "aborted": self.aborted,
-            "elapsed_s": round(self.elapsed_s, 1),
-        }
 
     def summary(self) -> str:
         s = (f"复核 {self.considered} 台：在售 {self.alive} / 已售 {self.sold} / "
