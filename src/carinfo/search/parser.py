@@ -83,7 +83,7 @@ body_type       车身类型，枚举（只准写这 7 个英文码，中文一�
                 SEDAN(房車/轿车)  HATCHBACK(掀背/揭背/两厢)  WAGON(旅行車/旅行版)
                 SUV(越野车/吉普)  MPV(七人車/商务车/保姆车)  CONVERTIBLE(開篷/敞篷)
                 COUPE(跑車/轿跑)
-                ⚠️「七人車」是**车型类别** → body_type=MPV；「七座」才是座位数 → seats=7
+                ⚠️「七人車/7人車」是**车型类别** → body_type=MPV（不许写成 seats）；「七座」才是座位数 → seats=7
 hand_max        手数上限，整数
 mileage_max     里程上限（公里），整数
 import_type     "行貨" 或 "水貨"
@@ -255,7 +255,10 @@ SOFT_HINT = "（用户只是随口问问，不要替他加任何筛选条件。�
 #: 「越野車/越野车」**必须带车字后缀**：不然会命中品牌别名「越野路華」(LAND ROVER)，
 #: 把品牌查询误判成车型查询。
 _BODY_WORD_RULES: tuple[tuple[str, str], ...] = (
+    # 「七人車」繁简 + **阿拉伯数字变体**：「7人车」口语极常见，拆分改造时漏收
+    # 导致条件整体丢失（2026-09-30 二审 P1-1 回归，必修）。
     ("七人車", "MPV"), ("七人车", "MPV"),
+    ("7人車", "MPV"), ("7人车", "MPV"),
     ("保姆車", "MPV"), ("保姆车", "MPV"),
     ("商務車", "MPV"), ("商务车", "MPV"),
     ("MPV", "MPV"),
@@ -282,8 +285,9 @@ _BODY_WORD_RE = re.compile(
 )
 _BODY_WORD_MAP: dict[str, str] = {w.upper(): code for w, code in _BODY_WORD_RULES}
 
-#: 「七人車」专用（粤语口语，含繁简）。用于口径兜底：它是车型类别，不是座位数。
-_SEVEN_SEATER_RE = re.compile(r"七人\s*[車车]")
+#: 「七人車」专用（粤语口语，繁简 + **阿拉伯数字**变体，允许夹空格）。
+#: 用于口径兜底：它是车型类别，不是座位数。
+_SEVEN_SEATER_RE = re.compile(r"[七7]\s*人\s*[車车]")
 
 
 def _mentions_7seater_car(text: str) -> bool:
@@ -655,18 +659,24 @@ def _group_to_spec(data: dict, query: str, ctx: SearchContext,
         payload["exclude_anomaly"] = bool(data["exclude_anomaly"])
 
     # ── 「七人車」口径兜底（2026-09-30，09-24 P0 规矩：prompt 是软约束）──────
-    # 香港语义里「七人車」是**车型类别**(MPV)，不是座位数。模型完全可能同时吐
-    # {"body_type":"MPV","seats":7}（字面「七人」就是 7）—— 那样会叠一层 seats=7，
-    # 把 7 座 SUV 一起卷进来，正是本次要修的错。故以**原文**为准：原文出现
-    # 「七人車/七人车」且最终 body_type 是 MPV 时，丢掉 seats。
-    # **只丢 seats，不丢其它条件**（"七人车 3.5 排量" 里的排量照留）。
+    # 香港语义里「七人車/7人車」是**车型类别**(MPV)，不是座位数。兜底**不能依赖
+    # 模型给 body_type**（二审 P1-2：模型只回 {"seats":7} 时旧守卫条件
+    # body_type=='MPV' 不成立 → 静默退化为 seats=7，7 座 SUV 照旧卷进来）。
+    # 故以**原文**为唯一依据，三件事全在代码里做死：
+    #   1. 模型漏给 body_type → 强制补 MPV；
+    #   2. 模型给错（如 SEDAN）→ 纠正为 MPV（原文的类别词优先于模型发挥）；
+    #   3. 丢掉 seats（模型常同时多写 {"seats":7}，字面「七人」就是 7）。
+    # **只动 body_type 与 seats，不碰其它条件**（"七人车 3.5 排量" 的排量照留）。
     # 不碰「七座」：那是真座位数诉求（"七座的 SUV" 里 seats=7 必须保留）。
-    if _mentions_7seater_car(query) and payload.get("body_type") == "MPV" \
-            and payload.get("seats") is not None:
-        dropped_seats = payload.pop("seats")
-        notes.append(
-            f"「七人車」是车型类别（MPV），已忽略模型多写的座位数 seats={dropped_seats}"
-        )
+    if _mentions_7seater_car(query):
+        if payload.get("body_type") != "MPV":
+            payload["body_type"] = "MPV"
+            notes.append("「七人車」是车型类别（MPV），已兜底 body_type=MPV")
+        if payload.get("seats") is not None:
+            dropped_seats = payload.pop("seats")
+            notes.append(
+                f"「七人車」是车型类别（MPV），已忽略模型多写的座位数 seats={dropped_seats}"
+            )
 
     return SearchSpec.from_dict(payload)
 

@@ -245,6 +245,19 @@ SERIES_DICT: dict[str, str] = {
     "SHUTTLE": WAGON,
     "MUSTANG": COUPE, "GTR": COUPE, "FAIRLADY": COUPE, "SCIROCCO": COUPE,
     "458": COUPE, "AVENTADOR": COUPE, "WRAITH": COUPE, "86": COUPE,
+    # ── 同线兄弟键补录（二审 P2，2026-09-30）────────────────────────────
+    # 「一个收了、兄弟没收」：NX200T 在而 NX300/NX300H 不在、S500 在而 S400/S450
+    # 不在、GR86/86 在而 GT86 不在、Q3-Q8 在而 Q2 不在……逐键抽过 car_model
+    # 变体核实形态唯一（M4/C300/E300 混形态键**刻意不收**，靠 R1 词+留白）。
+    # 合计 ~390 台，全部是「搜 SUV/轿车会静默漏掉」的主流车。
+    "NX300": SUV, "NX300H": SUV, "RX200T": SUV, "RX300": SUV, "RX350": SUV,
+    "RX450H": SUV, "UX200": SUV, "GLB250": SUV, "ML400": SUV, "ML350": SUV,
+    "Q2": SUV,
+    "ES250": SEDAN, "ES300H": SEDAN, "S350": SEDAN, "S400": SEDAN,
+    "S450": SEDAN, "IS250": SEDAN, "IS300": SEDAN,
+    "Z4": CONVERTIBLE, "IS250C": CONVERTIBLE,   # IS250C 是独立键，敞篷
+    "GT86": COUPE,
+    "LEVORG": WAGON,
 }
 
 #: 排除表引用的车系必须同时在 SERIES_DICT 里有条目 —— 否则 R1 让行之后落到 R4

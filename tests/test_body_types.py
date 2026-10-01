@@ -63,6 +63,30 @@ def test_coupe_lets_sliding_suv_pass(car_model, base_model):
     assert bt.classify("CAYENNE COUPE", "CAYENNE", "PORSCHE") == (bt.SUV, "series")
 
 
+@pytest.mark.parametrize(("base_model", "code"), [
+    # 二审 P2 同线兄弟键：「一个收了、兄弟没收」批次，全部实测过变体形态
+    ("NX300", bt.SUV), ("NX300H", bt.SUV), ("NX200T", bt.SUV),
+    ("RX200T", bt.SUV), ("RX450H", bt.SUV), ("UX200", bt.SUV),
+    ("GLB250", bt.SUV), ("ML400", bt.SUV), ("Q2", bt.SUV),
+    ("ES250", bt.SEDAN), ("ES300H", bt.SEDAN), ("S400", bt.SEDAN),
+    ("S450", bt.SEDAN), ("IS250", bt.SEDAN), ("IS300", bt.SEDAN),
+    ("Z4", bt.CONVERTIBLE), ("IS250C", bt.CONVERTIBLE),
+    ("GT86", bt.COUPE), ("LEVORG", bt.WAGON),
+])
+def test_sibling_series_keys(base_model, code):
+    """兄弟键逐条入库：搜 SUV/轿车不再静默漏掉它们（~390 台主流车）。"""
+    assert bt.classify(base_model, base_model, None) == (code, "series")
+
+
+@pytest.mark.parametrize("base_model", ["M4", "C300", "E300", "FOCUS", "500", "INTEGRA"])
+def test_mixed_form_keys_stay_blank(base_model):
+    """混形态键刻意不收：coupe/cabrio/sedan 混卖，标错比漏判更糟。
+
+    变体由 R1 词救（'M4 COUPE'→COUPE、'M4 CABRIO'→CONVERTIBLE），裸名留白。
+    """
+    assert bt.classify(base_model, base_model, None) == (None, None)
+
+
 @pytest.mark.parametrize(("car_model", "base_model"), [
     ("Q5 SPORTBACK", "Q5"),
     ("Q3 SPORTBACK 35 TFSI", "Q3"),

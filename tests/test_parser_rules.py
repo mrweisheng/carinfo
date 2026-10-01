@@ -124,6 +124,7 @@ def test_rule_displacement_not_confused_with_price(synth_ctx):
     ("越野车", "SUV"), ("越野車", "SUV"), ("吉普", "SUV"), ("SUV", "SUV"),
     ("suv", "SUV"),                                   # ASCII 不区分大小写
     ("七人车", "MPV"), ("七人車", "MPV"), ("MPV", "MPV"),
+    ("7人车", "MPV"), ("7人車", "MPV"),               # 阿拉伯数字变体（二审 P1-1）
     ("保姆车", "MPV"), ("商务车", "MPV"),
     ("房车", "SEDAN"), ("房車", "SEDAN"), ("轿车", "SEDAN"), ("轎車", "SEDAN"),
     ("掀背", "HATCHBACK"), ("揭背", "HATCHBACK"), ("两厢", "HATCHBACK"),
@@ -208,3 +209,28 @@ def test_llm_no_body_type_when_not_asked(synth_ctx, fake_llm):
                     llm=fake_llm({"base_model": "ALPHARD", "year_min": 2014,
                                   "year_max": 2014}))
     assert r.spec.body_type is None
+
+
+def test_rule_arabic_7seater(synth_ctx):
+    """二审 P1-1 回归：「7人车」（阿拉伯数字）条件曾被整体丢失。"""
+    s = rule_based_parse("找台7人车", synth_ctx)
+    assert s.body_type == "MPV"
+    assert s.seats is None
+    s2 = rule_based_parse("7人車", synth_ctx)
+    assert s2.body_type == "MPV" and s2.seats is None
+
+
+def test_llm_seven_seater_forces_mpv_when_model_omits_body(synth_ctx, fake_llm):
+    """二审 P1-2：模型漏给 body_type 时兜底必须独立生效——
+    旧守卫条件 body_type=='MPV' 不成立 → 静默退化为 seats=7，7 座 SUV 卷进来。"""
+    r = parse_query("找台七人车", synth_ctx, llm=fake_llm({"seats": 7}))
+    assert r.spec.body_type == "MPV"                  # 原文兜底，不依赖模型
+    assert r.spec.seats is None                       # seats 一并丢掉
+    assert any("兜底" in n for n in r.notes)
+
+
+def test_llm_seven_seater_corrects_wrong_body(synth_ctx, fake_llm):
+    """原文「七人車」是类别词，模型给错（SEDAN）也要纠正为 MPV。"""
+    r = parse_query("找台七人车", synth_ctx, llm=fake_llm({"body_type": "SEDAN"}))
+    assert r.spec.body_type == "MPV"
+    assert any("兜底" in n for n in r.notes)
